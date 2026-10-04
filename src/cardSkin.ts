@@ -1,0 +1,139 @@
+/**
+ * 一档卡皮肤:在显示文本上应用卡作者的美化正则(spec §7 P1)。
+ * 纯函数、无 DOM——server wire 与 web 显示管线共用。
+ * 只跑显示层——送模历史在 cleanAssistantText 路径，不经此处。
+ * 单条规则失败静默跳过:显示层宁可少化妆,不能白屏。
+ */
+
+import type { DisplayRule } from "./cardfront.ts";
+
+const escapeReg = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** 超过此长度视为「整页/程序卡」替换串：`$` 一律按字面，只认 {{match}} */
+const LITERAL_REPLACE_THRESHOLD = 8_000;
+
+function substMacros(text: string, macros: { charName: string; userName: string }, forRegex: boolean): string {
+	const char = forRegex ? escapeReg(macros.charName) : macros.charName;
+	const user = forRegex ? escapeReg(macros.userName) : macros.userName;
+	return text.replace(/\{\{\s*char\s*\}\}/gi, char).replace(/\{\{\s*user\s*\}\}/gi, user);
+}
+
+/**
+ * 展开捕获组 / {{match}}（短模板与长程序卡共用）。
+ *
+ * **不可**把模板直接交给 `String.replace(re, template)`：
+ * JS 会把 `$'`（后文）、`$``（前文）当特殊序列。
+ * 某程序卡的 replaceString 里有字面量 `'$'`，会被吃坏。
+ *
+ * 规则：
+ * - 始终展开：`$$` → `$`；`$1`…`$n`（n ≤ 实际捕获组数）→ 对应捕获
+ * - 长模板（≥8KB 程序卡 HTML）**不**展开 `$&`：卡内常有字面 `\$&` 片段，展开会毁掉 JS
+ * - 短模板展开 `$&` → 整段命中
+ * - **永不**展开 `$'` / `$``（本函数不匹配它们）
+ *
+ * 某卡的状态栏模板 >8KB 且依赖 `rawData = \`$2\``——若长串一律不展开 $n，
+ * 会变成字面 `$2` → 状态栏空、源码泄漏。故长串也必须展开有效 $n。
+ *
+ * `trim`（ST trimStrings）只作用于**代入的捕获组/整段命中**，不动模板里的字面文本——
+ * 与 ST `filterString`（engine.js:457，逐条 replaceAll 删除）同义。
+ */
+export function expandSkinReplacement(
+	template: string,
+	match: string,
+	captures: Array<string | undefined>,
+	trim?: string[],
+): string {
+	const cut = (s: string): string => {
+		if (!trim || trim.length === 0) return s;
+		let out = s;
+		for (const t of trim) out = out.split(t).join("");
+		return out;
+	};
+	const withMatch = template.replace(/\{\{\s*match\s*\}\}/gi, () => cut(match));
+	const isLong = template.length >= LITERAL_REPLACE_THRESHOLD;
+	return withMatch.replace(/\$(\$|&|\d{1,2})/g, (whole, kind: string) => {
+		if (kind === "$") return "$";
+		if (kind === "&") {
+			// 长程序卡：保留字面 $&；短模板：整段命中
+			return isLong ? whole : cut(match);
+		}
+		const n = Number(kind);
+		// 仅当本规则真有该捕获组时才展开；否则保留字面 $1（程序卡内可能出现）
+		if (n >= 1 && n <= captures.length) {
+			return cut(captures[n - 1] ?? "");
+		}
+		return whole;
+	});
+}
+
+export function applyCardSkin(
+	text: string,
+	rules: DisplayRule[],
+	macros: { charName: string; userName: string },
+): string {
+	let out = text;
+	for (const r of rules) {
+		try {
+			const re = new RegExp(substMacros(r.source, macros, true), r.flags);
+			const template = substMacros(r.replace, macros, false);
+			out = out.replace(re, (match, ...args) => {
+				// args: g1, g2, …, offset, input[, groupsObj]
+				const last = args[args.length - 1];
+				const hasNamed = typeof last === "object" && last !== null;
+				const captEnd = hasNamed ? args.length - 3 : args.length - 2;
+				const captures = args.slice(0, Math.max(0, captEnd)) as Array<string | undefined>;
+				return expandSkinReplacement(template, match, captures, r.trim);
+			});
+		} catch {
+			// 单条坏规则不拖累整条管线
+		}
+	}
+	return out;
+}
+
+/**
+ * 应用皮肤时原子暂存 HTML replacement。复杂社区皮肤常在 CSS/JS 字符串中嵌套标签，
+ * 事后靠标签配平无法可靠找回边界；在 replace 回调里边界天然准确。
+ */
+export function applyCardSkinProtected(
+	text: string,
+	rules: DisplayRule[],
+	macros: { charName: string; userName: string },
+	token: (index: number) => string,
+): { text: string; stash: string[] } {
+	let out = text;
+	const stash: string[] = [];
+	for (const r of rules) {
+		try {
+			const re = new RegExp(substMacros(r.source, macros, true), r.flags);
+			const template = substMacros(r.replace, macros, false);
+			const replace = (input: string): string => input.replace(re, (match, ...args) => {
+				const last = args[args.length - 1];
+				const hasNamed = typeof last === "object" && last !== null;
+				const captEnd = hasNamed ? args.length - 3 : args.length - 2;
+				const captures = args.slice(0, Math.max(0, captEnd)) as Array<string | undefined>;
+				return expandSkinReplacement(template, match, captures);
+			});
+			// ST 按规则顺序处理完整上一步产物。整页 renderer 虽已为防标签策略撕碎而
+			// 暂存，后续内联规则（如 [表情13] → <img>）仍必须进入该 HTML。
+			// 先处理旧 stash；本规则刚生成的新 stash 不应被同一规则递归处理。
+			for (let index = 0; index < stash.length; index++) stash[index] = replace(stash[index]);
+			out = out.replace(re, (match, ...args) => {
+				const last = args[args.length - 1];
+				const hasNamed = typeof last === "object" && last !== null;
+				const captEnd = hasNamed ? args.length - 3 : args.length - 2;
+				const captures = args.slice(0, Math.max(0, captEnd)) as Array<string | undefined>;
+				const replacement = expandSkinReplacement(template, match, captures);
+				if (!/(?:```(?:html)?|<!doctype\s+html|<html[\s>]|<(?:div|section|article|main|table|figure|details|style|script)\b)/i.test(replacement)) {
+					return replacement;
+				}
+				const index = stash.length;
+				stash.push(replacement);
+				return token(index);
+			});
+		} catch {
+			// 单条坏规则不拖累整条管线
+		}
+	}
+	return { text: out, stash };
+}

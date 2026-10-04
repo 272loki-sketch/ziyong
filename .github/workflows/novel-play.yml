@@ -1,0 +1,43 @@
+name: novel-play verification
+on:
+  push:
+    branches: [feat/novel-play-foundation]
+    paths:
+      - 'src/**'
+      - 'server/**'
+      - 'web/**'
+      - 'test/**'
+      - 'skills/**'
+      - 'scripts/test-summary.mjs'
+      - '.github/workflows/novel-play.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.19.0"
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Novel play tests
+        run: npm run test:novel-play
+      - name: Full domain regression
+        if: ${{ !cancelled() }}
+        run: npm test
+      - name: Install frontend
+        if: ${{ !cancelled() }}
+        run: npm --prefix web ci
+      - name: Frontend typecheck
+        if: ${{ !cancelled() }}
+        run: npm --prefix web run typecheck
+      - name: Frontend build
+        if: ${{ !cancelled() }}
+        run: npm run web:build

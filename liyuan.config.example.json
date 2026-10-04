@@ -1,0 +1,35 @@
+{
+	"card": "assets/cards/default_Qingwu.json",
+	"lorebooks": [],
+	"userName": "旅人",
+	"userPersona": "",
+	"language": "中文",
+	"scanDepth": 4,
+	"maxLoreInjections": 3,
+	"greeting": true,
+	"backendControl": true,
+	"creationMode": "ask",
+	"literaryWorldEnabled": false,
+	"literaryEcologyEnabled": false,
+	"researchSearchSchedule": {
+		"enabled": false,
+		"hour": 6,
+		"minute": 0,
+		"maxPerRun": 3,
+		"topics": ["校园恋爱中的慢热互信", "日常剧情中的关系推进", "悬疑故事的信息分配"]
+	},
+	"novelDigest": {
+		"enabled": true,
+		"chunkChars": 20000,
+		"maxCallsPerDoc": 800,
+		"autoSchedule": {
+			"enabled": false,
+			"hour": 5,
+			"minute": 0,
+			"maxPerRun": 3,
+			"queries": ["学園 日常", "現代 日常 社会人", "青春 日常"]
+		}
+	},
+	"importStripTags": [],
+	"greetingIndex": 0
+}

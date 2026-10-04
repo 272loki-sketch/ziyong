@@ -1,0 +1,120 @@
+# deps
+node_modules/
+web/node_modules/
+packages/**/node_modules/
+
+# runtime / user data (never ship)
+# 例外：.liyuan/extensions/ 是产品接线层源码，必须进仓库
+.liyuan/*
+!.liyuan/extensions/
+!.liyuan/extensions/**
+.liyuan-artifacts/
+.liyuan-assistant/
+.liyuan-cache/
+.liyuan-codex/
+.liyuan-lore/
+.liyuan-media/
+.liyuan-skills/
+.liyuan-stage-skills/
+.liyuan-state/
+.liyuan-uploads/
+.liyuan-audio/
+.liyuan-personas.json
+.rp-media/
+.rp-uploads/
+.playwright-mcp/
+
+# local secrets & personal config
+liyuan.agent.json
+liyuan.agent.meta.json
+liyuan.config.json
+liyuan-preset.json
+.liyuan-mcp.json
+.liyuan-memory/
+rp.config*.json
+liyuan-profiles/
+# docker compose 的宿主数据目录（含 API Key 的 liyuan.agent.json）
+data/
+*.bak
+.env
+.env.*
+
+# logs / build noise
+*.log
+_web-*.log
+_test-*.txt
+_test-*.json
+web/tsconfig.tsbuildinfo
+**/*.tsbuildinfo
+
+# local generative / scratch assets
+assets/gen/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# local-only assets (personal / copyright cards — keep defaults only)
+# 白名单式。原先按名字点名，漏掉 4 张卡 + 8 个世界书（`assets/cards/凡人*` 匹配
+# 不到 `《凡人修仙传V10.9》…`，`assets/lorebooks/淫宫*` 匹配不到 `淫乱仙侠.json`），
+# 一次 git add -A 就把版权内容提交进公开仓库。改为默认全忽略、只放行已入库的，
+# 与 pack-release.ps1「只留 default_* 卡、世界书全清」同口径。
+assets/cards/*
+!assets/cards/default_*
+assets/lorebooks/*
+!assets/lorebooks/Mistvale.json
+assets/presets/
+assets/ab-test/
+assets/import-test/
+assets/personas/
+
+# local debug screenshots (not for testers)
+web/shot-*.png
+web/bug-*.png
+web/fix-*.png
+web/latest-ui.png
+scripts/tmp-test-image.png
+white-screen-check.png
+
+# local VPS / gateway debug scripts (personal ops, not product)
+scripts/_*
+
+# root-level local diagnostics and imported display regex samples
+check-statusbar.cjs
+drive-turn.mjs
+dump-narrative.cjs
+dump-session.cjs
+inspect-wire-real.mts
+probe.mjs
+test-status-detect.mts
+vps-rounds.mjs
+/regex-*.json
+
+# 根级排查脚手架（下划线约定）+ 旧实验目录 + 调试截图
+# 与 pack-release.ps1 的 $dropGlobs 同口径（那里已有 "_*"，注释写着 root-level
+# dev scratch）——两处用同一套约定，别再各自点名。锚定根级 `/_*` 而非 `_*`，
+# 否则会波及已入库的 scripts/_privacy_scan.py。
+/_*
+/scratch/
+/summaries/
+/output/
+/persist/
+/liyuan-*.png
+# 同 $dropGlobs：内部调试脚本不随包、也不入库（已入库的同名前缀文件不受影响）
+scripts/build-fanren-*.mjs
+scripts/check-*.mjs
+scripts/debug-*.mjs
+scripts/find-*.mjs
+scripts/live-*.mjs
+scripts/probe-*.mjs
+!scripts/probe-backstage.mjs
+scripts/verify-*.mjs
+scripts/write-*.mjs
+
+# optional: keep web/dist for easier clone-and-run; uncomment to force rebuild
+# web/dist/
+
+# 预设→skill 装载期生成物（用户数据，不入库）
+skills/预设-*/
+/.backup/
+/.tmp-liyuan-e2e-test.mjs

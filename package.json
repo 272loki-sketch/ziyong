@@ -1,0 +1,37 @@
+{
+  "name": "liyuan",
+	"version": "1.7.4",
+  "description": "梨园（Liyuan）— 以 AI 为主演的角色扮演剧院",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 \"test/*.test.ts\"",
+    "test:frontend-version": "node web/test/build-version.test.ts",
+    "test:novel-play": "node --test --test-concurrency=1 \"test/novel-play*.test.ts\"",
+    "test:release": "node test/release-data-policy.test.ts",
+    "test:rest-lifecycle": "node test/rest-lifecycle.test.ts",
+    "verify": "npm test && npm run test:frontend-version && npm --prefix web run typecheck",
+    "web": "node server/main.ts",
+    "web:new": "node server/main.ts --new",
+    "web:build": "npm --prefix web run build",
+    "web:dev": "npm --prefix web run dev",
+    "pack:release": "powershell -NoProfile -File scripts/pack-release.ps1 -Target all",
+    "pack:release:windows": "powershell -NoProfile -File scripts/pack-release.ps1 -Target windows",
+    "pack:release:linux": "powershell -NoProfile -File scripts/pack-release.ps1 -Target linux",
+    "pack:release:macos": "powershell -NoProfile -File scripts/pack-release.ps1 -Target macos"
+  },
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "dependencies": {
+    "@liyuan/agent-runtime": "file:./packages/coding-agent",
+    "@liyuan/ai": "file:./packages/ai",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "better-sqlite3": "^12.11.1",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "playwright": "^1.49.0"
+  }
+}

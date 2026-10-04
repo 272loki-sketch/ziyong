@@ -1,0 +1,62 @@
+# Liyuan Agent 1.0 — Docker Compose
+# 用法：
+#   docker compose up -d --build
+#   浏览器 http://localhost:7620
+#   填 API Key：编辑 ./data/config/liyuan.agent.json（首启自动生成），然后
+#               docker compose restart；也可以直接在网页的连接面板里改
+
+services:
+  liyuan:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: liyuan:1.0.0
+    container_name: liyuan
+    restart: unless-stopped
+    ports:
+      - "${LIYUAN_PORT:-7620}:7620"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "7620"
+      # 可选：把 TTS 等密钥用环境变量注入（见 src/tts.ts）
+      # OPENAI_API_KEY: ""
+      # DEEPSEEK_API_KEY: ""
+    volumes:
+      # 持久化 agent 会话 / 用户数据
+      - liyuan-agent:/root/.liyuan
+      - liyuan-state:/app/.liyuan-state
+      - liyuan-uploads:/app/.liyuan-uploads
+      - liyuan-media:/app/.liyuan-media
+      - liyuan-audio:/app/.liyuan-audio
+      - liyuan-artifacts:/app/.liyuan-artifacts
+      - liyuan-codex:/app/.liyuan-codex
+      - liyuan-lore:/app/.liyuan-lore
+      # 配置 + 用户导入的角色卡 / 世界书（重建镜像不丢）
+      # 无需任何手工准备：目录不存在时 Docker 自建，首启由 entrypoint 从 example 播种。
+      # 只挂目录、不挂单个文件——文件级 bind mount 在宿主机缺文件时会被 Docker
+      # 当成目录创建，撞上容器内的同名文件直接崩（issue #1）。
+      - ./data/config:/app/config
+      - ./data/cards:/app/assets/cards
+      - ./data/lorebooks:/app/assets/lorebooks
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:7620/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+
+volumes:
+  liyuan-agent:
+  liyuan-state:
+  liyuan-uploads:
+  liyuan-media:
+  liyuan-audio:
+  liyuan-artifacts:
+  liyuan-codex:
+  liyuan-lore:

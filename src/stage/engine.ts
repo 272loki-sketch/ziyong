@@ -229,7 +229,7 @@ export interface StageSessionManager {
  * 它们可能在旁路模型请求期间追加到当前叶；不能因此丢弃本拍已经生成的正文。
  */
 const isSessionMetadataEntry = (entry: BranchEntryLike): boolean =>
-	entry.type === "model_change" || entry.type === "thinking_level_change";
+	entry.type === "model_change" || entry.type === "thinking_level_change" || (entry.type === "custom" && entry.customType === "rp-database-memory");
 
 const turnLeafIsStable = (sm: StageSessionManager, anchorId: string | null): boolean => {
 	if (!anchorId) return false;
@@ -391,6 +391,12 @@ export interface StageEngineDeps {
 	getStateFile?: (sessionId: string) => string | undefined;
 	/** 剧情库检索（memory_search 工具用）；未注入 = 该工具恒返回无命中 */
 	searchMemory?: (sessionId: string, query: string) => Promise<MemoryHitLike[]>;
+	databasePluginMemory?: {
+		enabled(): boolean;
+		before(userText: string, signal?: AbortSignal): Promise<Array<{ tag: string; kind: "digest"; text: string }>>;
+		after(sourceEntryId?: string, signal?: AbortSignal): Promise<void>;
+		recentHistoryMessages(): number;
+	};
 	/**
 	 * PLAN-RP-MEMORY：拍前自动召回（第一阶段：事件/纪要与证据合并检索）。
 	 * 未注入 = 主演无【剧情记忆】注入（退化为旧行为）。调用方承诺内部做 budget/topK。
@@ -419,7 +425,7 @@ export interface StageEngineDeps {
 		sessionId: string,
 		input: { text: string; title?: string },
 	) => Promise<{ added: number; total: number; chunks: number }>;
-	listMemory?: (sessionId: string, storeId: string) => MemoryChunkLike[];
+	listMemory?: (sessionId: string, storeId: string) => MemoryChunkLike[] | Promise<MemoryChunkLike[]>;
 	deleteMemory?: (sessionId: string, storeId: string, id: string) => boolean | Promise<boolean>;
 	/** 按需联网查证。隐私、查询额度、代理和网络请求由宿主执行。 */
 	webResearch?: (queries: string[], maxResults: number, signal?: AbortSignal) => Promise<import("../tools/web-research.ts").WebResearchItem[]>;
@@ -1519,7 +1525,16 @@ export class StageEngine {
 		const identityRepair = repairKnownCharacterIdentityState(rawState, identityHints);
 		const state = identityRepair.state;
 		const novelPlayContext = novelPlayContextForBranch(cwd, materials.rawCard, branch);
-		const { history, lastUserText, lastNarrativeText, summary } = rebuildHistory(branch, materials.promptRules);
+		const rebuiltHistory = rebuildHistory(branch, materials.promptRules);
+		const databasePluginEnabled = this.#deps.databasePluginMemory?.enabled() === true;
+		const { lastUserText, lastNarrativeText } = rebuiltHistory;
+		const history = databasePluginEnabled ? rebuiltHistory.history.slice(-this.#deps.databasePluginMemory!.recentHistoryMessages()) : rebuiltHistory.history;
+		const summary = rebuiltHistory.summary; // Legacy branch summaries remain read-only migration evidence; no old summary model continues running.
+		if (databasePluginEnabled) {
+			const receipts = branch.filter(e => e.type === "custom" && e.customType === "rp-database-memory").map(e => e.data as { sourceEntryId?: string; status?: string });
+			const latest = receipts.at(-1);
+			if (latest?.status === "pending" && latest.sourceEntryId) { await this.#deps.databasePluginMemory!.after(latest.sourceEntryId, this.#abort?.signal); sm.appendCustomEntry("rp-database-memory", {sourceEntryId:latest.sourceEntryId,status:"complete"}); sm.flush(); }
+		}
 		const literaryProfile = generationMode ? undefined : literaryProfileFromBranch(branch);
 		const committedEcology = literaryEcologyFromBranch(branch);
 		let literaryEcology = committedEcology;
@@ -1697,7 +1712,7 @@ export class StageEngine {
 			: Promise.resolve(undefined);
 		// PLAN-RP-MEMORY：拍前自动召回——受 injectOnTurn 配置与宿主依赖双重门控；不进正文关键路径（缺失即降级）。
 		const memoryRecallRequested =
-			!rerollPrep && !legacyBackstage && !!this.#deps.recallForTurn && (!!generationMode || shouldRecallHistory(lastUserText));
+			!databasePluginEnabled && !rerollPrep && !legacyBackstage && !!this.#deps.recallForTurn && (!!generationMode || shouldRecallHistory(lastUserText));
 		const memoryRecallMode = generationMode && !shouldRecallHistory(lastUserText) ? "sweep" : classifyRecallIntent(lastUserText);
 		const memoryRecallPromise: Promise<MemoryRecallHitLike[] | undefined> =
 			memoryRecallRequested && (!generationMode || memoryRecallMode === "point")
@@ -1743,6 +1758,11 @@ export class StageEngine {
 		}
 		// 记忆回照注入块（叶守卫：只在当前分支仍相同时采用）
 		let memoryRecallBlocks: Array<{ tag: string; kind: "event" | "digest" | "evidence" | "arc"; text: string }> | undefined;
+		if (databasePluginEnabled) {
+			ev.onActivity?.("原数据库插件：准备当前分支相关记忆");
+			memoryRecallBlocks = await this.#deps.databasePluginMemory!.before(lastUserText, this.#abort?.signal);
+			if (!stableLeaf(prepLeafId)) return { aborted: true };
+		}
 		if ((memoryHits || memoryArcs.length) && stableLeaf(prepLeafId)) {
 			const seenRecall = new Set<string>();
 			const points = ((memoryHits ?? []) as MemoryRecallHitLike[])
@@ -2767,7 +2787,7 @@ export class StageEngine {
 		// M4 长局压缩：攒够拍数就把早期剧情摘要成 rp-summary（装配时回读为【前情提要】）。
 		// 放在谢幕前的最后一步——记账已落，摘要能读到最新账本；叶守卫在 runCompaction 内。
 		// 压缩失败/未到期都只是跳过，下一拍会再判一次。
-		if (entryId && !aborted && finalText) {
+		if (entryId && !aborted && finalText && !databasePluginEnabled) {
 			const endCompaction = collector.beginPhase("compaction");
 			const compacted = await this.#compact(config.compactEveryNTurns ?? 30, undefined, entryId, observation("compaction"));
 			endCompaction(compacted.kind === "failed" ? "degraded" : compacted.kind === "skipped" ? "skipped" : "success");
@@ -2778,6 +2798,11 @@ export class StageEngine {
 		if (entryId && generationMode && !aborted && ownsSession() && this.#branchContains(sm.getBranch() as BranchEntryLike[], entryId)) for (const op of pendingOwnerTools) {
 			try { const result = await runStageTool(readDeps, op.name, op.args, config.language); sm.flush(); if (result.activity) ev.onActivity?.(result.activity); }
 			catch { settlementWarnings.push("asset"); ev.onNotify?.("warning", "资料或面板操作未完成，正文已保留；继续结算实际剧情"); }
+		}
+		if (entryId && !aborted && !legacyBackstage && databasePluginEnabled) {
+			try { await this.#deps.databasePluginMemory!.after(entryId, this.#abort?.signal);
+				sm.appendCustomEntry("rp-database-memory", { sourceEntryId: entryId, status: "complete" }); sm.flush(); }
+			catch { sm.appendCustomEntry("rp-database-memory", { sourceEntryId: entryId, status: "pending" }); sm.flush(); settlementWarnings.push("memory"); ev.onNotify?.("warning", "正文已保存，但原数据库插件记忆整理失败；保留原数据，不假报入库成功"); }
 		}
 		if (entryId && generationMode && !aborted) {
 			const domainFailures = settlementWarnings.filter(x => x === "world" || x === "ecology" || x === "presentation");
@@ -3123,6 +3148,7 @@ export class StageEngine {
 	 * 流式中拒绝——压缩要改上下文，不能与正在装配的一拍打架。
 	 */
 	async compactNow(): Promise<CompactOutcome> {
+		if (this.#deps.databasePluginMemory?.enabled()) return {kind:"skipped",reason:"upstream-plugin-managed"};
 		if (this.#busy) return { kind: "skipped", reason: "busy" };
 		const model = this.#deps.getModel();
 		if (!model) return { kind: "failed", error: "尚未配置剧情模型" };

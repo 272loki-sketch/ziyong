@@ -1,6 +1,6 @@
 # 当前部署与运维模板
 
-本文件不保存实际公网地址、账号、SSH/OAuth/API凭据。当前应用v1.8.6，结果见 `../docs/VALIDATION-20261007.md`；应用与独立CLI Proxy版本分别核验。
+本文件不保存实际公网地址、账号、SSH/OAuth/API凭据。当前应用v1.8.7，结果见 `../docs/VALIDATION-20261007.md`；应用与独立CLI Proxy版本分别核验。
 
 ## 部署前
 

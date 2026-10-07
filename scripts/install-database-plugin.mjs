@@ -1,0 +1,11 @@
+import { readFileSync,writeFileSync,mkdirSync,chmodSync,lstatSync,existsSync,renameSync } from 'node:fs';
+import { join } from 'node:path';
+import { createHash,randomUUID } from 'node:crypto';
+import { DatabasePluginSourceStore } from '../server/database-plugin-source.ts';
+const cwd=process.cwd(),root=join(cwd,'.liyuan-database-plugin');
+const source=new DatabasePluginSourceStore({cwd});const installed=await source.downloadSource();await source.activateRef(installed.sha256);
+const vendor=join(root,'vendor');if(existsSync(vendor)&&lstatSync(vendor).isSymbolicLink())throw new Error('Unsafe vendor cache');mkdirSync(vendor,{recursive:true,mode:0o700});chmodSync(vendor,0o700);
+const assets=[['jquery.min.js','https://gcore.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js','fc9a93dd241f6b045cbff0481cf4e1901becd0e12fb45166a8f17f95823f0b1a'],['sql-wasm.js','https://gcore.jsdelivr.net/npm/sql.js@1.14.1/dist/sql-wasm.js','77d6435bac506af0e3c59636dce9d22b1b14156348bc327f41a1577f3212360f'],['sql-wasm.wasm','https://gcore.jsdelivr.net/npm/sql.js@1.14.1/dist/sql-wasm.wasm','438c88f666dc054ce4e9395f80fe9db4218b1a3c379960454880f048a7898aed']];
+for(const [name,url,hash]of assets){const file=join(vendor,name);if(existsSync(file)){if(lstatSync(file).isSymbolicLink())throw new Error('Unsafe asset cache');const bytes=readFileSync(file);if(createHash('sha256').update(bytes).digest('hex')===hash){chmodSync(file,0o600);continue;}}const response=await fetch(url,{redirect:'error',signal:AbortSignal.timeout(60000)});if(!response.ok)throw new Error(`Dependency download HTTP ${response.status}`);const bytes=Buffer.from(await response.arrayBuffer());if(bytes.length>4*1024*1024||createHash('sha256').update(bytes).digest('hex')!==hash)throw new Error('Runtime dependency checksum mismatch: '+name);const tmp=file+'.'+randomUUID()+'.tmp';writeFileSync(tmp,bytes,{mode:0o600});renameSync(tmp,file);chmodSync(file,0o600);}
+console.log('Unchanged upstream source and runtime dependency hashes verified; provider switch is explicit.');
+console.log('Browser setup: npx playwright install chromium; Linux dependencies or explicit LIYUAN_DATABASE_BROWSER_EXECUTABLE / LIYUAN_DATABASE_BROWSER_LIBS are required.');

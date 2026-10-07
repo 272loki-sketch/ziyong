@@ -124,3 +124,6 @@ web/.dist-*/
 
 # 原子卡保存的未提交临时字节可能含私人内嵌书；即使异常中断也不得入库
 **/.liyuan-card-*.tmp
+
+# External database plugin private state, vectors, settings and upstream cache
+.liyuan-database-plugin/

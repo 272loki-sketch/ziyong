@@ -6,6 +6,8 @@
  */
 
 import { randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { cosine, embedOne } from "./embed.ts";
 import { memoryScopeId, loadMemoryConfig, patchMemoryConfig, publicMemoryConfig, saveMemoryConfig } from "./config.ts";
 import type { EmbedContext } from "./embed.ts";
@@ -44,6 +46,10 @@ import type {
 	RpEventLink,
 } from "./types.ts";
 import { DEFAULT_MEMORY_CONFIG } from "./types.ts";
+
+function upstreamDatabaseOwnsAutomaticMemory(cwd: string): boolean {
+	try { return JSON.parse(readFileSync(join(cwd, ".liyuan-database-plugin", "config.json"), "utf8")).enabled === true; } catch { return false; }
+}
 
 function embedCtxFrom(cfg: MemoryConfig): EmbedContext {
 	return { mode: cfg.embedMode, cloud: cfg.cloudEmbed };
@@ -405,6 +411,7 @@ export async function memoryUpsertEventDigest(
 	event: RpEventDigest,
 	opts?: { mergeInto?: string; reason?: string },
 ): Promise<{ stored: boolean; op?: "create" | "merge" | "update"; eventId?: string; reason?: string; error?: string }> {
+	if (upstreamDatabaseOwnsAutomaticMemory(cwd)) return { stored: false, error: "upstream database plugin owns automatic memory" };
 	const sc = normalizeScope(scope);
 	const key = lockKey(cwd, memoryScopeId(sc), "narrative");
 	return withScopeStoreLock(key, async () => {
@@ -533,6 +540,7 @@ export async function onNarrativeTurnEnd(
 	error?: string;
 	noop?: boolean;
 }> {
+	if (upstreamDatabaseOwnsAutomaticMemory(cwd)) return { stored: false, counter: 0, noop: true };
 	const cfg0 = loadMemoryConfig(cwd);
 	if (!cfg0.enabled) return { stored: false, counter: 0 };
 	const store0 = cfg0.stores.find((s) => s.id === "narrative" && s.enabled);
@@ -647,6 +655,7 @@ export async function memoryArchiveCompacted(
 	text: string,
 	opts?: { sourceRefs?: MemorySourceRef[] | null; perEntry?: Array<{ entryId: string; entryType?: string; turn?: number; text: string; textBasis?: MemorySourceRef["textBasis"] }> },
 ): Promise<{ archived: boolean; added?: number; chunks?: number; reason?: string }> {
+	if (upstreamDatabaseOwnsAutomaticMemory(cwd)) return { archived: false, reason: "upstream database plugin owns automatic memory" };
 	const cfg = loadMemoryConfig(cwd);
 	if (!cfg.enabled) return { archived: false, reason: "memory disabled" };
 	const store = cfg.stores.find((s) => s.id === "narrative" && s.enabled);

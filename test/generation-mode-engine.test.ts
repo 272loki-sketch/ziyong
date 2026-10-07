@@ -15,7 +15,7 @@ const normalDirector = JSON.stringify({ scenePressure: "既有事务", character
 const emptyReport = JSON.stringify({ summary: "依据现有材料完成", facts: [], inferences: [], candidates: [], issues: [] });
 const consult = (phase: keyof typeof DIRECTOR_ROLES) => ({ calls: [{ name: "consult_experts", args: { tasks: DIRECTOR_ROLES[phase].map(role => ({ role, task: "本拍报告" })) } }] });
 const directorScript = (body: string) => [consult("evidence"), consult("ideas"), { calls: [{ name: "begin_narrative" }] }, { text: body }, consult("review"), { calls: [{ name: "finalize" }] }];
-function fixture(mode: "direct" | "director", responses: any[], options: { ecology?: boolean; sideStreaming?: boolean; supportsTools?: boolean } = {}) {
+function fixture(mode: "direct" | "director", responses: any[], options: { ecology?: boolean; sideStreaming?: boolean; supportsTools?: boolean; databasePluginMemory?: {enabled():boolean;before(text:string):Promise<Array<{tag:string;kind:"digest";text:string}>>;after(id?:string):Promise<void>;recentHistoryMessages():number} } = {}) {
 	const cwd = mkdtempSync(join(tmpdir(), "liyuan-dual-engine-"));
 	writeFileSync(join(cwd, "card.json"), JSON.stringify({ data: { name: "云澜", description: "谨慎的同门", first_mes: "你来了。" } }));
 	mkdirSync(join(cwd, ".liyuan"));
@@ -50,7 +50,7 @@ function fixture(mode: "direct" | "director", responses: any[], options: { ecolo
 		const message: any = { role: "assistant", content: response.calls ? response.calls.map((c: any, i: number) => ({ type: "toolCall", id: `call-${requests.length}-${i}`, name: c.name, arguments: c.args ?? {} })) : [{ type: "text", text: response.text ?? "" }], stopReason: response.aborted ? "aborted" : response.calls ? "toolUse" : "stop", usage: { input: 10, output: 10 } };
 		return { async *[Symbol.asyncIterator]() { if (response.text) yield { type: "text_delta", delta: response.text }; yield { type: "done", message }; }, async result() { return message; } } as never;
 	};
-	const engine = new StageEngine({ cwd, getSessionManager: () => sm as never, getModel: () => model, findModel: (provider, id) => ({ ...model, provider, id }), getAuth: async () => ({}), streamFn });
+	const engine = new StageEngine({ cwd, getSessionManager: () => sm as never, getModel: () => model, findModel: (provider, id) => ({ ...model, provider, id }), getAuth: async () => ({}), streamFn, ...(options.databasePluginMemory ? {databasePluginMemory:options.databasePluginMemory} : {}) });
 	return { cwd, sm, requests, engine, setLedgerFail: (value: boolean) => { ledgerFail = value; }, cleanup: () => rmSync(cwd, { recursive: true, force: true }) };
 }
 const replies = (sm: any) => sm.getBranch().filter((e: any) => e.type === "message" && e.message.role === "assistant");
@@ -237,4 +237,19 @@ test("取消支持工具调用后，导演仍执行固定3/2/2而不切直出", 
 		assert.deepEqual(workflow.stages.filter((x: any) => ["evidence", "ideas", "review"].includes(x.stage)).map((x: any) => x.calls), [3, 2, 2]);
 		assert.equal(f.requests.filter(x => !["writer", "scribe"].includes(x.model)).length, 7);
 	} finally { f.cleanup(); }
+});
+
+
+test("原数据库接线：拍前投送、已落树规范正文拍后整理、旧自动压缩不再双写", async () => {
+	const body='青梧把铜钥匙收好，记下了未兑现的归还约定。'+"两人确认了眼前的安排。".repeat(25);
+	const calls: string[]=[];let f:ReturnType<typeof fixture>;
+	f=fixture("direct",[{text:body}],{databasePluginMemory:{enabled:()=>true,before:async text=>{calls.push("before");assert.equal(text,"继续。");return[{tag:"original-plugin",kind:"digest",text:"合成插件记忆：旧约定仍未兑现"}]},after:async id=>{calls.push("after");const entry=f.sm.getBranch().find(e=>e.id===id) as any;assert.equal(entry.message.details.rpNarrative,body);},recentHistoryMessages:()=>12}});
+	try{await f.engine.performTurn("继续。");assert.deepEqual(calls,["before","after"]);assert.ok(JSON.stringify(f.requests.find(r=>r.model==="writer").context).includes("合成插件记忆"));assert.ok(f.sm.getBranch().some((e:any)=>e.customType==="rp-database-memory"&&e.data.status==="complete"));assert.ok(!f.requests.some(r=>r.model==="compaction"||r.model==="memoryEvents"));assert.deepEqual(await f.engine.compactNow(),{kind:"skipped",reason:"upstream-plugin-managed"});}finally{f.cleanup()}
+});
+
+test("原数据库失败不重写已保存故事：留下pending并在下一拍前恢复一次", async () => {
+	const first='青梧收下铜钥匙，承诺明日归还。'+"两人确认了眼前的安排。".repeat(25),second='青梧核对了昨天的约定，没有把它当作已经兑现。'+"她继续说明归还的安排。".repeat(25);
+	let fail=true;const ids:string[]=[];
+	const f=fixture("direct",[{text:first},{text:second}],{databasePluginMemory:{enabled:()=>true,before:async()=>[],after:async id=>{ids.push(id!);if(fail){fail=false;throw new Error("synthetic memory failure")}},recentHistoryMessages:()=>12}});
+	try{await f.engine.performTurn("收下钥匙。");const saved=replies(f.sm)[0];assert.equal(saved.message.details.rpNarrative,first);assert.ok(f.sm.getBranch().some((e:any)=>e.customType==="rp-database-memory"&&e.data.status==="pending"));await f.engine.performTurn("核对约定。");assert.equal(replies(f.sm).length,2);assert.deepEqual(ids.slice(0,2),[saved.id,saved.id]);assert.equal(ids.length,3);}finally{f.cleanup()}
 });

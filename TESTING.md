@@ -1,6 +1,6 @@
 # 当前验证与测试边界
 
-本地v1.8.6，结果与未覆盖项见 [本次验收](docs/VALIDATION-20261007.md)。不要把旧版本测试数字、部署或失败恢复当成本次结果。
+本地v1.8.7，结果与未覆盖项见 [本次验收](docs/VALIDATION-20261007.md)。不要把旧版本测试数字、部署或失败恢复当成本次结果。
 
 ## 离线门禁
 
@@ -9,6 +9,9 @@ npm run verify               # test/*.test.ts + 前端版本 + 连接配置回�
 npm run test:connect-config  # 默认/覆盖/未知字段保护（离线）
 node test/model-tool-support.test.ts  # runtime/引擎/本机合成HTTP（不调外部模型）
 npm run test:lorebook-panel  # 内嵌书、来源/修订/行键、PNG、批量与缓存
+npm run test:database-plugin
+# 原脚本浏览器验收必须显式提供已校验的缓存和合成宿主，不下载/写生产：
+LIYUAN_DATABASE_PLUGIN_TEST_SOURCE=/tmp/index.js LIYUAN_DATABASE_PLUGIN_TEST_VENDOR=/tmp/vendor npm run test:database-plugin-browser
 node test/memory-narrative-window.test.ts
 node test/memory.test.ts
 node test/rp-memory.test.ts

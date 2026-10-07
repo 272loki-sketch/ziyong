@@ -12,6 +12,7 @@ import { PanelStatus, SliderField, Toggle, useAction, usePanelData } from "./kit
 import { GenerationModeControl } from "./GenerationModeControl.tsx";
 import { ModelPlugSelector } from "./ModelPlugSelector.tsx";
 import { WorldProfileSection } from "./WorldProfileSection.tsx";
+import { DatabasePluginPanel } from "./DatabasePluginPanel.tsx";
 
 type MemoryStoreStats = {
 	id: string;
@@ -372,7 +373,7 @@ function MemorySection({ toast }: { toast: (level: "info" | "warning" | "error",
 
 	return (
 		<section className="sp-section">
-			<h4>向量记忆</h4>
+			<h4>嵌入连接与旧记忆库（保留回退）</h4>
 			<div className="field-hint">
 				按「当前角色卡 + 当前对话」隔离。
 				<strong>剧情数据库</strong>仅 agent 自动<strong>合并</strong>入库；
@@ -818,6 +819,7 @@ export function SettingsPanel({
 				<div className="field-hint">白昼 / 黑夜立刻切换，偏好记在本机浏览器，与会话配置无关。</div>
 			</section>
 			<AccessSection toast={toast} />
+			<DatabasePluginPanel toast={toast} />
 			<MemorySection toast={toast} />
 			<NovelAiSection toast={toast} />
 			{data && (

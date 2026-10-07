@@ -1,6 +1,6 @@
 # 当前正文生成与结算流程
 
-本文件是现行执行契约，不是旧稿纸工作流的演进日记。适用本地 v1.8.6；公开发布版本另行核验。
+本文件是现行执行契约，不是旧稿纸工作流的演进日记。适用本地 v1.8.7；公开发布版本另行核验。
 
 ## 一拍的共同骨架
 
@@ -49,6 +49,6 @@ evidence：连续性、设定/知情、生活生态三份报告
 
 ## 记忆边界
 
-拍前按意图做事件/证据召回或活跃剧情线只读投影。拍后周期入库保存完整N拍、纯正文和来源范围；长局压缩保持最近6拍，早期摘要与证据归档分工。记忆不覆盖当前分支正文或账本，详见 `PLAN-RP-MEMORY.md`。
+原插件启用时，拍前走上游记忆准备与派生世界书投送，拍后只以已保存正文id执行原插件填表/持久化；失败留下 `rp-database-memory:pending`，下一拍先恢复，不重复正文。旧周期入库、事件提取和旧压缩关闭，原库保留；插件关闭时沿用旧路径。记忆不覆盖分支正文或账本，详见 `DATABASE-PLUGIN.md`。
 
 代码入口：`src/stage/engine.ts`、`agent-turn.ts`、`agent-director.ts`、`agent-presentation.ts`。验证：`test/generation-mode-engine.test.ts`、`generation-format-parity.test.ts`、`memory-narrative-window.test.ts`。

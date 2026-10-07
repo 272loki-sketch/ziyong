@@ -1,6 +1,6 @@
 # AGENTS.md — 梨园项目维护约束
 
-进入项目先读本文件，再读 `docs/DOCUMENTATION-INDEX.md`、`ARCHITECTURE-OVERVIEW.md`、`GENERATION-MODES.md` 与 `PLAN-ROUND-FLOW.md`。本地v1.8.6，发布状态/实际门禁单列，不据工作区版本冒称公开Release。
+进入项目先读本文件，再读 `docs/DOCUMENTATION-INDEX.md`、`ARCHITECTURE-OVERVIEW.md`、`GENERATION-MODES.md` 与 `PLAN-ROUND-FLOW.md`。本地v1.8.7，发布状态/实际门禁单列，不据工作区版本冒称公开Release。
 
 ## 必守边界
 
@@ -11,7 +11,7 @@
 5. 读会话/思考先读 `docs/READING-THINKING.md`，按真实id/条目timestamp和时区，不用mtime猜最新。只需状态时不读原文；私人文本/Key/OAuth/SSH/会话/截图/用户素材不进提交。
 6. 工具能力开关按模型保存，默认支持；修改须保留当前启用渠道、默认模型、岗位与其它兼容字段，不能用旧仓库子集覆盖运行配置。模型独立分工，禁止把Gemini 3.7/3.8 Flash全部换为Luna。仅Luna旧名迁移为原生gpt-6-luna，连接需真实端点验证，嵌入另有配置。
 7. 内嵌世界书自动随卡加载，不复制挂载；管理写操作带source/cardIdentity/entryKey，原关闭模块不自动开启。生产PNG不拿来试写。
-8. 记忆按session/card/祖先来源：完整周期窗口、规范正文及偏移基准；生产只读，金丝雀用临时库，不重生成故事来凑测试成功。
+8. 记忆按session/card/祖先来源：完整周期窗口、规范正文及偏移基准；生产原记忆只读保留，插件实测只用临时库合成故事，不重生成故事来凑测试成功。
 9. 升级先临时build、离线/浏览器、空闲与备份，再验证health/hello/bundle/SW/会话和私有数据。不要为方便放宽私有资料权限或默默启用旧渠道。
 
 ## 当前代码入口
@@ -19,7 +19,8 @@
 - `src/stage/engine.ts` / `agent-turn.ts` / `agent-director.ts`：模式、作者、阶段、保存与共用结算。
 - `agent-presentation.ts` / `materials.ts` / `assemble.ts`：原文资料、事实/格式边界。
 - `literary-world-*.ts` / `literary-ecology.ts`：世界与生态，另见相关现行PLAN。
-- `src/memory/` / `stage/compact.ts`：SQLite、完整N拍、事件/证据/摘要。
+- `server/database-plugin-*.ts` / `web/public/database-plugin-host.*`：原上游数据库的私有缓存、宿主适配、作用域与浏览器运行时；源码不fork，升级先验哈希与原插件回归。
+- `src/memory/` / `stage/compact.ts`：旧SQLite库保留回退；插件启用后不再自动剧情双写。
 - `src/outline/` / `src/novel-play/`：导演室、大纲、研究、小说消化和开演。
 - `src/tools/` / `.liyuan/extensions/roleplay.ts`：能力投影和旧SDK/热刷新接线。
 - `server/` / `web/src/`：会话宿主、REST/WS、两模式UI和只读诊断。

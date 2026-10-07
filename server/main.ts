@@ -13,6 +13,8 @@
 
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, unlinkSync, watch, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { DatabasePluginHttp } from "./database-plugin-http.ts";
+import { DatabasePluginRuntime } from "./database-plugin-runtime.ts";
 import { presentationFactText } from "../src/stage/agent-presentation.ts";
 import { createHash, randomBytes } from "node:crypto";
 import { networkInterfaces } from "node:os";
@@ -2055,6 +2057,9 @@ const storyBridge: StoryBridge = {
 	// 向量记忆作用域（M-D3 助手侧工具用）：与 restHost.memoryScope / 台上注入同一口径——
 	// 当前剧情会话 + 当前卡**路径**（scopeId 按路径 hash，只给卡名会落到另一个空作用域）。
 	memoryScope: () => ({ sessionId: session.sessionId, card: cardPath || undefined }),
+	databasePluginMemory: { enabled: () => databasePlugin.config().enabled,
+		search: async (query) => { await databasePluginRuntime.before(query); return (await databasePlugin.injection(query)).map(b=>({text:b.text,meta:{title:b.tag,kind:"digest" as const}})); },
+		add: input => databasePlugin.addMemory(input.text,input.title), list: () => databasePlugin.listMemory(), delete: id => databasePlugin.deleteMemory(id) },
 	memoryVisibleEntryIds: () => new Set(
 		session.sessionManager.getBranch().map((entry) => entry.id).filter((id): id is string => typeof id === "string"),
 	),
@@ -2436,6 +2441,51 @@ async function handleAccessApi(req: IncomingMessage, res: ServerResponse, url: s
 	}
 }
 
+const databasePlugin = new DatabasePluginHttp(cwd, {
+	isStreaming: () => readStoryStreaming(),
+	context: () => {
+		const branch = session.sessionManager.getBranch() as BranchEntryLike[];
+		const materials = loadStageMaterials(cwd);
+		const messages = branch.filter(entry => entry.type === "message" && entry.id && entry.message && ["user", "assistant"].includes(entry.message.role ?? ""));
+		const chat = messages.flatMap(entry => {
+			const details = entry.message!.details as Record<string, unknown> | undefined;
+			const text = entry.message!.role === "assistant"
+				? (details?.rpGreeting ? extractEntryText(entry.message!.content) : committedNarrativeText(entry))
+				: extractEntryText(entry.message!.content);
+			if (!text.trim()) return [];
+			return [{ mes: text, is_user: entry.message!.role === "user", name: entry.message!.role === "user" ? materials.config.userName : materials.card.name,
+				message_id: entry.id, __liyuanEntryId: entry.id, extra: {} }];
+		});
+		const sourceEntryId = String(chat.at(-1)?.__liyuanEntryId ?? `session:${session.sessionId}`);
+		return { scope: { sessionId: session.sessionId, card: cardPath || undefined }, sourceEntryId,
+			visibleEntryIds: [...branch.map(e => e.id).filter((id): id is string => !!id), sourceEntryId],
+			chat, readonlyBooks: { [`Liyuan-Materials-Readonly-${createHash("sha256").update(cardPath||"nocard").digest("hex").slice(0,12)}`]: { entries: materials.entries.map(entry=>({uid:entry.uid,comment:entry.comment,name:entry.comment,content:entry.content,keys:entry.keys,key:entry.keys,type:entry.constant?"constant":"keyword",constant:entry.constant,enabled:entry.enabled,order:entry.order,selective:entry.selective})) } }, character: { name: materials.card.name, description: materials.card.description, personality: materials.card.personality,
+				scenario: materials.card.scenario, first_mes: materials.card.firstMes, extensions: {} }, userName: materials.config.userName };
+	},
+	generate: async (prompts, signal) => {
+		const config = loadStageMaterials(cwd).config;
+		const model = resolveStepModel("memoryEvents", config.stepModels, session.model,
+			(provider, id) => currentlyConfiguredModels().find(m => m.provider === provider && m.id === id)).model;
+		if (!model) throw new Error("数据库整理模型尚未配置");
+		const auth = await session.modelRegistry.getApiKeyAndHeaders(model as never);
+		if (!auth.ok) throw new Error("数据库整理模型鉴权不可用");
+		const systemPrompt = prompts.filter(p => p.role === "system").map(p => p.content).join("\n\n");
+		const messages = prompts.filter(p => p.role !== "system").map(p => p.role === "assistant"
+			? { role: "assistant", content: [{ type: "text", text: p.content }], api: model.api, provider: model.provider, model: model.id,
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 0 }
+			: { role: "user", content: [{ type: "text", text: p.content }], timestamp: 0 });
+		const memoryHeaders = { ...(auth.headers ?? {}) }; if (!memoryHeaders["user-agent"] && !memoryHeaders["User-Agent"]) memoryHeaders["user-agent"]="Mozilla/5.0";
+		const source = streamSimple(model as never, { systemPrompt, messages: messages as never }, { apiKey: auth.apiKey, headers: memoryHeaders,
+			maxTokens: Math.min(model.maxTokens ?? 16384, 16384), reasoning:"off", signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(180000)]) : AbortSignal.timeout(180000), maxRetries: 0 });
+		for await (const _event of source) { /* Original plugin consumes the final response; intermediate reasoning is not persisted. */ }
+		const result = await source.result();
+		if (result.stopReason === "error" || result.stopReason === "aborted") throw new Error("数据库整理模型未完成，本次记忆没有成功收据");
+		return result.content.filter(part => part.type === "text").map(part => part.type === "text" ? part.text : "").join("");
+	},
+});
+const databasePluginRuntime = new DatabasePluginRuntime(databasePlugin, () => `http://127.0.0.1:${(httpServer.address() as { port: number } | null)?.port ?? 7620}`);
+databasePlugin.onSourceChanged = () => databasePluginRuntime.close();
+
 const httpServer = createServer((req, res) => {
 	void (async () => {
 		const urlPath = (req.url ?? "/").split("?")[0];
@@ -2443,11 +2493,18 @@ const httpServer = createServer((req, res) => {
 			await handleAccessApi(req, res, urlPath);
 			return;
 		}
-		if (accessGuarded(urlPath) && !requestAuthed(req)) {
+		const databaseHostRequest = (urlPath.startsWith("/api/database-plugin") || urlPath.startsWith("/database-plugin-host") || urlPath.startsWith("/api/files/") || urlPath.startsWith("/user/files/") || urlPath === "/api/chats/get" || urlPath === "/api/chats/group/get") && req.headers["x-liyuan-database-host"] === databasePlugin.internalToken;
+		if (accessGuarded(urlPath) && !requestAuthed(req) && !databaseHostRequest) {
 			res.writeHead(401, { "content-type": "application/json" });
 			res.end(JSON.stringify({ error: "需要登录" }));
 			return;
 		}
+		if (urlPath === "/api/database-plugin/rpc" && req.method === "POST") {
+			let raw=""; for await (const part of req) { raw+=part; if(raw.length>100000)throw new Error("插件管理请求过大"); }
+			try { const body=JSON.parse(raw);const value=await databasePluginRuntime.rpc(body.method,body.args??[]);res.writeHead(200,{"content-type":"application/json"});res.end(JSON.stringify({value})); }
+			catch { res.writeHead(400,{"content-type":"application/json"});res.end(JSON.stringify({error:"数据库管理操作未完成"})); }return;
+		}
+		if (await databasePlugin.handle(req,res)) return;
 		if (await handleApiRequest(req, res, restHost)) return;
 		const url = (req.url ?? "/").split("?")[0];
 		if (url === "/healthz") {
@@ -2598,7 +2655,14 @@ const stage = new StageEngine({
 	// 场记落盘 → fs.watch 自动广播 state 帧（与扩展/REST 写路径同一条）
 	getStateFile: (sessionId) => join(stateDir, `${sessionId}.json`),
 	// memory_search 工具：剧情库 + 外部资料库合并取前 6（与扩展侧同一套语义）
+	databasePluginMemory: {
+		enabled: () => databasePlugin.config().enabled,
+		before: async (userText, signal) => { await databasePluginRuntime.before(userText, signal); return databasePlugin.injection(userText); },
+		after: async (sourceEntryId, signal) => { await databasePluginRuntime.after(sourceEntryId, signal); },
+		recentHistoryMessages: () => databasePlugin.config().recentHistoryMessages,
+	},
 	searchMemory: async (sessionId, query) => {
+		if (databasePlugin.config().enabled) { await databasePluginRuntime.before(query); return (await databasePlugin.injection(query)).map(block=>({text:block.text,meta:{title:block.tag,kind:"digest" as const}})); }
 		const scope = { sessionId, card: cardPath || undefined };
 		const visibleEntryIds = new Set(
 			session.sessionManager.getBranch().map((entry) => entry.id).filter((id): id is string => typeof id === "string"),
@@ -2721,11 +2785,11 @@ const stage = new StageEngine({
 	},
 	// 向量库写侧三件（M-D3）：MemoryScope 一律在此绑定（当前对话 + 当前卡），**不经模型**。
 	// 写侧恒落 external——服务层 assertExtraStore 禁止手写剧情库，故工具不给 store 参数。
-	addMemory: (sessionId, input) =>
-		memoryManualAdd(cwd, { sessionId, card: cardPath || undefined }, input.text, {
-			...(input.title ? { title: input.title } : {}),
-		}),
+	addMemory: (sessionId, input) => databasePlugin.config().enabled
+		? databasePlugin.addMemory(input.text, input.title)
+		: memoryManualAdd(cwd, { sessionId, card: cardPath || undefined }, input.text, { ...(input.title ? { title: input.title } : {}) }),
 	listMemory: (sessionId, storeId) => {
+		if (databasePlugin.config().enabled) return databasePlugin.listMemory();
 		const visibleEntryIds = new Set(session.sessionManager.getBranch().map((entry) => entry.id).filter((id): id is string => typeof id === "string"));
 		return memoryVisibleChunks(cwd, { sessionId, card: cardPath || undefined }, storeId, visibleEntryIds)
 			.map((chunk) => ({ id: chunk.id, text: chunk.text, textLen: chunk.text.length, meta: chunk.meta, createdAt: chunk.createdAt }));
@@ -2867,6 +2931,7 @@ const stage = new StageEngine({
 			resyncAll();
 			// 向量记忆入库：只在真落了新正文时（中断/错误拍不入）
 			if (!info.entryId || info.error || info.aborted) return;
+			if (databasePlugin.config().enabled) return; // Original plugin owns automatic narrative memory; preserve the old database without dual writes.
 			const outlineMode = outline?.getView().settings.mode;
 			if (outlineMode && outlineMode !== "manual") {
 				const sourceSessionId = session.sessionId;

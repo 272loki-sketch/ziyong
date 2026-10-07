@@ -73,7 +73,7 @@ export interface MemoryDeps {
 	/** 写一段文字进额外库（恒 external，服务层禁写 narrative）；回落盘条数 */
 	addMemory?: (input: { text: string; title?: string }) => Promise<{ added: number; total: number; chunks: number }>;
 	/** 列举某库条目（不含向量）；storeId 缺省 external */
-	listMemory?: (storeId: string) => MemoryChunkLike[];
+	listMemory?: (storeId: string) => MemoryChunkLike[] | Promise<MemoryChunkLike[]>;
 	/** 按 id 删除；等待落盘后返回是否删到，兼容同步宿主。 */
 	deleteMemory?: (storeId: string, id: string) => boolean | Promise<boolean>;
 	/** 本拍用户原文 + 门禁档位（写侧门禁判定用，见 gate.ts） */
@@ -287,7 +287,7 @@ export const memoryList: ToolSpec<MemoryDeps> = {
 
 		let all: MemoryChunkLike[];
 		try {
-			all = deps.listMemory(store);
+			all = await deps.listMemory(store);
 		} catch (err) {
 			return { text: `列举${label}失败：${errText(err)}` };
 		}

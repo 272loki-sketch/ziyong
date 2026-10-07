@@ -1,6 +1,6 @@
 # 梨园当前架构
 
-本地 v1.8.6。当前应用以两个普通文本主Agent模式运行，不以旧稿纸/询问/画像架构为正文流程。部署和测试结果单列 `VALIDATION-20261007.md`，不声明公开Release。
+本地 v1.8.7。当前应用以两个普通文本主Agent模式运行，不以旧稿纸/询问/画像架构为正文流程。部署和测试结果单列 `VALIDATION-20261007.md`，不声明公开Release。
 
 ## 1. 唯一事实与派生工件
 
@@ -36,7 +36,8 @@
 | `assemble.ts` / `materials.ts` | 原始资料、预设和分支历史/摘要装配 |
 | `literary-director.ts` | 正常直出导演；职责/岗位不缩水 |
 | `literary-world-*.ts` / `literary-ecology.ts` | 世界转移与生态背景池/分支运行态 |
-| `src/memory/` / `stage/compact.ts` | SQLite剧情库、完整周期窗口、事件、证据、长局摘要 |
+| `server/database-plugin-*.ts` / `web/public/database-plugin-host.*` | 原上游插件＋宿主适配：私有版本缓存、人物/纪要、交火/0TK、来源隔离与模型通道 |
+| `src/memory/` / `stage/compact.ts` | 插件关闭时的旧记忆回退；插件启用后停止自动双写 |
 | `src/outline/` / `src/novel-play/` | 研究/大纲/消化与原著开演，非第二作者 |
 | `src/tools/` | 统一领域契约与按能力投影 |
 | `skills/` / 用户Skill覆盖 | 工作流提示词与用户覆盖，不混入用户预设写法 |
@@ -55,7 +56,7 @@
 
 ### 记忆
 
-会话＋卡作用域、祖先来源过滤；周期正文取完整N拍和规范文本，源偏移带基准。事件/证据召回与剧情线投影有限等待，不捏造无命中事实。长局压缩留最近6拍，归档先于摘要落树，见 `PLAN-RP-MEMORY.md`。
+原数据库使用未改写上游脚本；宿主只向它提供当前分支规范正文并持久化派生扩展，写入带scope/source/revision。拍前投送原插件筛选的资料，拍后只处理已提交正文，失败留pending恢复收据，取消不能补故事。旧库原样保留，见 `DATABASE-PLUGIN.md` 与回退文档 `PLAN-RP-MEMORY.md`。
 
 ### 权限、取消和恢复
 

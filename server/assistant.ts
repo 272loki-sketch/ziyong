@@ -102,6 +102,7 @@ export interface StoryBridge {
 	memoryScope(): { sessionId: string; card?: string };
 	/** 当前剧情分支祖先条目 id，供记忆检索/列表隔离 sibling。 */
 	memoryVisibleEntryIds(): ReadonlySet<string>;
+	databasePluginMemory?: { enabled(): boolean; search(query: string): Promise<import("../src/tools/memory.ts").MemoryHitLike[]>; add(input: {text:string;title?:string}): Promise<{added:number;total:number;chunks:number}>; list(): Promise<import("../src/tools/memory.ts").MemoryChunkLike[]>; delete(id:string): Promise<boolean>; };
 		/** 世界线视图（M-D5）：从当前剧情会话树抽存档点并组装视图 */
 		worldlineView(): unknown;
 		/** 面板读写（M-D5）：当前剧情会话的面板，读/写/关经盘 sync 与前端双工 */
@@ -721,6 +722,7 @@ function createStagehandTools(cwd: string, bridge: StoryBridge, hooks: Stagehand
 			memoryTools,
 			{
 				searchMemory: async (query) => {
+					if (bridge.databasePluginMemory?.enabled()) return bridge.databasePluginMemory.search(query);
 					const sc = memoryScopeOf();
 					const visible = bridge.memoryVisibleEntryIds();
 					const [narrative, external] = await Promise.all([
@@ -733,11 +735,11 @@ function createStagehandTools(cwd: string, bridge: StoryBridge, hooks: Stagehand
 						: []));
 					return [...primary, ...evidence.flat()].slice(0, 8);
 				},
-				addMemory: (input) =>
+				addMemory: (input) => bridge.databasePluginMemory?.enabled() ? bridge.databasePluginMemory.add(input) :
 					memoryManualAdd(cwd, memoryScopeOf(), input.text, { ...(input.title ? { title: input.title } : {}) }),
-				listMemory: (storeId) => memoryVisibleChunks(cwd, memoryScopeOf(), storeId, bridge.memoryVisibleEntryIds())
+				listMemory: (storeId) => bridge.databasePluginMemory?.enabled() ? bridge.databasePluginMemory.list() : memoryVisibleChunks(cwd, memoryScopeOf(), storeId, bridge.memoryVisibleEntryIds())
 					.map((chunk) => ({ id: chunk.id, text: chunk.text, textLen: chunk.text.length, meta: chunk.meta, createdAt: chunk.createdAt })),
-				deleteMemory: async (storeId, id) => await memoryDeleteChunk(cwd, memoryScopeOf(), storeId, id),
+				deleteMemory: async (storeId, id) => bridge.databasePluginMemory?.enabled() ? bridge.databasePluginMemory.delete(id) : await memoryDeleteChunk(cwd, memoryScopeOf(), storeId, id),
 			},
 			loadConfig(cwd).language,
 		),

@@ -25,9 +25,10 @@ import {
 	type BranchEntryLike,
 	type RpSummaryData,
 } from "./assemble.ts";
+import { committedNarrativeText } from "../memory/narrative-window.ts";
 import { buildRpSummaryPrompt, validateRpSummaryMarkdown } from "../scribe.ts";
 import { formatState } from "../state.ts";
-import type { RpEventDigest } from "../memory/types.ts";
+import type { MemorySourceRef, RpEventDigest } from "../memory/types.ts";
 import type { WorldState } from "../types.ts";
 
 export { SUMMARY_ENTRY_TYPE };
@@ -167,6 +168,7 @@ export interface CompactRunDeps {
 
 /** 逐 entry 归档单元：原始正文 + 它的树锚点（供精确证据切块与回源）。 */
 export interface ArchiveEntryLike {
+	textBasis?: "rpNarrative" | "entryText";
 	entryId: string;
 	entryType?: string;
 	turn?: number;
@@ -176,6 +178,7 @@ export interface ArchiveEntryLike {
 /** 从树条目提取原始文本（与 server 回源切片用同一坐标空间）。 */
 export function entryRawText(e: BranchEntryLike): string {
 	if (e.type !== "message") return "";
+	if (e.message?.role === "assistant") return committedNarrativeText(e);
 	const content = (e.message as { content?: unknown } | undefined)?.content;
 	if (typeof content === "string") return content;
 	if (Array.isArray(content)) {
@@ -192,8 +195,26 @@ export interface RpSummaryEnvelope {
 	events: RpEventDigest[];
 }
 
+/** Host-owned entry ids and coordinate bases; no model-provided scope or offset basis is trusted. */
+function summaryEventSourceRefs(refs: unknown, allowed?: readonly MemorySourceRef[]): MemorySourceRef[] {
+	if (!Array.isArray(refs)) return [];
+	return refs.flatMap((ref) => {
+		if (!ref || typeof ref !== "object" || typeof ref.entryId !== "string") return [];
+		if (!allowed) return [ref as MemorySourceRef]; // Existing direct callers retain the legacy parser contract.
+		const host = allowed.find((item) => item.entryId === ref.entryId);
+		if (!host) return [];
+		const lower = host.charFrom ?? 0, upper = host.charTo;
+		const from = typeof ref.charFrom === "number" && Number.isFinite(ref.charFrom) ? Math.floor(ref.charFrom) : host.charFrom;
+		const to = typeof ref.charTo === "number" && Number.isFinite(ref.charTo) ? Math.floor(ref.charTo) : upper;
+		const charFrom = from === undefined ? undefined : Math.max(lower, Math.min(upper ?? from, from));
+		const charTo = to === undefined ? undefined : Math.max(charFrom ?? lower, Math.min(upper ?? to, to));
+		if (charFrom !== undefined && charTo !== undefined && charTo <= charFrom) return [];
+		return [{ ...host, ...(charFrom !== undefined ? { charFrom } : {}), ...(charTo !== undefined ? { charTo } : {}) }];
+	});
+}
+
 /** 宽容解析数据库式摘要 envelope；旧会话/旧模型仍可返回纯 Markdown。 */
-export function parseRpSummaryEnvelope(text: string): { summary: string; events: RpEventDigest[]; wasEnvelope: boolean } {
+export function parseRpSummaryEnvelope(text: string, allowedSourceRefs?: readonly MemorySourceRef[], opts?: { requireSources?: boolean }): { summary: string; events: RpEventDigest[]; wasEnvelope: boolean; error?: string } {
 	let raw = text.trim();
 	const fence = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
 	if (fence) raw = fence[1]!.trim();
@@ -205,8 +226,11 @@ export function parseRpSummaryEnvelope(text: string): { summary: string; events:
 				for (const rawEvent of value.events) {
 					if (!rawEvent || typeof rawEvent !== "object") continue;
 					const event = rawEvent as Partial<RpEventDigest>;
+					if (event.op === "skip") continue;
 					const sourceKey = typeof event.sourceKey === "string" && event.sourceKey ? event.sourceKey : event.id;
 					if (typeof sourceKey !== "string" || !sourceKey || typeof event.title !== "string" || !event.title.trim()) continue;
+					const sourceRefs = summaryEventSourceRefs(event.sourceRefs, allowedSourceRefs);
+					if (opts?.requireSources && sourceRefs.length === 0) return { summary: "", events: [], wasEnvelope: true, error: "事件缺少本次实际发送的有效正文来源，拒绝用整个窗口补造证据" };
 					events.push({
 						...event,
 						kind: "rp-event-digest",
@@ -219,7 +243,7 @@ export function parseRpSummaryEnvelope(text: string): { summary: string; events:
 						recallAnchors: Array.isArray(event.recallAnchors) ? event.recallAnchors.filter((x): x is string => typeof x === "string") : [],
 						summary: typeof event.summary === "string" ? event.summary : event.title,
 						evidenceLevel: event.evidenceLevel ?? "source-backed",
-						sourceRefs: Array.isArray(event.sourceRefs) ? event.sourceRefs : [],
+						sourceRefs,
 						...(typeof event.arc === "string" && event.arc.trim() ? { arc: event.arc.trim() } : {}),
 						...(Array.isArray(event.links) ? { links: event.links } : {}),
 					});
@@ -235,6 +259,7 @@ export function parseRpSummaryEnvelope(text: string): { summary: string; events:
 
 /** 记忆 sourceRef 的最小形状（避免 service 层强耦合进 stage） */
 export interface MemorySourceRefLike {
+	textBasis?: "rpNarrative" | "entryText";
 	entryId: string;
 	entryType?: string;
 	turn?: number;
@@ -251,6 +276,8 @@ export interface CompactRunInput {
 	everyNTurns: number;
 	keepRecentBeats?: number;
 	minChars?: number;
+	/** Current workflow memory Skill, already resolved with user overrides. */
+	memoryInstructions?: string;
 }
 
 export type CompactOutcome =
@@ -276,6 +303,31 @@ export async function runCompaction(deps: CompactRunDeps, input: CompactRunInput
 	const leafBefore = deps.getLeafId();
 	deps.onActivity?.(`正在压缩前情（${plan.turns} 拍 · ${plan.conversationText.length} 字）…`);
 
+	// Build provenance before the model call so it can choose real, per-event sources.
+	const sourceRefs: MemorySourceRefLike[] = [];
+	const perEntry: ArchiveEntryLike[] = [];
+	const sourceEntries: NonNullable<Parameters<typeof buildRpSummaryPrompt>[0]["sourceEntries"]> = [];
+	const firstCovered = input.branch.findIndex((entry) => entry.id === plan.covered[0]?.id);
+	let beatTurn = input.branch.slice(0, Math.max(0, firstCovered)).filter((entry) => entry.type === "message" && entry.message?.role === "user").length;
+	for (const e of plan.covered) {
+		if (e.type === "message" && e.message?.role === "user") beatTurn++;
+		if (!e.id) continue;
+		sourceRefs.push({ entryId: e.id, entryType: e.type, turn: beatTurn || undefined });
+		const raw = entryRawText(e);
+		if (!raw.trim()) continue;
+		const textBasis = e.message?.role === "assistant" && typeof (e.message?.details as Record<string, unknown> | undefined)?.rpNarrative === "string" ? "rpNarrative" : "entryText";
+		perEntry.push({ entryId: e.id, entryType: e.type, ...(beatTurn ? { turn: beatTurn } : {}), text: raw, textBasis });
+		if (e.message?.role === "user" || e.message?.role === "assistant") {
+			sourceEntries.push({ role: e.message.role, text: raw,
+				sourceRef: { entryId: e.id, entryType: e.type, turn: beatTurn || undefined, textBasis, charFrom: 0, charTo: raw.length } });
+		}
+	}
+	// Legacy draft operations/imports still require serializeForSummary's patched/cleaned transcript.
+	// Only canonical ordinary-text branches replace it with source-labelled entries; never duplicate prose.
+	const sourceAware = sourceEntries.length > 0 && plan.covered.every((entry) => entry.type !== "custom_message"
+		&& (entry.message?.role !== "assistant" || !entryRawText(entry).trim()
+			|| typeof (entry.message.details as Record<string, unknown> | undefined)?.rpNarrative === "string"))
+		&& JSON.stringify(sourceEntries).length < MAX_COMPACT_INPUT_CHARS - 2_048;
 	const prompt = buildRpSummaryPrompt({
 		conversationText: plan.conversationText,
 		stateSnapshot: formatState(input.state),
@@ -283,23 +335,13 @@ export async function runCompaction(deps: CompactRunDeps, input: CompactRunInput
 		language: input.language,
 		userName: input.userName,
 		charName: input.charName,
+		...(sourceAware ? { sourceEntries } : {}),
+		...(input.memoryInstructions ? { memoryInstructions: input.memoryInstructions } : {}),
 	});
 	const resp = await deps.sideText(prompt.systemPrompt, prompt.userText);
 	if (typeof resp !== "string") return { kind: "failed", error: resp.error };
-	const envelope = parseRpSummaryEnvelope(resp);
-
-	// 被裁区间的逐 entry 原文与平铺锚点：供归档精确切块、事件/摘要 canonical 种子统一。
-	const sourceRefs: MemorySourceRefLike[] = [];
-	const perEntry: ArchiveEntryLike[] = [];
-	let beatTurn = 0;
-	for (const e of plan.covered) {
-		if (e.type === "message" && e.message?.role === "user") beatTurn++;
-		if (e.id) {
-			sourceRefs.push({ entryId: e.id, entryType: e.type, turn: beatTurn || undefined });
-			const raw = entryRawText(e);
-			if (raw.trim()) perEntry.push({ entryId: e.id, entryType: e.type, ...(beatTurn ? { turn: beatTurn } : {}), text: raw });
-		}
-	}
+	const envelope = parseRpSummaryEnvelope(resp, sourceEntries.map((entry) => entry.sourceRef), { requireSources: sourceAware });
+	if (envelope.error) return { kind: "failed", error: envelope.error };
 
 	const summary = deps.normalizeSummary ? deps.normalizeSummary(envelope.summary, envelope.events, sourceRefs) : envelope.summary;
 	if (!summary) return { kind: "failed", error: "摘要为空" };

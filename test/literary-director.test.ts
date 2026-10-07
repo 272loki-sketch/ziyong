@@ -7,6 +7,7 @@ import {
 	parseLiteraryDirection,
 } from "../src/stage/literary-director.ts";
 import { defaultState } from "../src/state.ts";
+import { readFileSync } from "node:fs";
 
 test("文学导演：提示词固定唯一拍前导演及候选事实边界", () => {
 	const prompt = buildLiteraryDirectorPrompt({
@@ -16,9 +17,12 @@ test("文学导演：提示词固定唯一拍前导演及候选事实边界", ()
 	assert.ok(prompt.systemPrompt.includes("不写正文"));
 	assert.ok(prompt.systemPrompt.includes("唯一的拍前导演"));
 	assert.ok(prompt.systemPrompt.includes("不得创造新事实"));
-	assert.ok(prompt.systemPrompt.includes("不得替玩家选择"));
-	assert.ok(prompt.systemPrompt.includes("不得擅自跳到稍后、放学、夜晚、次日"));
-	assert.ok(prompt.systemPrompt.includes("不得重演已经发生的后续"));
+	const skill = readFileSync(new URL("../skills/Stitches拍前导演/SKILL.md", import.meta.url), "utf8");
+	assert.ok(!prompt.systemPrompt.includes("playerStop") && !skill.includes("playerStop"));
+	assert.ok(!prompt.systemPrompt.includes("涉及玩家行动、思想、对白或重大选择前的停点"));
+	assert.ok(!prompt.systemPrompt.includes("每一拍还必须给出"));
+	assert.ok(!skill.includes("不跨到放学、夜晚、次日"), "不再追加系统级默认时间冻结");
+	assert.ok(skill.includes("不重演后续"));
 	assert.ok(prompt.userText.includes("我推开门"));
 });
 

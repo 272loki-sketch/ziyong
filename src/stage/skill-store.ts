@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-export type WorkflowSkillStage = "continuity" | "character" | "persona" | "director" | "writer" | "curtain" | "world" | "world-profile" | "world-facts" | "world-audit" | "ecology-global" | "ecology-card" | "ecology-runtime" | "outline-chat" | "outline-bootstrap" | "outline-reconcile" | "outline-foreshadowing" | "outline-audit" | "outline-research" | "outline-corpus-research" | "novel-digest" | "memory";
+export type WorkflowSkillStage = "continuity" | "character" | "persona" | "director" | "writer" | "curtain" | "world" | "world-profile" | "world-facts" | "world-audit" | "ecology-global" | "ecology-card" | "ecology-runtime" | "outline-chat" | "outline-bootstrap" | "outline-reconcile" | "outline-foreshadowing" | "outline-audit" | "outline-research" | "outline-corpus-research" | "novel-digest" | "memory" | "director-evidence" | "director-setting" | "director-ecology" | "director-ideas" | "director-review-facts" | "director-review-style" | "director-main" | "writer-direct" | "structured-repair" | "writer-recovery" | "agent-presentation" | "tool-protocol-repair" | "author-boundary" | "presentation-plan";
 
 export type SkillUpdateStatus = "current" | "outdated" | "untracked" | "custom";
 
@@ -49,7 +49,7 @@ export interface StageSkillInput {
 }
 
 const USER_SKILLS_DIR = ".liyuan-stage-skills";
-const WORKFLOW_STAGES = new Set<WorkflowSkillStage>(["continuity", "character", "persona", "director", "writer", "curtain", "world", "world-profile", "world-facts", "world-audit", "ecology-global", "ecology-card", "ecology-runtime", "outline-chat", "outline-bootstrap", "outline-reconcile", "outline-foreshadowing", "outline-audit", "outline-research", "outline-corpus-research", "novel-digest", "memory"]);
+const WORKFLOW_STAGES = new Set<WorkflowSkillStage>(["continuity", "character", "persona", "director", "writer", "curtain", "world", "world-profile", "world-facts", "world-audit", "ecology-global", "ecology-card", "ecology-runtime", "outline-chat", "outline-bootstrap", "outline-reconcile", "outline-foreshadowing", "outline-audit", "outline-research", "outline-corpus-research", "novel-digest", "memory", "director-evidence", "director-setting", "director-ecology", "director-ideas", "director-review-facts", "director-review-style", "director-main", "writer-direct", "structured-repair", "writer-recovery", "agent-presentation", "tool-protocol-repair", "author-boundary", "presentation-plan"]);
 const oneLine = (value: string): string => value.replace(/\s+/g, " ").trim();
 
 export function sanitizeSkillDir(name: string): string | null {

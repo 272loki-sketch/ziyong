@@ -1,3 +1,4 @@
+import { RealTestRecords } from "./RealTestRecords.tsx";
 /**
  * 会话面板（左栏，PLAN-PANELS §2.1）：
  * 「当前会话」卡（改名/上下文占用/压缩）＋会话列表（末条预览、重命名/导出/删除）
@@ -232,6 +233,7 @@ export function SessionsPanel({
 
 	return (
 		<div className="panel-body">
+			<section className="sp-section"><h4>实战记录</h4><RealTestRecords /></section>
 			{current && (
 				<section className="sp-section">
 					<h4>当前会话</h4>

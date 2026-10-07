@@ -14,7 +14,7 @@ import { isAbsolute, join } from "node:path";
 import { loadCardFile, applyMacros, readCardRawJson } from "../card.ts";
 import { promptRules, extractRegexScripts, type DisplayRule } from "../cardfront.ts";
 import {
-	applyDisabledLore,
+	applyLoreSourceState,
 	constantEntries,
 	loadLorebookFile,
 	loadLorebookRegexScripts,
@@ -103,6 +103,8 @@ export function loadStageConfig(cwd: string): RpConfig {
 			raw = { ...DEFAULT_CONFIG };
 		}
 	}
+	delete (raw as unknown as Record<string, unknown>).creationMode;
+	if (raw.generationMode === "direct" || raw.generationMode === "director") { delete raw.literaryQuality; delete raw.literaryProfileEveryNTurns; }
 	raw.stepModels = normalizeStepModels(raw.stepModels);
 	return setMountedLorebooks(raw, mountedLorebookPaths(raw));
 }
@@ -130,22 +132,22 @@ export function loadStageMaterials(cwd: string): StageMaterials {
 	for (const rel of mountedLorebookPaths(config)) {
 		const abs = resolvePath(cwd, rel);
 		if (existsSync(abs)) {
-			fileGroups.push(loadLorebookFile(abs).map((entry) => ({ ...entry, source: `lorebook:${rel}` })));
+			fileGroups.push(applyLoreSourceState(loadLorebookFile(abs), config, "file", rel).map((entry) => ({ ...entry, source: `lorebook:${rel}` })));
 			lorebookRegexScripts.push(...loadLorebookRegexScripts(abs));
 		}
 	}
 	const fileEntries = mergeEntries(...fileGroups);
 	const overlayFile = overlayPathFor(cwd, card.name);
 	const overlayEntries = existsSync(overlayFile)
-		? loadLorebookFile(overlayFile).map((entry) => ({ ...entry, source: "overlay" }))
+		? applyLoreSourceState(loadLorebookFile(overlayFile), config, "agent", config.card).map((entry) => ({ ...entry, source: "overlay" }))
 		: [];
 	// 用户级停用 → 外部插件协议判死（M-C2）。协议条目是 H 类「脑内 harness」：
 	// 指望酒馆插件解析的输出格式强制令，梨园无解析器且原生 world_state_update 已覆盖其功能，
 	// 留着只会与 draft_write「纯剧情文字」互斥（实测首拍 31% 思考 + 正文污染 + 双份记账）。
 	const protocolFiltered = stripProtocolEntries(
-		applyDisabledLore(
-			mergeEntries(card.book.map((entry) => ({ ...entry, source: "card" })), fileEntries, overlayEntries),
-			config.disabledLore,
+		mergeEntries(
+			applyLoreSourceState(card.book, config, "card", config.card).map((entry) => ({ ...entry, source: "card" })),
+			fileEntries, overlayEntries,
 		),
 	);
 	const entries = protocolFiltered.entries;

@@ -93,22 +93,23 @@ export function projectTavernVariables(state: WorldState, userName: string): Tav
 			备注: value.notes,
 		};
 	}
-	const ranks = Object.fromEntries(["A班", "B班", "C班", "D班"].map((name, index) => [name, {
+	const knownNumber=(pattern:RegExp):number|null=>{const raw=flagValue(state,pattern).trim();if(!raw)return null;const n=Number(raw.replace(/[，,\s]/g,""));return Number.isFinite(n)?n:null;};
+	const ranks = Object.fromEntries(["A班", "B班", "C班", "D班"].map((name) => [name, {
 		显示名: name,
 		领导者: "",
-		排名: `第${index + 1}名`,
-		班级点数: Number(flagValue(state, new RegExp(`${name}.*(?:班级)?点数|(?:班级)?点数.*${name}`))) || 1000,
+		排名: flagValue(state,new RegExp(`${name}.*排名|排名.*${name}`)) || "未记录",
+		班级点数: knownNumber(new RegExp(`${name}.*(?:班级)?点数|(?:班级)?点数.*${name}`)),
 	}]));
 	return {
 		stat_data: {
 			学生证: {
 				姓名: userName,
-				年龄: Number(flagValue(state, /年龄/)) || 15,
-				所属年级: flagValue(state, /所属年级|学年/) || "一年级",
-				班级: flagValue(state, /实际班级|班级/) || "D班",
-				实际班级: flagValue(state, /实际班级|班级/) || "D班",
-				社团: flagValue(state, /社团/) || "无",
-				个人点数: Number(flagValue(state, /个人点数/)) || 100000,
+				年龄: knownNumber(/年龄/),
+				所属年级: flagValue(state, /所属年级|学年/) || "未记录",
+				班级: flagValue(state, /实际班级|班级/) || "未记录",
+				实际班级: flagValue(state, /实际班级|班级/) || "未记录",
+				社团: flagValue(state, /社团/) || "未记录",
+				个人点数: knownNumber(/个人点数/),
 				当前时间: state.time,
 				当前地点: state.location,
 				效果状态: Object.fromEntries(Object.entries(state.flags).filter(([key]) => !/班级|年级|年龄|社团|点数/.test(key))),

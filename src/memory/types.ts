@@ -178,6 +178,8 @@ export interface RpEventLink {
 
 /** 原文锚点的可定位坐标（PLAN-RP-MEMORY §2.1） */
 export interface MemorySourceRef {
+	/** Coordinate basis; missing on legacy records means the original message text. */
+	textBasis?: "rpNarrative" | "entryText";
 	/** 分支条目 id（message/custom 等树条目） */
 	entryId: string;
 	/** 条目类型（message/custom/custom_message…）；未知时省略 */

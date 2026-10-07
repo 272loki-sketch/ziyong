@@ -131,3 +131,7 @@ test("谢幕收口：抢跑选项保留，正式谢幕后置且一份", () => {
 	assert.match(repeated, /正式新选项/);
 	assert.equal((repeated.match(/<options>/g) ?? []).length, 1);
 });
+
+test("原生格式与模型格式不得同时要求calendar，模型不重复生成原生日历",()=>{
+ withCurtainFixture(cwd=>{const{compact}=compactMaterials(cwd);assert.ok(!compact.formatPlan.modelTags.some(t=>compact.formatPlan.nativeTags.includes(t)));assert.ok(!compact.formatPlan.modelTags.some(t=>compact.formatPlan.deterministicTags.includes(t)));});
+});

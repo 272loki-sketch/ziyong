@@ -118,3 +118,9 @@ scripts/write-*.mjs
 skills/预设-*/
 /.backup/
 /.tmp-liyuan-e2e-test.mjs
+
+# Protected local pre-deploy static bundles, never source/release artifacts
+web/.dist-*/
+
+# 原子卡保存的未提交临时字节可能含私人内嵌书；即使异常中断也不得入库
+**/.liyuan-card-*.tmp

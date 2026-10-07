@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
 import { apiGet, apiPost } from "../api.ts";
 
-type WorkflowStage = "continuity" | "character" | "persona" | "director" | "writer" | "curtain" | "world" | "world-profile" | "world-facts" | "world-audit" | "ecology-global" | "ecology-card" | "ecology-runtime" | "outline-bootstrap" | "outline-chat" | "outline-reconcile" | "outline-foreshadowing" | "outline-research" | "outline-audit";
+type WorkflowStage =
+	| "continuity" | "character" | "persona" | "director" | "writer" | "curtain" | "world" | "world-profile" | "world-facts" | "world-audit"
+	| "ecology-global" | "ecology-card" | "ecology-runtime" | "outline-bootstrap" | "outline-chat" | "outline-reconcile" | "outline-foreshadowing" | "outline-research" | "outline-audit"
+	| "writer-direct" | "director-main"
+	| "director-evidence" | "director-setting" | "director-ecology" | "director-ideas" | "director-review-facts" | "director-review-style"
+	| (string & {});
 type SkillUpdateStatus = "current" | "outdated" | "untracked" | "custom";
 type BuiltinReference = {
 	fingerprint: string;
@@ -31,12 +36,22 @@ type StageSkill = {
 	builtin?: BuiltinReference;
 };
 
-const STAGE_LABELS: Record<WorkflowStage, string> = {
+const STAGE_LABELS: Record<string, string> = {
 	continuity: "连续性",
 	character: "Sogon",
 	persona: "Sigon",
 	director: "导演",
 	writer: "主演",
+	"writer-direct": "直出主演",
+	"structured-repair": "领域JSON校验修复",
+	"writer-recovery": "主演截断恢复",
+	"director-main": "导演主 Agent",
+	"director-evidence": "连续性证据",
+	"director-setting": "设定核对",
+	"director-ecology": "生态参考",
+	"director-ideas": "角度构思",
+	"director-review-facts": "事实审阅",
+	"director-review-style": "预设审阅",
 	curtain: "谢幕格式",
 	world: "后台世界",
 	"world-profile": "角色卡世界画像",
@@ -145,6 +160,7 @@ export function SkillLibrary({ toast }: { toast: (level: "info" | "warning" | "e
 				<label className="field-label">工作流阶段</label>
 				<select className="field-input" value={editing.workflow ?? ""} disabled={busy} onChange={(event) => setEditing({ ...editing, workflow: event.target.value as WorkflowStage || undefined })}>
 					<option value="">写作参考</option>
+					{editing.workflow && !Object.hasOwn(STAGE_LABELS, editing.workflow) && <option value={editing.workflow}>{editing.workflow}</option>}
 					{Object.entries(STAGE_LABELS).map(([value, label]) => <option value={value} key={value}>{label}</option>)}
 				</select>
 				<label className="field-label">Skill 正文</label>

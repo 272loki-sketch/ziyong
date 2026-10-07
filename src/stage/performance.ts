@@ -1,7 +1,7 @@
 /** 只读回合性能投影。collector 显式归属一拍；不得从可变的全局“当前拍”取 owner。 */
 export const TURN_PERFORMANCE_ENTRY_TYPE = "rp-turn-performance";
 export const PERFORMANCE_PHASES = [
-	"prep", "prep.arrival", "prep.continuity", "prep.novelCalibration", "prep.plotAdaptation",
+	"prep", "agent.evidence", "agent.ideas", "agent.review", "settlement.recovery", "prep.arrival", "prep.continuity", "prep.novelCalibration", "prep.plotAdaptation",
 	"prep.director", "prep.sceneConductor", "prep.memoryRecall", "prep.memoryArcs",
 	"writer", "settlement.planFact", "settlement.scribe", "settlement.worldFacts",
 	"settlement.worldProposal", "settlement.worldAudit", "settlement.ecology", "curtain", "compaction",

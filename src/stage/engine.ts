@@ -12,6 +12,13 @@
  */
 
 import { join } from "node:path";
+import { existingEcologyReference } from "./passive-ecology.ts";
+import { buildAgentPresentationMaterials, parseAgentPresentation, parseAgentPresentationPlan, presentationPlainText, presentationSegments, authoredImages } from "./agent-presentation.ts";
+import { projectPresentation } from "../presentation.ts";
+import { runAgentTurn } from "./agent-turn.ts";
+import { classifyModelFailure, isNativeToolsUnsupported, type ModelAttemptDiagnostic } from "./model-failure.ts";
+import { executeDirectorBatch, directorMainSkill, type DirectorContext, type DirectorReport } from "./agent-director.ts";
+import { isGenerationMode, type GenerationMode, type GenerationWorkflow } from "./generation-mode.ts";
 import { mkdirSync, writeFileSync } from "node:fs";
 
 import { applyProjectedSamplers } from "../samplers.ts";
@@ -133,7 +140,8 @@ import {
 	type StageToolDeps,
 	type ToolRunResult,
 } from "./tools.ts";
-import { unifiedStageToolNames } from "../tools/adapters/stage.ts";
+import { unifiedStageToolNames, unifiedStageReadToolNames, unifiedStageWriteToolNames } from "../tools/adapters/stage.ts";
+import { narrativeMemoryWindow } from "../memory/narrative-window.ts";
 import { canonicalEventId } from "../memory/event-id.ts";
 import {
 	mcpStageTools,
@@ -311,12 +319,14 @@ export interface StageStreamEvent {
 }
 
 export interface StageSubmission {
+	generationMode?: GenerationMode;
 	clientMessageId?: string;
 	expectedSessionId?: string;
 	onAccepted?: (entryId: string) => void;
 }
 
 interface StageRequestObservation {
+	diagnostics?: ModelAttemptDiagnostic[];
 	collector?: TurnPerformanceCollector;
 	phase: PerformancePhase;
 	preflight?: WriterContextPreflight;
@@ -488,16 +498,11 @@ const textOfAssistant = (m: AssistantMsgLike | null): string => {
 
 /** 规划卡：每拍第 1 轮随末端注入送达（工作区新建必空） */
 export const PLAN_CARD =
-	"【第 1 步·规划】本拍还没有计划。读题、探索（工具自取）；用户这句输入引出的未定变量——" +
-	"取不同值这拍走向会分岔、且设定里查不到的——若清单中有 `ask`，先请用户定夺；否则由你依据人物动机和已有事实自行选择，再用 `beat_plan` 列路标。" +
-	"你的任务是列出抽象的路标的同时为路标的具体内容留下充分的可发挥余地，" +
-	"让下面每个剧情轮次扮演路标时拥有极大的发挥空间以给用户带来更多的剧情可能性。" +
-	"没有戏的拍可 `draft_write` 一次交完；有戏时按路标分段演出，只有清单中有 `ask` 且确实无法继续时才询问。";
+	"【第 1 步·规划】本拍还没有计划。读取本拍材料，用 `beat_plan` 列短路标；规划与首次正文写入分轮。";
 
 /** 记账注入：seal（含兜底封笔）之后第一件事；本拍已有落账（结构信号）时跳过 */
 export const CREATIVE_REVIEW_INJECTION =
-	"【分段回看】回看刚落下的稿段和导演约束，检查人物声音、潜台词、信息交换、节奏变化与模板化表达。" +
-	"只在 thinking 中记录简短判断，不复述正文，不预写下一段；需要修正用 draft_edit，继续只写一个自然段，到了玩家接话处用 draft_seal。";
+	"【分段回看】稿纸已更新。下一轮继续用 draft_append，修订用 draft_edit，完成本拍用 draft_seal。";
 
 export const LEDGER_INJECTION =
 	"【记账】已封笔。核对本拍变动并落账：世界状态用 `world_state_update`（物品/时间/位置/关系），" +
@@ -522,6 +527,7 @@ export function mainStageMaxTokens(
 }
 
 export interface StageRerollPrep {
+	generationMode?: GenerationMode;
 	literaryContinuity?: LiteraryContinuity;
 	literaryDirection?: string;
 	literaryDirectionData?: LiteraryDirection;
@@ -606,7 +612,7 @@ export function userAuthorizesTransition(userText: string): boolean {
 }
 
 export function isToolUnsupportedError(error: string): boolean {
-	return /(?:tools?|functions?|function[_ -]?calling).{0,80}(?:unsupported|not supported|not allowed|unknown|unrecognized|invalid|禁用|不支持|不允许)|(?:unsupported|not supported|unknown|unrecognized|invalid).{0,80}(?:tools?|functions?|function[_ -]?calling)/i.test(error);
+	return isNativeToolsUnsupported(error);
 }
 
 export function looksLikeTextualToolProtocol(text: string): boolean {
@@ -620,22 +626,38 @@ export function extractPureTextNarrative(text: string): string {
 	// Some card presets wrap the complete answer in a narrative container. The
 	// generic panel stripper treats every top-level tag as non-prose, so unwrap
 	// these known body containers before removing nested status/option blocks.
-	let unwrapped = text;
-	const open = /<(content|main_output)\b[^>]*>/i.exec(unwrapped);
-	if (open?.index !== undefined) {
+	const preserved: string[] = [];
+	let unwrapped = text.replace(/<(image(?:Tag)?|options)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, block => {
+		const token = `\uE000LIYUAN_PRESENTATION_${preserved.length}\uE001`;
+		preserved.push(block); return token;
+	});
+	let outerRemoved = false;
+	// Cards may nest both known prose containers (main_output > content).
+	// Unwrap every outer body layer before the generic format-block stripper;
+	// a missing closing tag must preserve already-generated prose as well.
+	while (true) {
+		const open = /<(content|main_output)\b[^>]*>/i.exec(unwrapped);
+		if (open?.index === undefined || (outerRemoved && unwrapped.slice(0, open.index).trim())) break;
 		const bodyStart = open.index + open[0].length;
-		const close = new RegExp(`</${open[1]}\\s*>`, "i").exec(unwrapped.slice(bodyStart));
-		const bodyEnd = close?.index === undefined ? unwrapped.length : bodyStart + close.index;
+		let bodyEnd = unwrapped.length, nesting = 1;
+		const sameTag = new RegExp(`<(/?)${open[1]}\\b[^>]*>`, "gi");
+		for (const tag of unwrapped.slice(bodyStart).matchAll(sameTag)) {
+			if (tag[1]) nesting--;
+			else if (!/\/\s*>$/.test(tag[0])) nesting++;
+			if (nesting === 0) { bodyEnd = bodyStart + tag.index!; break; }
+		}
 		unwrapped = unwrapped.slice(bodyStart, bodyEnd);
+		outerRemoved = true;
 	}
 	// Remove complete format blocks while preserving narrative before and after
 	// them. If a provider stops inside a final format block, the tag scanner's
 	// hanging-block rule drops that unfinished tail without dropping earlier prose.
-	return extractDraftBody(unwrapped);
+	const body = extractDraftBody(unwrapped);
+	if (!body.replace(/\uE000LIYUAN_PRESENTATION_\d+\uE001/g, "").trim()) return "";
+	return body.replace(/\uE000LIYUAN_PRESENTATION_(\d+)\uE001/g, (_, index) => preserved[Number(index)] ?? "");
 }
 
 const WRITER_STREAM_TIMEOUT_MS = 900_000;
-const ASK_TIMEOUT_MS = 30 * 60_000;
 
 async function* streamWithTimeout(
 	stream: AsyncIterable<StageStreamEvent>,
@@ -676,48 +698,25 @@ async function* streamWithTimeout(
 	}
 }
 
-async function waitForUserChoice(
-	promise: Promise<string | undefined>,
-	signal: AbortSignal | undefined,
-	timeoutMs = ASK_TIMEOUT_MS,
-): Promise<string | undefined> {
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	let onAbort: (() => void) | undefined;
-	const stop = new Promise<undefined>((resolve) => {
-		timer = setTimeout(() => resolve(undefined), timeoutMs);
-		if (signal) {
-			onAbort = () => resolve(undefined);
-			if (signal.aborted) onAbort();
-			else signal.addEventListener("abort", onAbort, { once: true });
-		}
-	});
-	try {
-		return await Promise.race([promise, stop]);
-	} finally {
-		if (timer) clearTimeout(timer);
-		if (signal && onAbort) signal.removeEventListener("abort", onAbort);
-		void promise.catch(() => undefined);
-	}
-}
-
 export function sideTextTimeoutMs(step: SideModelStep): number {
 	if (step === "writer") return 900_000;
 	if (step === "compaction") return 120_000;
 	if (step === "memoryEvents") return 60_000;
 	// The configured side models can spend well over a minute on structured
 	// Chinese planning. Keep a finite per-step cap without killing valid work.
-	return 180_000;
+	return 600_000;
 }
 
 export function sideTextRetryLimit(step: SideModelStep): number {
+	if (step.startsWith("director")) return 0;
 	if (step === "writer") return MODEL_MAX_RETRIES;
 	if (step === "memoryEvents") return 1;
 	return Math.min(3, MODEL_MAX_RETRIES);
 }
 
 /** 判定注入：收笔前一次性；不回报篇幅，续写/收笔归模型判断。 */
-export function verdictInjection(userName: string, allowAsk = true): string {
-	return `【判定】继续写${allowAsk ? "、必要时 `ask`" : ""}，或 \`draft_seal\` 收笔——你判断；剧情走向由你依据人物动机和已有事实自行决定${allowAsk ? "；只有用户主权未定且此刻不定就无法继续时才询问" : "，不要中途询问用户"}。`;
+export function verdictInjection(_userName: string): string {
+	return "【判定】继续写正文用 `draft_append`，修订用 `draft_edit`，完成本拍用 `draft_seal`。";
 }
 
 /**
@@ -751,7 +750,7 @@ function formatMemoryRecallHit(
 }
 
 /** 解析事件候选旁路输出：{ events: RpEventDigest[] }，宽容解析（剥围栏/首 { 试切）。 */
-function parseMemoryEventPayload(text: string, allowedRefs: Array<{ entryId: string; entryType?: string; turn?: number }> = []): import("../memory/types.ts").RpEventDigest[] | null {
+function parseMemoryEventPayload(text: string, allowedRefs: Array<{ entryId: string; entryType?: string; turn?: number; textBasis?: "rpNarrative" | "entryText"; charFrom?: number; charTo?: number }> = []): import("../memory/types.ts").RpEventDigest[] | null {
 	let t = text.trim();
 	const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/);
 	if (fence) t = fence[1].trim();
@@ -815,7 +814,17 @@ function parseMemoryEventPayload(text: string, allowedRefs: Array<{ entryId: str
 						? o.sourceRefs
 							.filter((ref): ref is Record<string, unknown> => !!ref && typeof ref === "object" && typeof (ref as Record<string, unknown>).entryId === "string")
 							.filter((ref) => allowedRefs.length === 0 || allowedRefs.some((allowed) => allowed.entryId === ref.entryId))
-							.map((ref) => ({ entryId: String(ref.entryId), ...(typeof ref.entryType === "string" ? { entryType: ref.entryType } : {}), ...(typeof ref.turn === "number" ? { turn: ref.turn } : {}), ...(typeof ref.charFrom === "number" ? { charFrom: ref.charFrom } : {}), ...(typeof ref.charTo === "number" ? { charTo: ref.charTo } : {}) }))
+							.map((ref) => {
+								const host = allowedRefs.find((allowed) => allowed.entryId === ref.entryId);
+								const lower = host?.charFrom ?? 0, upper = host?.charTo;
+								const requestedFrom = typeof ref.charFrom === "number" && Number.isFinite(ref.charFrom) ? Math.floor(ref.charFrom) : host?.charFrom;
+								const requestedTo = typeof ref.charTo === "number" && Number.isFinite(ref.charTo) ? Math.floor(ref.charTo) : upper;
+								const charFrom = requestedFrom === undefined ? undefined : Math.max(lower, Math.min(upper ?? requestedFrom, requestedFrom));
+								const charTo = requestedTo === undefined ? undefined : Math.max(charFrom ?? lower, Math.min(upper ?? requestedTo, requestedTo));
+								return { entryId: String(ref.entryId), entryType: host?.entryType ?? (typeof ref.entryType === "string" ? ref.entryType : undefined),
+									turn: host?.turn ?? (typeof ref.turn === "number" ? ref.turn : undefined), ...(charFrom !== undefined ? { charFrom } : {}),
+									...(charTo !== undefined ? { charTo } : {}), ...(host?.textBasis ? { textBasis: host.textBasis } : {}) };
+							})
 						: [],
 				});
 			}
@@ -1005,6 +1014,10 @@ export const mergeFinalText = (draft: string, text: string): string => {
 
 export class StageEngine {
 	#deps: StageEngineDeps;
+	#backgroundController: AbortController | null = null;
+	#pendingBackground: (() => void) | null = null;
+	#backgroundTimer: ReturnType<typeof setTimeout> | undefined;
+
 	#busy = false;
 	#queue: Array<{ text: string; sessionId: string; cardPath: string; submission?: StageSubmission; resolve: () => void; reject: (error: unknown) => void }> = [];
 	#abort: AbortController | null = null;
@@ -1035,6 +1048,8 @@ export class StageEngine {
 	/** 用户新输入开一拍：先落 user 消息再开演；忙时排队（流式中送达的输入不打断叙事） */
 	async performTurn(userText: string, submission?: StageSubmission): Promise<void> {
 		submission = submission ? { ...submission } : undefined;
+		const submittedMode = submission?.generationMode ?? loadStageConfig(this.#deps.cwd).generationMode;
+		if (isGenerationMode(submittedMode)) submission = { ...submission, generationMode: submittedMode };
 		this.#validateSubmission(submission);
 		if (this.#busy) {
 			const sm = this.#deps.getSessionManager();
@@ -1082,6 +1097,14 @@ export class StageEngine {
 				return;
 			}
 			const materials = loadStageMaterials(this.#deps.cwd);
+			if (isGenerationMode(details.rpGenerationMode)) {
+				const result = await this.#deliverAgentPresentation(materials, sm, String(target.id), narrative,
+					typeof details.rpAuthorDraft === "string" ? details.rpAuthorDraft : narrative,
+					anchor => this.#deps.getSessionManager() === sm && turnLeafIsStable(sm, anchor));
+				if (!result.ok) ev.onNotify?.("error", `卡格式重做失败：${result.error}；原有交付保持不变。`);
+				else ev.onActivity?.("卡格式完整交付已更新，正文事实保持不变");
+				return;
+			}
 			const curtainSkill = workflowSkill(materials.skillFiles, "curtain");
 			const boundedMaterials = buildCurtainRerollMaterials({ card: materials.card, entries: materials.entries, preset: materials.preset, statusBarFormats: materials.statusBarFormats });
 			const systemPrompt = `你在执行梨园的独立格式收尾。正文已经冻结，禁止复述、改写、概括或包裹正文。只生成 materials.formatPlan.modelTags；deterministicTags 由代码补齐，nativeTags 由梨园权威状态投影，forbiddenTags 禁止输出。不得借用历史回复或其他角色卡的格式。输出完整闭合后立即结束。\n\n# 工作流 Skill\n${curtainSkill?.body ?? "严格依据 formatPlan 生成当前卡要求的模型格式。"}`;
@@ -1138,9 +1161,26 @@ export class StageEngine {
 		}
 	}
 
+	async retryPendingSettlement(): Promise<StageTurnEndInfo> {
+		if(this.#busy)return {aborted:false,error:"正在生成，请先等待或停止"};
+		const sm=this.#deps.getSessionManager(),sessionId=sm.getSessionId(),ev=this.#deps.events??{};
+		const calls:ModelAttemptDiagnostic[]=[],obs:StageRequestObservation={phase:"settlement.recovery",diagnostics:calls};
+		this.#busy=true;this.#abort=new AbortController();ev.onTurnStart?.();let result:StageTurnEndInfo={aborted:false};
+		const timer=setTimeout(()=>this.#abort?.abort(),(loadStageConfig(this.#deps.cwd).generationTimeoutMinutes??60)*60000);
+		try { const materials=loadStageMaterials(this.#deps.cwd);await this.#recoverPendingTurn(materials,sm,ev,anchor=>this.#deps.getSessionManager()===sm&&sm.getSessionId()===sessionId&&turnLeafIsStable(sm,anchor),obs); }
+		catch(e){result={aborted:!!this.#abort?.signal.aborted,error:e instanceof Error?e.message:String(e)};ev.onNotify?.("error",result.error??"恢复失败");}
+		finally{
+			clearTimeout(timer);if(calls.length&&this.#deps.getSessionManager()===sm){const receipt=[...(sm.getBranch() as BranchEntryLike[])].reverse().find(e=>e.customType==="rp-turn-settlement")?.data as {narrativeEntryId?:string}|undefined;sm.appendCustomEntry("rp-model-diagnostics",{version:1,narrativeEntryId:receipt?.narrativeEntryId??null,calls});sm.flush();}
+			this.#busy=false;this.#abort=null;ev.onTurnEnd?.(result);
+		}
+		if(result.error){for(const queued of this.#queue.splice(0))queued.reject(new Error("结算尚未恢复，新输入未受理；草稿保留"));}
+		else void this.#drain();
+		return result;
+	}
+
 	/** 强制停止本拍：已流出的部分正文仍落树可见 */
 	abort(): void {
-		this.#abort?.abort();
+		this.#abort?.abort(); this.#backgroundController?.abort(); clearTimeout(this.#backgroundTimer); this.#pendingBackground = null;
 		const queued = this.#queue.splice(0);
 		for (const item of queued) item.reject(new Error("本拍已停止，排队输入已取消"));
 	}
@@ -1256,7 +1296,7 @@ export class StageEngine {
 		const prompt = buildWorldProfilePrompt({ skillBody: skill.body, card, entries: materials.entries, preset: materials.preset, greetingIndex: config.greetingIndex, previous: profile, recentHistory: rebuildHistory(branch).history });
 		this.#worldProfilePrepRunning = true;
 		this.#deps.events?.onActivity?.("角色卡世界画像：已在后台分析，完成后下一拍生效");
-		void this.#sideText("worldProfile", prompt.systemPrompt, prompt.userText, 12288, "off", undefined).then((result) => {
+		void this.#sideText("worldProfile", prompt.systemPrompt, prompt.userText, 12288, "off", this.#backgroundController?.signal).then((result) => {
 			if (typeof result !== "string") { this.#deps.events?.onActivity?.(`角色卡世界画像：后台分析失败（${result.error}）`); return; }
 			const base = profile ?? defaultCardWorldProfile(this.#deps.cwd, config.card, card.name, fingerprint, card);
 			const next = normalizeCardWorldProfile(result, base, { preserveStatus: !!profile, sourceFingerprint: fingerprint, analyzedTurns: countCompletedNarrativeTurns(branch) });
@@ -1311,6 +1351,7 @@ export class StageEngine {
 		})().catch((error) => ({ cardPath: input.cardPath, cardName: input.card.name, pools: input.pools, warnings: [`鲜活世界备料异常：${error instanceof Error ? error.message : String(error)}`] }));
 		this.#ecologyPoolPrep = task;
 		void task.then((candidate) => {
+			if (input.signal?.aborted) { if(this.#ecologyPoolPrep===task)this.#ecologyPoolPrep=null; return; }
 			if (this.#ecologyPoolPrep === task) {
 				this.#ecologyPoolReady = candidate;
 				this.#ecologyPoolPrep = null;
@@ -1320,10 +1361,17 @@ export class StageEngine {
 
 	async #run(userText: string | null, rerollPrep?: StageRerollPrep, submission?: StageSubmission): Promise<void> {
 		this.#validateSubmission(submission);
+		clearTimeout(this.#backgroundTimer); this.#backgroundController?.abort(); this.#backgroundController = null; this.#pendingBackground = null;
 		const ev = this.#deps.events ?? {};
 		this.#busy = true;
 		ev.onTurnStart?.();
 		let endInfo: StageTurnEndInfo = { aborted: false };
+		const cfg = loadStageConfig(this.#deps.cwd);
+		const requestedMode = submission?.generationMode ?? rerollPrep?.generationMode ?? cfg.generationMode;
+		const minutes = typeof cfg.generationTimeoutMinutes === "number" ? Math.max(1, Math.min(120, cfg.generationTimeoutMinutes)) : requestedMode === "director" ? 60 : 30;
+		const controller = new AbortController(); this.#abort = controller;
+		let budgetExpired = false;
+		const budgetTimer = setTimeout(() => { budgetExpired = true; controller.abort(); ev.onNotify?.("error", `本拍总体预算${minutes}分钟已到，保留已有正文与未完成收据，不跳过失败阶段。`); }, minutes * 60_000);
 		try {
 			endInfo = await this.#turn(userText, rerollPrep, submission);
 		} catch (err) {
@@ -1331,9 +1379,15 @@ export class StageEngine {
 			ev.onNotify?.("error", `本拍开演失败：${msg}`);
 			endInfo = { aborted: false, error: msg };
 		} finally {
+			clearTimeout(budgetTimer);
+			if (budgetExpired) endInfo = { ...endInfo, aborted: true, error: endInfo.error ?? "本拍总体时间预算耗尽" };
 			this.#busy = false;
 			this.#abort = null;
 			ev.onTurnEnd?.(endInfo);
+			if (!endInfo.aborted && !endInfo.error && this.#pendingBackground) {
+				const launch = this.#pendingBackground;
+				this.#backgroundTimer = setTimeout(() => { if (!this.#busy && !this.#queue.length && this.#pendingBackground === launch) { this.#pendingBackground = null; launch(); } }, 2000);
+			}
 		}
 	}
 
@@ -1341,6 +1395,7 @@ export class StageEngine {
 		const { cwd, events: rawEv = {} } = this.#deps;
 		const turnStartedAt = Date.now();
 		const sm = this.#deps.getSessionManager();
+		this.#abort ??= new AbortController();
 		const turnSessionId = sm.getSessionId();
 		const ownsSession = () => this.#deps.getSessionManager() === sm && sm.getSessionId() === turnSessionId;
 		let discardPerformance = false;
@@ -1350,6 +1405,7 @@ export class StageEngine {
 			return stable;
 		};
 		const collector = new TurnPerformanceCollector();
+		const modelDiagnostics: ModelAttemptDiagnostic[] = [];
 		const preflight = new WriterContextPreflight();
 		let committedNarrativeId: string | undefined;
 		const beatLog: Array<{ ts: number; ev: string; data: string }> = [];
@@ -1363,8 +1419,10 @@ export class StageEngine {
 			onNotify: (level, text) => { _blog("notify", `[${level}] ${text}`); rawEv.onNotify?.(level, text); },
 		};
 
-		const observation = (phase: PerformancePhase): StageRequestObservation => ({ collector, phase, ...(phase === "writer" || phase === "curtain" ? { preflight, notify: (message: string) => ev.onNotify?.("warning", message) } : {}) });
+		const observation = (phase: PerformancePhase): StageRequestObservation => ({ collector, phase, diagnostics: modelDiagnostics, ...(phase === "writer" || phase === "curtain" ? { preflight, notify: (message: string) => ev.onNotify?.("warning", message) } : {}) });
 		const turnSideText = (phase: PerformancePhase, step: SideModelStep, sp: string, ut: string, maxTokens = 8192, reasoning: string | undefined = "off", signal: AbortSignal | undefined = this.#abort?.signal) => this.#sideText(step, sp, ut, maxTokens, reasoning, signal, observation(phase));
+		const repairStructured = (phase: PerformancePhase, step: SideModelStep, prompt: {systemPrompt:string;userText:string}, invalid:string, errors:string[], maxTokens=8192) => this.#repairStructured(step,prompt,invalid,errors,maxTokens,observation(phase));
+
 		const measureAwait = async <T>(phase: PerformancePhase, work: Promise<T>): Promise<T> => {
 			const end = collector.beginPhase(phase);
 			try { const value = await work; end("success"); return value; }
@@ -1377,12 +1435,19 @@ export class StageEngine {
 		// 素材现读：改卡/改预设/挂书即时生效
 		const materials = loadStageMaterials(cwd);
 		const { config, card } = materials;
+		const selectedMode = submission?.generationMode ?? rerollPrep?.generationMode ?? config.generationMode;
+		// 无模式的 SDK 调用暂保留历史工具协议；Web 宿主始终绑定两种新模式之一。
+		const generationMode = isGenerationMode(selectedMode) ? selectedMode : undefined;
+		let agentWorkflow: GenerationWorkflow | undefined;
+		const settlementWarnings: string[] = [];
+		const pendingOwnerTools: Array<{ name: string; args: Record<string, unknown> }> = [];
+		if (generationMode) await this.#recoverPendingTurn(materials, sm, ev, stableLeaf, observation("settlement.recovery"));
 		// 非关键候选只消费已经完成的结果；尚未完成就沿用旧工件，绝不等它们出正文。
 		if (userText !== null && !rerollPrep) {
 			this.#consumeWorldProfileReady(materials);
-			this.#consumeLiteraryProfileReady(config.card);
+			if (!generationMode) this.#consumeLiteraryProfileReady(config.card);
 			// 生态双池同样不等待：后台尚未完成时，本拍继续用磁盘现有池。
-			this.#consumeEcologyPoolPrep(config.card, card.name);
+			if (generationMode !== "direct") this.#consumeEcologyPoolPrep(config.card, card.name);
 		}
 		if (materials.macroWarnings.length > 0) {
 			const key = materials.macroWarnings.join(",");
@@ -1420,7 +1485,7 @@ export class StageEngine {
 				ev.onNotify?.("warning", `主演插头配置的模型 ${resolved.requested.provider}/${resolved.requested.id} 不可用，本次已继承剧情总插头。`);
 			}
 		}
-		this.#abort = new AbortController();
+		this.#abort ??= new AbortController();
 
 		let branch = sm.getBranch() as BranchEntryLike[];
 		// 卡级画像已存在但当前分支尚无 Manifest 时，在新 user 落树之前播种。
@@ -1437,15 +1502,15 @@ export class StageEngine {
 		if (userText !== null) {
 			// 接受回执只代表 user 已可靠落树，不代表主演已生成成功。
 			this.#validateSubmission(submission);
-			expectedTurnLeafId = sm.appendMessage({ ...nowMsg(userText), ...(submission?.clientMessageId !== undefined ? { details: { rpClientMessageId: submission.clientMessageId } } : {}) });
+			expectedTurnLeafId = sm.appendMessage({ ...nowMsg(userText), ...((submission?.clientMessageId !== undefined || generationMode) ? { details: { ...(submission?.clientMessageId !== undefined ? { rpClientMessageId: submission.clientMessageId } : {}), ...(generationMode ? { rpGenerationMode: generationMode } : {}) } } : {}) });
 			sm.flush();
 			try { submission?.onAccepted?.(expectedTurnLeafId); } catch { ev.onActivity?.("输入已落树，但接受回执回调失败"); }
 		}
 		// 上下文 = f(分支)
 		branch = sm.getBranch() as BranchEntryLike[];
 		if (userText !== null && !rerollPrep) {
-			this.#startWorldProfilePrep(materials, branch);
-			this.#startLiteraryProfilePrep(materials, branch);
+			if (!generationMode) this.#startWorldProfilePrep(materials, branch);
+			if (!generationMode) this.#startLiteraryProfilePrep(materials, branch);
 		}
 		const rawState = stateFromBranch(branch);
 		const identityHints = Object.fromEntries(Object.keys(rawState.characters).flatMap(name => materials.entries
@@ -1455,7 +1520,7 @@ export class StageEngine {
 		const state = identityRepair.state;
 		const novelPlayContext = novelPlayContextForBranch(cwd, materials.rawCard, branch);
 		const { history, lastUserText, lastNarrativeText, summary } = rebuildHistory(branch, materials.promptRules);
-		const literaryProfile = literaryProfileFromBranch(branch);
+		const literaryProfile = generationMode ? undefined : literaryProfileFromBranch(branch);
 		const committedEcology = literaryEcologyFromBranch(branch);
 		let literaryEcology = committedEcology;
 		const latestUserEntry = [...branch].reverse().find(entry => entry.message?.role === "user");
@@ -1465,17 +1530,17 @@ export class StageEngine {
 		const worldManifest = worldManifestFromBranch(branch, existingWorldProfile?.cardKey);
 		const modularWorld = modularWorldFromBranch(branch, worldManifest);
 		const adaptiveWorldEnabled = config.literaryWorldEnabled === true && !!worldManifest;
-		let literaryDirectionData = rerollPrep?.literaryDirectionData;
-		let literaryDirection = rerollPrep?.literaryDirection;
-		let plotAdaptation = rerollPrep?.plotAdaptation;
-		let sceneConductor = rerollPrep?.sceneConductor;
+		let literaryDirectionData = generationMode === "director" ? undefined : rerollPrep?.literaryDirectionData;
+		let literaryDirection = literaryDirectionData ? formatLiteraryDirection(literaryDirectionData) : undefined;
+		let plotAdaptation = generationMode ? undefined : rerollPrep?.plotAdaptation;
+		let sceneConductor = generationMode ? undefined : rerollPrep?.sceneConductor;
 		let novelProjection: NovelPlayProjection | undefined;
 		let preparedNovelPlay: PreparedNovelPlayTurn | undefined;
 		let planFact: PlanFactComparison | undefined;
 		// A reroll is a writer retry. If the previous turn has prep artifacts they
 		// are carried in rerollPrep; otherwise do not rebuild slow optional prep.
 		const rerollWithoutPrep = userText === null && !rerollPrep;
-		const directorRequested = !rerollPrep && !rerollWithoutPrep && config.literaryQuality === "guided" && !isBackstageText(lastUserText);
+		const directorRequested = generationMode === "direct" ? true : !generationMode && !rerollPrep && !rerollWithoutPrep && config.literaryQuality === "guided" && !isBackstageText(lastUserText);
 		if (!history.some((m) => m.role === "user")) {
 			ev.onNotify?.("error", "没有可开演的用户输入。");
 			return { aborted: false, error: "no-user-input" };
@@ -1501,11 +1566,12 @@ export class StageEngine {
 		}
 
 		// 旧会话遗留的戏外轮：不注预设末端模板（不按剧情模板硬写）
-		const legacyBackstage = !!lastUserText && isBackstageText(lastUserText);
+		const legacyBackstage = !generationMode && !!lastUserText && isBackstageText(lastUserText);
 		const ecologyGlobalSkill = workflowSkill(materials.skillFiles, "ecology-global");
 		const ecologyCardSkill = workflowSkill(materials.skillFiles, "ecology-card");
 		const ecologyRuntimeSkill = workflowSkill(materials.skillFiles, "ecology-runtime");
 		let ecologyPools = loadEcologyPools(cwd, config.card, card.name);
+		const passiveEcology = generationMode && config.literaryEcologyEnabled ? existingEcologyReference({ cardPool: ecologyPools.card, globalPool: ecologyPools.global, ecology: literaryEcology, state, history, userText: lastUserText }) : undefined;
 		if (false && !rerollPrep && config.literaryEcologyEnabled === true && !legacyBackstage && ecologyGlobalSkill && ecologyCardSkill && ecologyRuntimeSkill) {
 			const sourceLeafId = sm.getLeafId();
 			if (sourceLeafId) {
@@ -1557,6 +1623,7 @@ export class StageEngine {
 		let literaryContinuity: LiteraryContinuity | undefined = rerollPrep?.literaryContinuity;
 		const prepLeafId = sm.getLeafId();
 		// 拍前旁路共享总预算；建议工件超时只会降级，不得阻塞正文入口。
+		let prepFinished = false;
 		const prepController = new AbortController();
 		// 停止按钮必须同时取消拍前旁路；否则导演/排演/生态请求仍会继续跑完。
 		this.#abort.signal.addEventListener("abort", () => prepController.abort(), { once: true });
@@ -1585,8 +1652,8 @@ export class StageEngine {
 			prepController.abort();
 			ev.onActivity?.(`拍前准备达到总预算（${Math.round(prepBudgetMs / 1000)}秒），正文按已有材料继续`);
 		}, prepBudgetMs);
-		const arrivalRequested = !rerollPrep && !rerollWithoutPrep && config.literaryEcologyEnabled === true && !legacyBackstage && !!ecologyRuntimeSkill;
-		const continuityRequested = !rerollPrep && !rerollWithoutPrep && config.literaryQuality === "guided" && !legacyBackstage && shouldRunContinuity({ state, history, summary, userText: lastUserText });
+		const arrivalRequested = !generationMode && !rerollPrep && !rerollWithoutPrep && config.literaryEcologyEnabled === true && !legacyBackstage && !!ecologyRuntimeSkill;
+		const continuityRequested = !generationMode && !rerollPrep && !rerollWithoutPrep && config.literaryQuality === "guided" && !legacyBackstage && shouldRunContinuity({ state, history, summary, userText: lastUserText });
 		const arrivalPromise: Promise<LiteraryEcologyState | undefined> = arrivalRequested
 			? Promise.resolve().then(async () => {
 				ev.onActivity?.("鲜活世界：匹配当前人物与场所");
@@ -1630,10 +1697,10 @@ export class StageEngine {
 			: Promise.resolve(undefined);
 		// PLAN-RP-MEMORY：拍前自动召回——受 injectOnTurn 配置与宿主依赖双重门控；不进正文关键路径（缺失即降级）。
 		const memoryRecallRequested =
-			!rerollPrep && !legacyBackstage && !!this.#deps.recallForTurn && shouldRecallHistory(lastUserText);
-		const memoryRecallMode = classifyRecallIntent(lastUserText);
+			!rerollPrep && !legacyBackstage && !!this.#deps.recallForTurn && (!!generationMode || shouldRecallHistory(lastUserText));
+		const memoryRecallMode = generationMode && !shouldRecallHistory(lastUserText) ? "sweep" : classifyRecallIntent(lastUserText);
 		const memoryRecallPromise: Promise<MemoryRecallHitLike[] | undefined> =
-			memoryRecallRequested
+			memoryRecallRequested && (!generationMode || memoryRecallMode === "point")
 				? Promise.resolve().then(async () => {
 					const shouldRecall = await (this.#deps.shouldRecallForTurn?.(sm.getSessionId()) ?? true);
 					if (!shouldRecall) return undefined;
@@ -1657,7 +1724,7 @@ export class StageEngine {
 		const memoryArcPromise =
 			memoryRecallRequested && memoryRecallMode === "sweep" && this.#deps.recallArcsForTurn
 				? Promise.race([
-					this.#deps.recallArcsForTurn(sm.getSessionId()).catch(() => []),
+					Promise.resolve().then(async () => (await (this.#deps.shouldRecallForTurn?.(sm.getSessionId()) ?? true)) ? this.#deps.recallArcsForTurn!(sm.getSessionId()) : []).catch(() => []),
 					new Promise<Array<{ arc: string; text: string; events: number }>>((resolve) => setTimeout(() => resolve([]), 5_000)),
 				])
 				: Promise.resolve([]);
@@ -1704,13 +1771,13 @@ export class StageEngine {
 		} else if ((memoryHits || memoryArcs.length) && !stableLeaf(prepLeafId)) {
 			ev.onActivity?.("剧情记忆召回已丢弃（期间切换了分支）");
 		}
-		if (!rerollPrep && config.literaryEcologyEnabled === true && !legacyBackstage && ecologyGlobalSkill && ecologyCardSkill) {
+		if (!generationMode && !rerollPrep && config.literaryEcologyEnabled === true && !legacyBackstage && ecologyGlobalSkill && ecologyCardSkill) {
 			const poolSignal = new AbortController();
 			this.#startEcologyPoolPrep({ cardPath: config.card, card, entries: materials.entries, state, history, userText: lastUserText, userName: config.userName, globalSkill: ecologyGlobalSkill, cardSkill: ecologyCardSkill, pools: ecologyPools, signal: poolSignal.signal });
 			ev.onActivity?.("鲜活世界：已在后台搜索并准备下一拍素材");
 		}
 		// 小说开演独立于生态开关。它只读取原始卡扩展、不可变作品包和当前权威分支。
-		if (!rerollPrep && !rerollWithoutPrep && !legacyBackstage) {
+		if (generationMode !== "direct" && !rerollPrep && !rerollWithoutPrep && !legacyBackstage) {
 			const novelSkill = materials.skillFiles.find(skill => skill.dir === "小说分支校准");
 			if (novelSkill) {
 				preparedNovelPlay = await waitPrep(prepareNovelPlayTurn({
@@ -1729,7 +1796,7 @@ export class StageEngine {
 
 		// 剧情卡—生态适配：卡池是长期卡级语法，运行态给出眼前人物/地点；本步骤把抽象模板
 		// 变形成当前故事可用的因果候选。候选不落事实，正文实际发生后才由场记/大纲校准。
-		const plotAdaptationRequested = !rerollPrep && !rerollWithoutPrep && config.literaryEcologyEnabled === true && !legacyBackstage;
+		const plotAdaptationRequested = !generationMode && !rerollPrep && !rerollWithoutPrep && config.literaryEcologyEnabled === true && !legacyBackstage;
 		if (plotAdaptationRequested) {
 			ev.onActivity?.("生态剧情适配：按当前剧情卡编排事件候选");
 			const sourceLeafId = sm.getLeafId();
@@ -1756,13 +1823,15 @@ export class StageEngine {
 				summary,
 				literaryProfile,
 				continuity: literaryContinuity,
-				ecology: config.literaryEcologyEnabled === true ? formatLiteraryEcologyInjection(literaryEcology) : undefined,
+				ecology: config.literaryEcologyEnabled === true ? [formatLiteraryEcologyInjection(literaryEcology), passiveEcology].filter(Boolean).join("\n\n") || undefined : undefined,
 				plotAdaptation: formatPlotAdaptation(plotAdaptation),
 				activatedLore: activated,
 				userText: lastUserText,
 				charName: card.name,
 				userName: config.userName,
 				characterIdentityIndex: identityReference || undefined,
+				characterCard: generationMode === "direct" ? card : undefined,
+				userPersona: generationMode === "direct" ? config.userPersona : undefined,
 				outline: projectOutline(outlineFromBranch(branch), "director"),
 			});
 			const result = await turnSideText(
@@ -1773,7 +1842,7 @@ export class StageEngine {
 				undefined,
 				prepController.signal,
 			);
-			if (stableLeaf(sourceLeafId) && typeof result === "string") {
+			if (!prepFinished && stableLeaf(sourceLeafId) && typeof result === "string") {
 				literaryDirectionData = parseLiteraryDirection(result) ?? undefined;
 				literaryDirection = literaryDirectionData ? formatLiteraryDirection(literaryDirectionData) : undefined;
 			} else if (typeof result !== "string") {
@@ -1785,8 +1854,8 @@ export class StageEngine {
 		// 不再按出场人数额外调用模型做逐角色排演。
 		await waitPrep(directorPromise, undefined);
 		// 排演后的场面编排：把各角色的独立动机变成可见动作链。它不写正文，也不创造事实，
-		// 只把本拍事件的因果、信息差和玩家停点交给主演。
-		const sceneConductorRequested = !rerollPrep && !rerollWithoutPrep && !legacyBackstage && (!!plotAdaptation || !!literaryDirectionData);
+		// 只把本拍候选的因果与信息边界交给主演。
+		const sceneConductorRequested = !generationMode && !rerollPrep && !rerollWithoutPrep && !legacyBackstage && (!!plotAdaptation || !!literaryDirectionData);
 		if (sceneConductorRequested) {
 			ev.onActivity?.("场面编排：组织角色行动与信息差");
 			const sourceLeafId = sm.getLeafId();
@@ -1798,6 +1867,7 @@ export class StageEngine {
 			} else if (typeof result !== "string") ev.onActivity?.(`场面编排：生成失败（${result.error}），主演按现有材料继续`);
 		}
 		clearTimeout(prepTimer);
+		prepFinished = true;
 		endPrep(this.#abort?.signal.aborted ? "aborted" : "success");
 
 		// 历史后段每拍重装（{{lastusermessage}} 在此生效）：原文原序直通末端，不再拆层。
@@ -1823,8 +1893,8 @@ export class StageEngine {
 		// 读侧依赖先建：统一层按注入情况决定哪些世界书工具上清单（M-D2）。
 		// 可读名单：拉取档 skill 文件（常驻档已随 system 全文送达，不重复上单）+ 进口 topic 包。
 		// 必定读取（每轮）skill：受理门强制落笔前先读（认 frontmatter `每轮` 标志，不认具体名字）
-		const forcedSkills = materials.skillFiles.filter((f) => f.everyBeat).map((f) => f.name);
-		const skillNames = materials.skillFiles.filter((f) => !f.resident).map((f) => f.name);
+		const forcedSkills = generationMode ? [] : materials.skillFiles.filter((f) => f.everyBeat).map((f) => f.name);
+		const skillNames = materials.skillFiles.filter((f) => !f.resident && (!generationMode || (!f.workflow && !f.everyBeat))).map((f) => f.name);
 		const readDeps = this.#toolDeps(lastUserText);
 		// MCP 外设（8/06 重接）：hub 里本会话已连接的工具并入清单。
 		// 空数组＝没启用/没连上，与「未注入 mcp 依赖」同效——都不上清单。
@@ -1834,9 +1904,7 @@ export class StageEngine {
 		const mediaTools = this.#deps.media ? mediaStageTools(config.language, mediaOpts) : [];
 		// 助手委托（8/06 重接）：runner 未注册时不上清单
 		const assistantTool = assistantStageTool();
-		// 剧情连续演出：不在中途把叙事决定抛回用户，避免选择卡打断节奏。
-		// askUser 保留在宿主接口中供其他场景使用，但台上工具清单永久剔除 ask。
-		const askEnabled = config.creationMode === "ask" && !!this.#deps.askUser;
+		// 正文只运行稿纸工具；共创询问接口不接入台上工具清单。
 		const ws = createWorkspace();
 		const wsDeps: WorkspaceDeps = {
 			rules: extractDraftRules([...materials.presetRuleTexts, ...phAll.map((b) => b.text)]),
@@ -1849,13 +1917,16 @@ export class StageEngine {
 		const allTools = [
 			...stageTools(config.language, readDeps),
 			...(skillNames.length > 0 ? [skillReadTool(config.language, skillNames)] : []),
-			...writeTools(config.language, planStepBudget(wsDeps.rules.wordRange)).filter((t) => t.name !== "ask" || askEnabled),
+			...writeTools(config.language, planStepBudget(wsDeps.rules.wordRange)),
 			...mediaTools,
 			...(assistantTool ? [assistantTool] : []),
 			...mcpTools,
 		];
 		const configuredToolSupport = (model.compat as { supportsTools?: boolean } | undefined)?.supportsTools !== false;
-		const tools = configuredToolSupport ? allTools : [];
+		const readOnlyToolNames = new Set([...unifiedStageReadToolNames(readDeps), "world_state_get", "skill_read"]);
+		const deferredBusinessWrites = new Set(unifiedStageWriteToolNames(readDeps).filter(name => name !== "worldline_back"));
+		const ownerBusinessTools = new Set([...deferredBusinessWrites, ...mcpTools.map(t => t.name), ...mediaTools.map(t => t.name), ...(assistantTool ? [assistantTool.name] : []), "panel_write", "panel_close"]);
+		const tools = configuredToolSupport ? (generationMode ? allTools.filter(t => readOnlyToolNames.has(t.name) || ownerBusinessTools.has(t.name)) : allTools) : [];
 		if (!configuredToolSupport) ev.onActivity?.("主演 API 已配置为不支持工具，本拍使用纯文本模式");
 
 		const systemPrompt = buildStageSystemPrompt({
@@ -1868,7 +1939,7 @@ export class StageEngine {
 			// skill 素材位（M-R2）：常驻包全文 + 拉取包 L1 索引，无包零痕迹
 			skills: materials.skillFiles,
 			tools: tools.length > 0,
-			allowAsk: askEnabled && tools.some((tool) => tool.name === "ask"),
+			generationMode,
 			// MCP 外设索引进 system（不进每拍注入）：会话内字节稳定，不破前缀缓存。
 			// 与旧 director.ts 同一位置——工具清单里有 mcp__ 工具，这里说明它们是什么。
 			mcpTools: mcpTools.map((t) => ({ name: t.name, description: t.description })),
@@ -1891,20 +1962,17 @@ export class StageEngine {
 			sceneConductor: formatSceneConductor(sceneConductor),
 			literaryWorld: adaptiveWorldEnabled ? formatModularWorldInjection(modularWorld, worldManifest) : undefined,
 			literaryEcology: config.literaryEcologyEnabled === true ? formatLiteraryEcologyInjection(literaryEcology) : undefined,
+			existingEcology: passiveEcology,
 			memoryRecall: memoryRecallBlocks,
 					novelPlayContext,
 				novelSceneRecall: novelProjection?.sceneRecall?.map(item => `- ${item.title}：${item.summary}\n  原文证据：${item.quote}`).join("\n") || undefined,
-				characterIdentityIndex: identityHints || undefined,
-			writerGuidance: [
-				...materials.writerGuidance,
-				...(workflowSkill(materials.skillFiles, "writer")
-					? [{ topic: "主演工作流 skill", text: workflowSkill(materials.skillFiles, "writer")!.body }]
-					: []),
-			],
+				characterIdentityIndex: identityReference || undefined,
+			writerGuidance: materials.writerGuidance,
+			writerWorkflow: generationMode === "director" ? undefined : workflowSkill(materials.skillFiles, generationMode === "direct" ? "writer-direct" : "writer")?.body,
 		});
 		const curtainSkill = workflowSkill(materials.skillFiles, "curtain");
 		const curtainMaterials = buildCurtainRerollMaterials({ card, entries: materials.entries, preset: materials.preset, statusBarFormats: materials.statusBarFormats });
-		const curtain = curtainMaterials.formatPlan.modelTags.length || curtainMaterials.formatPlan.deterministicTags.length
+		const curtain = !generationMode && (curtainMaterials.formatPlan.modelTags.length || curtainMaterials.formatPlan.deterministicTags.length)
 			? `【主演·最终状态栏与图片交付】正文已经完成并封笔。现在仍由你本人完成本拍最终交付：先保证正文已经完整落稿，再按 formatPlan 输出状态栏等格式区块。当前卡要求图片交付，因此必须至少输出一份完整的 <image>... </image>（或兼容的 <imageTag>... </imageTag>）块；块内按 NAI4 规则写出 image### 场景与分角色提示词 ### 的内容。图片块应根据本拍刚写的正文和最终状态生成，不能凭空补写事件；格式轻微偏离不影响交付。只生成 formatPlan.modelTags；deterministicTags 由代码补齐；nativeTags 由梨园权威状态投影；forbiddenTags 禁止输出。不要复述、改写或压缩正文。\n\n# 工作流 skill\n${curtainSkill?.body ?? "依据当前卡材料生成非正文格式。"}\n\n# formatPlan\n${JSON.stringify(curtainMaterials, null, 2)}`
 			: undefined;
 
@@ -1915,7 +1983,7 @@ export class StageEngine {
 		const endsWithUser = history[history.length - 1]?.role === "user";
 		const past = endsWithUser ? history.slice(0, -1) : history;
 		// 规划卡（五注入之一）：每拍第 1 轮随末端注入送达（工作区新建必空），用户话保持最后一句。
-		const injWithCard = tools.length > 0 ? `${injection}\n\n${PLAN_CARD}` : injection;
+		const injWithCard = !generationMode && tools.length > 0 ? `${injection}\n\n${PLAN_CARD}` : injection;
 		const tailText = endsWithUser ? `${injWithCard}\n\n${history[history.length - 1].text}` : injWithCard;
 
 		const buildWriterMessages = (tail: string): unknown[] => [
@@ -1969,6 +2037,7 @@ export class StageEngine {
 				declaredMarkers: materials.declaredMarkers,
 				skills: materials.skillFiles,
 				tools: false,
+				generationMode,
 				mcpTools: [],
 			});
 		const pureTextTail = endsWithUser ? `${injection}\n\n${history[history.length - 1].text}` : injection;
@@ -2014,17 +2083,115 @@ export class StageEngine {
 		let writerMessages = messages;
 		let writerTools = tools;
 		let toolFallbackUsed = tools.length === 0;
-		let s = this.#observedStream(model, { systemPrompt: writerSystemPrompt, messages: writerMessages, ...(writerTools.length ? { tools: writerTools } : {}) }, options, observation("writer"));
+		let s: ReturnType<StageStreamFn>;
 		let final: AssistantMsgLike | null = null;
 		let errored: string | undefined;
 		let text = "";
 		const fwd = this.#draftForwarder(ev);
 		let loopTail = "";
 		let curtainText = "";
+		let authorDraft = "";
+		let presentationDone = false;
 		let interruptedDraft = "";
 		let enteredAgentLoop = false;
 		let stoppedByUser = false;
 		let corruptOutput = false;
+		if (generationMode) {
+			const sourceEntries = branch.flatMap(entry => {
+				if (!entry.id || !entry.message || !["user", "assistant"].includes(entry.message.role ?? "")) return [];
+				const details = entry.message.details as Record<string, unknown> | undefined;
+				const raw = typeof details?.rpNarrative === "string" ? details.rpNarrative : entry.message.content;
+				const text = typeof raw === "string" ? raw : Array.isArray(raw) ? raw.filter(part => part.type === "text").map(part => part.text ?? "").join("") : "";
+				return text ? [{ id: entry.id, text }] : [];
+			});
+			const expertContext: DirectorContext = {
+				sessionId: sm.getSessionId(), leafId: expectedTurnLeafId,
+				userText: lastUserText, userPersona: config.userPersona, card: { name: card.name, description: card.description, personality: card.personality, scenario: card.scenario },
+				state, history, summary: [summary, ...(memoryRecallBlocks ?? []).map(x => x.text)].filter(Boolean).join("\n\n") || undefined, world: formatModularWorldInjection(modularWorld, worldManifest), ecology: { committed: formatLiteraryEcologyInjection(literaryEcology), existingCandidates: passiveEcology },
+				outline: projectOutline(outlineFromBranch(branch), "director"), lore: activated,
+				presetText: [...materials.presetBefore.map(p => p.text), ...phAll.map(p => p.text)].join("\n\n"),
+				writerPresetText:[...materials.presetBefore.filter(p=>p.source==="block").map(p=>p.text),...phAll.filter(p=>p.source==="block").map(p=>p.text)].join("\n\n"),
+				constantLore:constantLoreOf(materials).map((entry,index)=>({id:`constant:${index}`,title:entry.comment,content:entry.content})),
+				sources: [
+					{ id: "preset", text: [...materials.presetBefore.map(p => p.text), ...phAll.map(p => p.text)].join("\n\n") },
+					{ id: "card", text: [card.description, card.personality, card.scenario].join("\n") },
+					{ id: "persona", text: config.userPersona },
+					{ id: "state", text: JSON.stringify(state) },
+					{ id: "world", text: formatModularWorldInjection(modularWorld, worldManifest) ?? "" },
+					{ id: "ecology", text: formatLiteraryEcologyInjection(literaryEcology) ?? "" },
+					...sourceEntries.slice(-8).reverse(),
+					...(summary ? [{ id: "summary", text: summary }] : []),
+					...(memoryRecallBlocks ?? []).map((x, index) => ({ id: `memory:${index}`, text: x.text })),
+					...activated.map((entry, index) => ({ id: `lore:${index}`, text: entry.content })),
+				],
+			};
+			const priorReports: DirectorReport[] = [];
+			const retrievedSources: Array<{ id: string; text: string }> = [];
+			let retrievalCount = 0;
+			const outcome = await runAgentTurn({
+				mode: generationMode, systemPrompt, messages,
+				readTools: tools, directorPrompt: directorMainSkill(materials.skillFiles),
+				timeoutMs: Math.max(1, (config.generationTimeoutMinutes ?? (generationMode === "director" ? 60 : 30)) * 60_000 - (Date.now() - turnStartedAt)),
+				allowDegraded: config.allowDegradedGeneration === true,
+				normalizeNarrative: extractPureTextNarrative,
+				outputRecoveryPrompt: workflowSkill(materials.skillFiles,"writer-recovery")?.body,
+				toolProtocolRecoveryPrompt: workflowSkill(materials.skillFiles,"tool-protocol-repair")?.body,
+				toolsSupported: configuredToolSupport, signal: this.#abort.signal, isCurrent: () => stableLeaf(expectedTurnLeafId),
+				stream: (context, requestSignal) => {
+					const source = this.#observedStream(model, context, { ...options, signal: requestSignal ?? this.#abort?.signal, maxTokens: firstCallMaxTokens }, observation("writer"));
+					return { [Symbol.asyncIterator]: () => streamWithTimeout(source, WRITER_STREAM_TIMEOUT_MS, requestSignal ?? this.#abort?.signal), result: () => source.result() };
+				},
+				read: async (name, args, requestSignal) => {
+					if (requestSignal?.aborted || !stableLeaf(expectedTurnLeafId)) return { text: "工具请求已取消或分支改变", isError: true };
+					if (name === "skill_read" && !skillNames.includes(String(args.name ?? ""))) return { text: "该 Skill 不在本拍可读清单。" };
+					if (deferredBusinessWrites.has(name)) { pendingOwnerTools.push({ name, args: structuredClone(args) }); return { text: "资料/面板操作已暂存，正文保存并结算后才执行。" }; }
+					let result: ToolRunResult | MediaStageResult | null | undefined;
+					if (mcpTools.some(t => t.name === name)) result = await runMcpStageTool(this.#deps.mcp!, name, args, requestSignal);
+					else if (mediaTools.some(t => t.name === name)) result = await runMediaStageTool(cwd, name, args);
+					else if (name === "assistant_run") result = await runAssistantStageTool(name, args, requestSignal);
+					else result = await this.#runReadTool({ ws, language: config.language }, readDeps, name, args);
+					if (requestSignal?.aborted || !stableLeaf(expectedTurnLeafId)) return { text: "迟到工具结果未采用", isError: true };
+					if (mediaTools.some(t => t.name === name) && (result as MediaStageResult)?.details && !(result as MediaStageResult).isError) {
+						ws.mediaDeliveries ??= []; ws.mediaDeliveries.push({ toolName: name, details: (result as MediaStageResult).details!, text: result!.text });
+					}
+					// Forward actual read receipts, not private reasoning or helper-authored prose.
+					if (result?.text && !(result as MediaStageResult).isError && readOnlyToolNames.has(name) && name !== "skill_read") {
+						retrievedSources.push({ id: `retrieval:${++retrievalCount}:${name}`, text: result.text.slice(0, 4_000) });
+						if (retrievedSources.length > 4) retrievedSources.shift();
+					}
+					return result ?? { text: "工具不可用", isError: true };
+				},
+				experts: async (phase, tasks, draft, requestSignal) => {
+					const reports = await executeDirectorBatch({ phase, tasks,
+						context: { ...expertContext, sources: [...retrievedSources, ...expertContext.sources], priorReports: [...priorReports], ...(draft ? { draft } : {}) }, skills: materials.skillFiles,
+						run: (step, sp, ut, maxTokens, recoverMalformed) => {
+							if(recoverMalformed){const previous=[...modelDiagnostics].reverse().find(x=>x.step===step);modelDiagnostics.push({phase:`agent.${phase}`,step,provider:previous?.provider??"validation",model:previous?.model??"schema",attempt:(previous?.attempt??0)+1,status:"failed",kind:"format",reason:"JSON/schema：专家报告字段无效",durationMs:0});}
+							return this.#sideText(step, sp, ut, maxTokens, "off", requestSignal ?? this.#abort?.signal, observation(`agent.${phase}` as PerformancePhase), recoverMalformed === true);
+						},
+						repairMalformed: !!config.analysisRecoveryModel,
+						signal: requestSignal ?? this.#abort?.signal, isCurrent: () => stableLeaf(expectedTurnLeafId), onActivity: ev.onActivity });
+					if (!requestSignal?.aborted && stableLeaf(expectedTurnLeafId)) priorReports.push(...reports);
+					return reports;
+				},
+				onDelta: (delta, reset) => ev.onDelta?.("text", delta, true, reset),
+				onThinking: delta => ev.onDelta?.("thinking", delta),
+				onResync: narrative => ev.onDraftResync?.(splitDraftSegments(narrative)), onActivity: ev.onActivity,
+			});
+			agentWorkflow = outcome.workflow; final = outcome.final; if (outcome.aborted && final) final = { ...final, stopReason: "aborted" }; text = outcome.authorDraft; authorDraft = outcome.authorDraft;
+			errored = outcome.error; enteredAgentLoop = true;
+			ws.draft = extractDraftBody(extractPureTextNarrative(outcome.narrative)); ws.sealed = !outcome.aborted;
+			const structuralDraft = authorDraft.replace(/<(image(?:Tag)?|options)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, "");
+			if (!outcome.aborted && authorDraft.trim() && !/<(?:content|main_output)\b/i.test(authorDraft)
+				&& (/<[A-Za-z_][\w:.-]*\b[^>]*>/.test(structuralDraft) || /^\s*(?:```(?:json|html)|[\[{])/.test(structuralDraft))) {
+				const boundary = await this.#readAuthorNarrative(materials, authorDraft, stableLeaf, expectedTurnLeafId, observation("writer"));
+				if (boundary.ok) ws.draft = boundary.narrative;
+				else { errored = boundary.error; final = {...(final ?? {role:"assistant",content:[]}),stopReason:"aborted",errorMessage:boundary.error}; }
+			}
+			if (ws.draft !== outcome.narrative.trim()) ev.onDraftResync?.(splitDraftSegments(ws.draft));
+			ws.rounds = outcome.workflow.writerRounds; ws.appends = ws.draft ? 1 : 0;
+			ws.timeline = [...(outcome.final?.content ?? []).filter(x => x.type === "thinking" && x.thinking).map(x => ({ kind: "thinking" as const, text: x.thinking! })), ...(ws.draft ? [{ kind: "text" as const, text: ws.draft, draft: true }] : [])];
+		} else {
+			s = this.#observedStream(model, { systemPrompt: writerSystemPrompt, messages: writerMessages, ...(writerTools.length ? { tools: writerTools } : {}) }, options, observation("writer"));
 		// 首轮 writer 若在中途断流（未落任何稿段），自动重发整个请求，避免一次上游故障毁掉整拍。
 		// 一旦已有稿段（ws.draft）则保留现有行为（交由 abort 收敛，不无脑重发）。
 		for (let writerAttempt = 0; writerAttempt <= WRITER_OUTER_RETRIES; writerAttempt++) {
@@ -2033,7 +2200,7 @@ export class StageEngine {
 			for await (const e of streamWithTimeout(s, WRITER_STREAM_TIMEOUT_MS, this.#abort?.signal)) {
 				// provider 可能不会因 AbortSignal 立即结束 async iterator；在事件入口丢弃迟到事件并主动关闭迭代器。
 				if (this.#abort?.signal.aborted) {
-					try { await s.return?.(); } catch { /* provider 已关闭 */ }
+					try { await (s as ReturnType<StageStreamFn> & { return?: () => Promise<unknown> }).return?.(); } catch { /* provider 已关闭 */ }
 					break;
 				}
 				if (e.type === "done") {
@@ -2164,7 +2331,6 @@ export class StageEngine {
 				events: ev,
 				observation: observation("writer"),
 				_blog,
-				allowAsk: askEnabled,
 			});
 			if (turn.final) final = turn.final;
 			if (turn.errored) errored = turn.errored;
@@ -2173,6 +2339,8 @@ export class StageEngine {
 			loopTail = turn.tailText ?? turn.text;
 			curtainText = turn.curtainText ?? "";
 			interruptedDraft = turn.pendingDraft ?? "";
+		}
+
 		}
 
 		endWriter(errored ? "failed" : final?.stopReason === "aborted" || this.#abort?.signal.aborted ? "aborted" : "success");
@@ -2196,8 +2364,8 @@ export class StageEngine {
 		// 稿件为主体，text 里**格式特征**的尾巴补回（纯文本闲聊不进正文）。
 		const hasFormatPlan = curtainMaterials.formatPlan.modelTags.length > 0 || curtainMaterials.formatPlan.deterministicTags.length > 0;
 		if (ws.draft.trim()) {
-			if (hasFormatPlan) curtainText = finalizeCurtainText(`${text}\n\n${curtainText}`, curtainMaterials.formatPlan);
-			else {
+			if (!generationMode && hasFormatPlan) curtainText = finalizeCurtainText(`${text}\n\n${curtainText}`, curtainMaterials.formatPlan);
+			else if (!generationMode) {
 				const merged = mergeFinalText(ws.draft, loopTail || text);
 				curtainText = merged.startsWith(ws.draft.trim()) ? merged.slice(ws.draft.trim().length).trim() : "";
 			}
@@ -2218,7 +2386,7 @@ export class StageEngine {
 			: corruptOutput ? "" : ws.draft.trim() || mergeFinalText("", text);
 		const finalText = [narrativeText, curtainText].filter(Boolean).join("\n\n");
 		// 正文是唯一事实源；对照工件只总结兑现程度，随后由既有 OutlineEngine 读取 rpPrep 校准。
-		if (!aborted && narrativeText && (plotAdaptation || sceneConductor)) {
+		if (!generationMode && !aborted && narrativeText && (plotAdaptation || sceneConductor)) {
 			const prompt = buildPlanFactPrompt({ plot: plotAdaptation, scene: sceneConductor, narrative: narrativeText });
 			const result = await turnSideText("settlement.planFact", "scribe", prompt.systemPrompt, prompt.userText, 2048);
 			if (typeof result === "string") planFact = parsePlanFact(result);
@@ -2257,6 +2425,7 @@ export class StageEngine {
 				: Math.ceil((thinkingChars + finalText.length) / 4);
 			const details = {
 				...prevDetails,
+				...(generationMode ? { rpGenerationMode: generationMode, rpGenerationWorkflow: agentWorkflow, rpAuthorDraft: authorDraft } : {}),
 				...(narrativeTimeline.length ? { rpTimeline: narrativeTimeline } : {}),
 				...(narrativeText ? { rpNarrative: narrativeText } : {}),
 				...(curtainText.trim() ? { rpCurtain: curtainText.trim() } : {}),
@@ -2305,6 +2474,7 @@ export class StageEngine {
 					thinkingChars,
 					narrativeChars: draftBodyCharsOf(ws),
 				},
+				rpModelDiagnostics: modelDiagnostics,
 				rpInputComposition: { ...writerInput, initialChars: writerInitialChars },
 				rpContextPreflight: preflight.snapshot(),
 				...(ws.patchAudit.length ? { rpPatchAudit: ws.patchAudit } : {}),
@@ -2373,6 +2543,8 @@ export class StageEngine {
 			return { aborted: false, error: "no-draft" };
 		}
 
+		if (entryId && generationMode) { sm.appendCustomEntry("rp-turn-settlement", { version: 1, narrativeEntryId: entryId, status: aborted ? "pending" : "settling", mode: generationMode }); sm.flush(); }
+
 		// M-A：#revise 旁路停用（8/10 验收整体退役；修改由模型自发 draft_edit 承担）。
 		// 记账：world_state_update 干跑验证过的 patch 在此统一落账——
 		// 落树刚完成、叶即本拍新条目，无叶漂移窗口；模型是记账主体，harness 只执行。
@@ -2429,7 +2601,12 @@ export class StageEngine {
 				...(r.kind === "failed" ? { error: r.error.slice(0, 240) } : {}),
 			});
 			sm.flush();
+			if (generationMode && r.kind === "failed") {
+				ev.onNotify?.("warning", "正文已保存，账本尚未结算；下一条输入前会先恢复，不以旧账本继续演出。");
+				return { aborted: this.#abort?.signal.aborted === true, entryId, error: "账本结算未完成" };
+			}
 		}
+		if (entryId && generationMode && !aborted) { sm.appendCustomEntry("rp-turn-settlement", { version: 1, narrativeEntryId: entryId, status: "settling", ledgerDone: true, mode: generationMode }); sm.flush(); }
 
 		// 后台世界推演：Skill 即开关、也是规则唯一权威。完整快照落当前分支，
 		// 下一拍只注入裁剪投影；叶守卫防止异步推演写入用户已切换的世界线。
@@ -2456,7 +2633,8 @@ export class StageEngine {
 					const factPrompt = buildBeatFactPrompt(factsSkill.body, { userText: lastUserText, narrativeText, rpState: postState, world: currentWorld, history, manifest: worldManifest });
 					const factText = await turnSideText("settlement.worldFacts", "literaryWorldFacts", factPrompt.systemPrompt, factPrompt.userText, 8192);
 					if (typeof factText !== "string") return { state: undefined, audit: baseAudit("fact-failed", [factText.error]), error: `事实信封失败：${factText.error}` };
-					const factResult = normalizeBeatFactEnvelope(factText, { userText: lastUserText, narrativeText });
+					let factResult = normalizeBeatFactEnvelope(factText, { userText: lastUserText, narrativeText });
+					if (!factResult.envelope) { const repaired=await repairStructured("settlement.worldFacts","literaryWorldFacts",factPrompt,factText,factResult.errors); if(typeof repaired==="string") factResult=normalizeBeatFactEnvelope(repaired,{userText:lastUserText,narrativeText}); }
 					if (!factResult.envelope) return { state: undefined, audit: baseAudit("fact-failed", factResult.errors), error: `事实信封拒绝：${factResult.errors.join("；")}` };
 					const envelope = factResult.envelope;
 					ev.onActivity?.(`后台世界：已确认 ${envelope.facts.length} 条带证据事实`);
@@ -2469,16 +2647,26 @@ export class StageEngine {
 					const proposalPrompt = buildWorldProposalPrompt(worldSkill.body, { envelope, world: currentModularWorld, rpState: postState, manifest: worldManifest, dueModuleIds: dueModules.map((module) => module.id), moduleSkillBodies: modulePacks.map((skill) => ({ name: skill.name, body: skill.body })), ecologySignals: ecologySignalsForWorld(currentEcology) });
 					const proposalText = await turnSideText("settlement.worldProposal", "literaryWorld", proposalPrompt.systemPrompt, proposalPrompt.userText, 8192);
 					if (typeof proposalText !== "string") return { state: undefined, audit: baseAudit("proposal-failed", [proposalText.error], { envelopeHash: worldTransitionHash(envelope), elapsed: envelope.elapsed }), error: `世界提案失败：${proposalText.error}` };
-					const proposalResult = normalizeModularWorldProposal(proposalText, currentModularWorld, envelope, worldManifest);
+					let proposalResult = normalizeModularWorldProposal(proposalText, currentModularWorld, envelope, worldManifest);
+					if (!proposalResult.proposal) { const repaired=await repairStructured("settlement.worldProposal","literaryWorld",proposalPrompt,proposalText,proposalResult.errors); if(typeof repaired==="string") proposalResult=normalizeModularWorldProposal(repaired,currentModularWorld,envelope,worldManifest); }
 					if (!proposalResult.proposal) return { state: undefined, audit: baseAudit("rejected", proposalResult.errors, { envelopeHash: worldTransitionHash(envelope), proposalHash: worldTransitionHash(proposalText), elapsed: envelope.elapsed }), error: `世界提案拒绝：${proposalResult.errors.join("；")}` };
-					const proposal = proposalResult.proposal;
+					let proposal = proposalResult.proposal;
 					ev.onActivity?.("后台世界：独立审计因果、主权与信息边界");
-					const auditPrompt = buildWorldAuditPrompt(auditSkill.body, { envelope, proposal, world: currentModularWorld, rpState: postState, manifest: worldManifest, preflightWarnings: proposalResult.warnings });
+					let auditPrompt = buildWorldAuditPrompt(auditSkill.body, { envelope, proposal, world: currentModularWorld, rpState: postState, manifest: worldManifest, preflightWarnings: proposalResult.warnings });
 					const auditText = await turnSideText("settlement.worldAudit", "literaryWorldAudit", auditPrompt.systemPrompt, auditPrompt.userText, 8192);
 					if (typeof auditText !== "string") return { state: undefined, audit: baseAudit("audit-failed", [auditText.error], { envelopeHash: worldTransitionHash(envelope), proposalHash: worldTransitionHash(proposal), elapsed: envelope.elapsed }), error: `世界审计失败：${auditText.error}` };
-					const auditResult = normalizeWorldTransitionAudit(auditText, envelope);
+					let auditResult = normalizeWorldTransitionAudit(auditText, envelope);
+					if (!auditResult.audit) { const repaired=await repairStructured("settlement.worldAudit","literaryWorldAudit",auditPrompt,auditText,auditResult.errors); if(typeof repaired==="string") auditResult=normalizeWorldTransitionAudit(repaired,envelope); }
 					if (!auditResult.audit) return { state: undefined, audit: baseAudit("audit-failed", auditResult.errors, { envelopeHash: worldTransitionHash(envelope), proposalHash: worldTransitionHash(proposal), elapsed: envelope.elapsed }), error: `世界审计不可解析：${auditResult.errors.join("；")}` };
-					if (auditResult.audit.verdict !== "approve") return { state: undefined, audit: baseAudit("rejected", auditResult.audit.issues.filter((issue) => issue.severity === "error").map((issue) => issue.message), { envelopeHash: worldTransitionHash(envelope), proposalHash: worldTransitionHash(proposal), elapsed: envelope.elapsed, audit: auditResult.audit }), error: `世界提案未通过审计：${auditResult.audit.summary}` };
+					if(auditResult.audit.verdict!=="approve") {
+						const feedback=auditResult.audit.issues.filter(x=>x.severity==="error").map(x=>x.message);
+						const fixed=await repairStructured("settlement.worldProposal","literaryWorld",proposalPrompt,JSON.stringify(proposal),feedback.length?feedback:[auditResult.audit.summary]);
+						if(typeof fixed==="string") {
+							const normalized=normalizeModularWorldProposal(fixed,currentModularWorld,envelope,worldManifest);
+							if(normalized.proposal){proposal=normalized.proposal;auditPrompt=buildWorldAuditPrompt(auditSkill.body,{envelope,proposal,world:currentModularWorld,rpState:postState,manifest:worldManifest,preflightWarnings:normalized.warnings});const checked=await turnSideText("settlement.worldAudit","literaryWorldAudit",auditPrompt.systemPrompt,auditPrompt.userText,8192);if(typeof checked==="string")auditResult=normalizeWorldTransitionAudit(checked,envelope);}
+						}
+					}
+					if (!auditResult.audit || auditResult.audit.verdict !== "approve") return { state: undefined, audit: baseAudit("rejected", (auditResult.audit?.issues.filter((issue) => issue.severity === "error").map((issue) => issue.message) ?? auditResult.errors), { envelopeHash: worldTransitionHash(envelope), proposalHash: worldTransitionHash(proposal), elapsed: envelope.elapsed, audit: auditResult.audit }), error: `世界提案未通过审计：${auditResult.audit?.summary ?? auditResult.errors.join("；")}` };
 					const auditHash = worldTransitionHash(auditResult.audit);
 					const nextState = commitModularWorldTransition(currentModularWorld, proposal, auditHash, worldManifest);
 					return { state: nextState, audit: baseAudit("committed", [], { nextRound: nextState.round, envelopeHash: worldTransitionHash(envelope), proposalHash: worldTransitionHash(proposal), nextStateHash: worldTransitionHash(nextState), elapsed: envelope.elapsed, audit: auditResult.audit }), error: undefined };
@@ -2487,13 +2675,14 @@ export class StageEngine {
 					ev.onActivity?.("鲜活世界：推进人物生活与场所事件");
 				const prompt = buildEcologyRuntimePrompt(ecologyRuntimeSkill.body, {
 					phase: "aftermath", ecology: currentEcology, global: currentPools.global, cardPool: currentPools.card, lore: materials.entries,
-					state: postState, history, userText: latestUserOriginalText, userEntryId: latestUserEntryId, narrativeText, worldSignals: worldSignalsForEcology(currentModularWorld),
+					state: postState, history, userText: latestUserOriginalText, userEntryId: latestUserEntryId, narrativeText, ...(generationMode && entryId ? { trustedNarrative: { entryId, text: narrativeText } } : {}), worldSignals: worldSignalsForEcology(currentModularWorld),
 				});
 				const result = await turnSideText("settlement.ecology", "ecologyRuntime", prompt.systemPrompt, prompt.userText, 16384);
 				if (typeof result !== "string") return { state: degradedLiteraryEcologyRound(currentEcology, previousEcologyRound, "aftermath", result.error), degraded: true, error: result.error };
-				const parsed = normalizeLiteraryEcologyState(result, currentEcology);
+				let parsed = normalizeLiteraryEcologyState(result, currentEcology);
+				if (!parsed) { const repaired=await repairStructured("settlement.ecology","ecologyRuntime",prompt,result,["生态JSON不可解析"],16384); if(typeof repaired==="string") parsed=normalizeLiteraryEcologyState(repaired,currentEcology); }
 				if (!parsed) return { state: degradedLiteraryEcologyRound(currentEcology, previousEcologyRound, "aftermath", "输出不可解析"), degraded: true, error: "输出不可解析" };
-				const transitionErrors = validateEcologyTransition(currentEcology, parsed, worldSignalsForEcology(currentModularWorld), { latestUserText: latestUserOriginalText, latestUserEntryId, committedState: committedEcology });
+				const transitionErrors = validateEcologyTransition(currentEcology, parsed, worldSignalsForEcology(currentModularWorld), { latestUserText: latestUserOriginalText, latestUserEntryId, committedState: committedEcology, ...(generationMode && entryId ? { trustedNarrative: { entryId, text: narrativeText } } : {}) });
 				for (const warning of (parsed as typeof parsed & { commitmentWarnings?: string[] }).commitmentWarnings ?? []) ev.onActivity?.(`鲜活世界承诺来源门禁：${warning}`);
 				if (transitionErrors.length) collector.status("settlement.ecology", "degraded");
 				return transitionErrors.length
@@ -2511,9 +2700,11 @@ export class StageEngine {
 					// 模型并发、树写入串行：审计先留痕，权威世界仍在生态之前。
 					if (worldResult.audit) sm.appendCustomEntry(WORLD_AUDIT_ENTRY_TYPE, worldResult.audit);
 					if (worldResult.state) { sm.appendCustomEntry(LITERARY_WORLD_ENTRY_TYPE, { ...worldResult.state, _diagnosticSourceEntryId: entryId }); ev.onActivity?.(`后台世界推进至第 ${worldResult.state.round} 轮（已审计）`); }
-					else if (worldResult.error) ev.onActivity?.(`后台世界推演失败（${worldResult.error}），保留上一快照`);
+					else if (worldResult.error) { settlementWarnings.push("world"); ev.onActivity?.(`后台世界推演失败（${worldResult.error}），保留上一快照`); }
 					if (ecologyResult.state) {
-						sm.appendCustomEntry(LITERARY_ECOLOGY_ENTRY_TYPE, { ...ecologyResult.state, _diagnosticSourceEntryId: entryId });
+						if (ecologyResult.degraded) settlementWarnings.push("ecology");
+						if (!generationMode || config.allowDegradedGeneration === true || !ecologyResult.degraded) sm.appendCustomEntry(LITERARY_ECOLOGY_ENTRY_TYPE, { ...ecologyResult.state, _diagnosticSourceEntryId: entryId });
+						else sm.appendCustomEntry("rp-ecology-audit", {status:"failed",narrativeEntryId:entryId,error:classifyModelFailure(ecologyResult.error??"生态解析失败").reason});
 						if (!ecologyResult.degraded) {
 							this.#ecologyPoolWrite = this.#ecologyPoolWrite.then(() => {
 								const latest = loadEcologyPools(cwd, config.card, card.name);
@@ -2529,8 +2720,16 @@ export class StageEngine {
 			}
 		}
 
+		if (entryId && generationMode && !aborted) { sm.appendCustomEntry("rp-turn-settlement", { version: 1, narrativeEntryId: entryId, status: "settling", ledgerDone: true, worldDone: !settlementWarnings.includes("world"), ecologyDone: !settlementWarnings.includes("ecology"), degradedDomains: settlementWarnings, mode: generationMode }); sm.flush(); }
+
 		// 独立谢幕必须读取场记、世界与生态已经提交后的最终分支状态，不在 writer 循环里提前猜。
-		if (entryId && !aborted && narrativeText && curtain) {
+		if (entryId && generationMode && !aborted && narrativeText) {
+			const result = await this.#deliverAgentPresentation(materials, sm, entryId, narrativeText, authorDraft || text,
+				stableLeaf, observation("curtain"));
+			presentationDone = result.ok;
+			if (!result.ok) { settlementWarnings.push("presentation"); ev.onNotify?.("error", `正文已保存，但卡格式交付失败：${result.error}。留待恢复，不把缺格式当完整成功。`); }
+		}
+		if (entryId && !generationMode && !aborted && narrativeText && curtain) {
 			const curtainLeaf = sm.getLeafId();
 			const settledBranch = sm.getBranch() as BranchEntryLike[];
 			let nextCurtain = finalizeCurtainText("", curtainMaterials.formatPlan);
@@ -2576,14 +2775,259 @@ export class StageEngine {
 				.then(() => this.#rollMemoryEvents(entryId))
 				.catch((error) => console.error(`[stage-memory-events] 滚动提取失败：${error instanceof Error ? error.message : String(error)}`));
 		}
+		if (entryId && generationMode && !aborted && ownsSession() && this.#branchContains(sm.getBranch() as BranchEntryLike[], entryId)) for (const op of pendingOwnerTools) {
+			try { const result = await runStageTool(readDeps, op.name, op.args, config.language); sm.flush(); if (result.activity) ev.onActivity?.(result.activity); }
+			catch { settlementWarnings.push("asset"); ev.onNotify?.("warning", "资料或面板操作未完成，正文已保留；继续结算实际剧情"); }
+		}
+		if (entryId && generationMode && !aborted) {
+			const domainFailures = settlementWarnings.filter(x => x === "world" || x === "ecology" || x === "presentation");
+			const strict = config.allowDegradedGeneration !== true;
+			sm.appendCustomEntry("rp-turn-settlement", { version: 1, narrativeEntryId: entryId,
+				status: strict && domainFailures.length ? "pending" : settlementWarnings.length ? "degraded" : "complete",
+				ledgerDone:true,worldDone:!domainFailures.includes("world"),ecologyDone:!domainFailures.includes("ecology"),presentationDone,degradedDomains:settlementWarnings,mode:generationMode }); sm.flush();
+			if (strict && domainFailures.length) {
+				const error = `正文已保存，但${domainFailures.join("/")}结算仍失败；已留待恢复收据，不用旧快照假装本拍完成。下一输入前必须先恢复。`;
+				ev.onNotify?.("error",error); return {aborted:false,entryId,error};
+			}
+			if (generationMode === "director") this.#pendingBackground = () => {
+				if (!ownsSession() || loadStageConfig(cwd).card !== config.card) return;
+				this.#backgroundController = new AbortController();
+				this.#startWorldProfilePrep(materials,sm.getBranch() as BranchEntryLike[]);
+				if (config.literaryEcologyEnabled && ecologyGlobalSkill && ecologyCardSkill) {
+					const latest = sm.getBranch() as BranchEntryLike[];
+					this.#startEcologyPoolPrep({cardPath:config.card,card,entries:materials.entries,state:stateFromBranch(latest),history:rebuildHistory(latest).history,userText:lastUserText,userName:config.userName,globalSkill:ecologyGlobalSkill,cardSkill:ecologyCardSkill,pools:loadEcologyPools(cwd,config.card,card.name),signal:this.#backgroundController.signal});
+				}
+			};
+		}
 		return { aborted, entryId };
 		} finally {
+			if (modelDiagnostics.length && !discardPerformance && ownsSession()) {
+				try { sm.appendCustomEntry("rp-model-diagnostics", { version: 1, narrativeEntryId: committedNarrativeId ?? null, calls: modelDiagnostics }); sm.flush(); } catch { /* Diagnostics are not canonical state. */ }
+			}
 			const metrics = collector.finish(committedNarrativeId ?? "");
 			if (!discardPerformance && committedNarrativeId && ownsSession() && this.#branchContains(sm.getBranch() as BranchEntryLike[], committedNarrativeId)) {
 				try { sm.appendCustomEntry(TURN_PERFORMANCE_ENTRY_TYPE, metrics); sm.flush(); }
 				catch { rawEv.onActivity?.("本拍性能留痕写入失败（不影响正文权威）"); }
 			}
 		}
+	}
+
+
+
+
+	async #readAuthorNarrative(materials: StageMaterials, authorDraft: string, stable: (anchor:string|null)=>boolean,
+		anchor:string|null, observation?:StageRequestObservation): Promise<{ok:true;narrative:string}|{ok:false;error:string}> {
+		const skill = workflowSkill(materials.skillFiles,"author-boundary");
+		if(!skill)return {ok:false,error:"无法确认当前卡的正文边界，缺少主作者原稿解析Skill"};
+		let error = "主作者未返回有效正文边界";
+		for(let attempt=0;attempt<2;attempt++) {
+			if(!stable(anchor)||this.#abort?.signal.aborted)return {ok:false,error:"正文边界解析已取消或分支改变"};
+			this.#deps.events?.onActivity?.("主作者识别当前卡自定义正文结构：只取已写原文，不套固定正文标签");
+			const result = await this.#sideText("writer",skill.body,JSON.stringify({phase:"author-boundary",author_draft:authorDraft,
+				materials:buildAgentPresentationMaterials({card:materials.card,entries:materials.entries,preset:materials.preset,statusBarFormats:materials.statusBarFormats}),
+				...(attempt?{validation_errors:[error]}:{})},null,2),16384,undefined,this.#abort?.signal,observation);
+			if(typeof result!=="string"){error=result.error;continue;}
+			try {
+				const row=JSON.parse(result.trim().replace(/^```(?:json)?\s*|\s*```$/g,""));
+				if(!Array.isArray(row.fragments)||!row.fragments.length||row.fragments.length>100)throw new Error("原稿没有可核对的故事正文");
+				let cursor=0;const fragments:string[]=[];
+				for(const quote of row.fragments){
+					if(typeof quote!=="string"||!quote.trim())throw new Error("正文片段不是非空原文字符串");
+					const at=authorDraft.indexOf(quote,cursor);
+					if(at<0)throw new Error("正文片段改变、遗漏定位或倒置了主作者原文");
+					cursor=at+quote.length;fragments.push(quote);
+				}
+				const narrative=presentationPlainText(fragments.join("\n\n"));
+				if(!narrative.trim())throw new Error("原稿只有附属格式，没有故事正文");
+				if(!stable(anchor)||this.#abort?.signal.aborted)return {ok:false,error:"迟到正文边界未采用"};
+				return {ok:true,narrative};
+			}catch(e){error=e instanceof Error?e.message:String(e);}
+		}
+		return {ok:false,error};
+	}
+
+	async #deliverAgentPresentation(materials: StageMaterials, sm: StageSessionManager, entryId: string,
+		narrative: string, authorDraft: string, stable: (anchor: string | null) => boolean,
+		observation?: StageRequestObservation): Promise<{ok:true} | {ok:false;error:string}> {
+		const skill = workflowSkill(materials.skillFiles, "agent-presentation");
+		if (!skill) return {ok:false,error:"缺少卡格式完整交付Skill，未用固定标签模板替代"};
+		const ownerModel = this.#deps.getModel();
+		if (!ownerModel) return {ok:false,error:"未配置正文主作者模型"};
+		const anchor = sm.getLeafId(), branch = sm.getBranch() as BranchEntryLike[];
+		const manifest = worldManifestFromBranch(branch), world = modularWorldFromBranch(branch, manifest);
+		const state = stateFromBranch(branch), ecology = literaryEcologyFromBranch(branch);
+		const payload = {
+			phase: "agent-presentation", materials: buildAgentPresentationMaterials({card:materials.card,entries:materials.entries,preset:materials.preset,statusBarFormats:materials.statusBarFormats,activated:scanEntries(materials.entries,authorDraft+"\n"+narrative+"\n"+Object.keys(state.characters).join("\n"),materials.config.maxLoreInjections)}),
+			frozen_narrative: narrative, frozen_segments:presentationSegments(narrative), authored_images:authoredImages(authorDraft), author_draft: authorDraft, current_user_input: [...branch].reverse().find(entry=>entry.message?.role==="user")?.message?.content, user:{name:materials.config.userName,persona:materials.config.userPersona}, current_state: state,
+			current_world: world, current_ecology: ecology, calendar_facts: projectPresentation(state, world, ecology, materials.config.userName).calendar,
+		};
+		const planSkill = workflowSkill(materials.skillFiles,"presentation-plan");
+		if(!planSkill)return {ok:false,error:"缺少卡格式需求识别Skill，未回退固定标签清单"};
+		const planningMaterials = {...payload.materials,sources:payload.materials.sources.filter(source=>source.formatCandidate)};
+		// Stable card instructions are separate source documents too, not tag-name hints.
+		for(const [name,text] of Object.entries(payload.materials.card))if(name!=="name"&&text.trim())planningMaterials.sources.push({id:`card:${name}`,title:`card.${name}`,content:text,formatCandidate:true});
+		const validationFailed = (reason:string) => {
+			observation?.diagnostics?.push({phase:observation.phase,step:"writer",provider:String(ownerModel.provider??""),model:ownerModel.id,attempt:1,status:"failed",kind:"format",validationOnly:true,durationMs:0,reason:classifyModelFailure(reason).reason});
+		};
+		let plan:import("./agent-presentation.ts").AgentPresentationPlan|undefined, planError="需求识别未完成";
+		for(let attempt=0;attempt<2&&!plan;attempt++){
+			if(!stable(anchor)||this.#abort?.signal.aborted)return {ok:false,error:"格式需求识别已取消或分支改变"};
+			this.#deps.events?.onActivity?.("主Agent逐份读取当前卡格式原文，确定本拍完整交付清单");
+			const result=await this.#sideText("writer",planSkill.body,JSON.stringify({...payload,phase:"presentation-plan",materials:planningMaterials,...(attempt?{validation_errors:[planError]}:{})},null,2),16384,undefined,this.#abort?.signal,observation);
+			if(typeof result!=="string"){planError=result.error;continue;}
+			const parsed=parseAgentPresentationPlan(result,planningMaterials);
+			if(parsed.ok)plan=parsed.plan;else {planError=parsed.error;validationFailed(planError);}
+		}
+		if(!plan)return {ok:false,error:planError};
+		let error = "未收到有效格式交付", attempt = 0, sourceReads = 0;
+		for (let requestIndex = 0; requestIndex < 4 && attempt < 2; requestIndex++) {
+			if (!stable(anchor) || this.#abort?.signal.aborted) return {ok:false,error:"格式交付已取消或分支变化"};
+			this.#deps.events?.onActivity?.(attempt ? "卡格式校验失败：同主作者读取原因后重新交付" : "卡格式完整交付：原文规则、穿插图片与行动选项，两模式同一契约");
+			const result = await this.#sideText("writer", skill.body, JSON.stringify({...payload,format_requirements:plan, ...(attempt ? {validation_errors:[error]} : {})},null,2),
+				curtainMaxTokens(ownerModel), undefined, this.#abort?.signal, observation);
+			if (typeof result !== "string") { error = result.error; attempt++; continue; }
+			try {
+				const requested = JSON.parse(result.trim().replace(/^```(?:json)?\s*|\s*```$/g, ""));
+				if (Array.isArray(requested.readSources) && requested.readSources.length && sourceReads++ < 2) {
+					const enabled = materials.entries.filter(entry => entry.enabled);
+					let valid = true;
+					for (const id of requested.readSources.slice(0,16)) {
+						if (typeof id !== "string" || !payload.materials.sourceIndex.some(source => source.id === id)) { valid=false; break; }
+						if (payload.materials.sources.some(source => source.id === id)) continue;
+						const index = Number(id.split(":")[1]);
+						const source = id.startsWith("lore:") ? enabled[index]?.content : materials.preset?.blocks[index]?.content;
+						const title = payload.materials.sourceIndex.find(source => source.id === id)!.title;
+						if (typeof source !== "string") { valid=false; break; }
+						payload.materials.sources.push({id,title,content:source});
+					}
+					if (valid) { this.#deps.events?.onActivity?.("卡格式Agent按索引读取原始定义（未截断，不改变输出清单）"); continue; }
+				}
+			} catch { /* The ordinary validator handles malformed JSON and records a finite retry. */ }
+			attempt++;
+			const parsed = parseAgentPresentation(result, narrative, authorDraft, plan);
+			if (!parsed.ok) {
+				error = parsed.error;
+				validationFailed(error);
+				if (/JSON/.test(error)) {
+					const repaired=await this.#repairStructured("writer",{systemPrompt:skill.body,userText:JSON.stringify({...payload,format_requirements:plan})},result,[error],curtainMaxTokens(ownerModel),observation);
+					if(typeof repaired==="string"){
+						const valid=parseAgentPresentation(repaired,narrative,authorDraft,plan);
+						if(valid.ok&&stable(anchor)&&!this.#abort?.signal.aborted){sm.appendCustomEntry("rp-presentation-delivery",{targetEntryId:entryId,...valid.delivery,formatPlan:plan,inputSourceCount:payload.materials.sources.length,inputChars:JSON.stringify(payload.materials).length,retryCount:attempt,createdAt:Date.now()});sm.flush();return {ok:true};}
+						if(!valid.ok)error=valid.error;
+					}
+				}
+				continue;
+			}
+			if (!stable(anchor) || this.#abort?.signal.aborted) return {ok:false,error:"迟到格式结果未采用"};
+			sm.appendCustomEntry("rp-presentation-delivery", {targetEntryId:entryId,...parsed.delivery,formatPlan:plan,inputSourceCount:payload.materials.sources.length,inputChars:JSON.stringify(payload.materials).length,retryCount:attempt-1,createdAt:Date.now()});
+			sm.flush(); return {ok:true};
+		}
+		return {ok:false,error};
+	}
+
+	/** 半稿或结算失败的正文保留在树上；新输入落树前先补齐镜头账本和启用的领域结算。 */
+	async #recoverPendingTurn(materials: StageMaterials, sm: StageSessionManager, ev: StageEvents, stable: (anchor: string | null) => boolean, recoveryObservation?:StageRequestObservation): Promise<void> {
+		const branch = sm.getBranch() as BranchEntryLike[];
+		const status = new Map<string, { status?: string; ledgerDone?: boolean; worldDone?: boolean; ecologyDone?: boolean; presentationDone?: boolean; degradedDomains?: string[] }>();
+		for (const e of branch) if (e.customType === "rp-turn-settlement" && e.data && typeof e.data === "object") {
+			const d = e.data as { narrativeEntryId?: string; status?: string }; if (d.narrativeEntryId && d.status) status.set(d.narrativeEntryId, d);
+		}
+		const strictRecovery = materials.config.allowDegradedGeneration !== true;
+		const pending = [...branch].reverse().find(e => {
+			if(e.type!=="message"||e.message?.role!=="assistant"||!e.id)return false;
+			const receipt=status.get(e.id);return ["pending","settling"].includes(receipt?.status??"") || (strictRecovery && receipt?.status==="degraded" && receipt.degradedDomains?.some(x=>x==="world"||x==="ecology"));
+		});
+		if (!pending?.id) return;
+		const id = pending.id, recordedCheckpoint = status.get(id), details = pending.message?.details as Record<string, unknown> | undefined;
+		const checkpoint = recordedCheckpoint?.status === "degraded" && strictRecovery ? { ...recordedCheckpoint, worldDone:!recordedCheckpoint.degradedDomains?.includes("world"),ecologyDone:!recordedCheckpoint.degradedDomains?.includes("ecology") } : recordedCheckpoint;
+		const narrative = typeof details?.rpNarrative === "string" ? details.rpNarrative : "";
+		const trustedNarrative = ["direct", "director"].includes(String(details?.rpGenerationMode)) ? { entryId: id, text: narrative } : undefined;
+		if (!narrative.trim()) { sm.appendCustomEntry("rp-turn-settlement", { version: 1, narrativeEntryId: id, status: "complete", recovered: true }); sm.flush(); return; }
+		const at = branch.indexOf(pending), userEntry = branch.slice(0, at).reverse().find(e => e.message?.role === "user");
+		const content = userEntry?.message?.content;
+		const userText = typeof content === "string" ? content : Array.isArray(content) ? content.filter(p => p.type === "text").map(p => p.text ?? "").join("") : "";
+		const state = stateFromBranch(branch), { config, card } = materials;
+		const side = (step: SideModelStep, sp: string, ut: string, max = 8192) => this.#sideText(step, sp, ut, max, "off", this.#abort?.signal,recoveryObservation);
+		ev.onActivity?.("恢复上一拍未结算正文：先核对实际发生的内容，不重写半稿");
+		const ledger = (checkpoint?.ledgerDone || branch.some(e => e.customType === STATE_ENTRY_TYPE && (e.data as Record<string, unknown> | undefined)?._diagnosticSourceEntryId === id)) ? { kind: "skipped" as const, reason: "already-settled" } : await runScribeTurn({ sideText: (sp, ut) => side("scribe", sp, ut, 2048), appendStateEntry: next => sm.appendCustomEntry(STATE_ENTRY_TYPE, { ...next, _diagnosticSourceEntryId: id }), getLeafId: () => sm.getLeafId(), isLeafStable: stable, stateFile: this.#deps.getStateFile?.(sm.getSessionId()), onActivity: ev.onActivity }, { state, userText, assistantText: narrative, charName: card.name, userName: config.userName });
+		if (ledger.kind === "failed" || ledger.kind === "stale" || this.#abort?.signal.aborted) throw new Error("上一拍账本恢复尚未完成；本条输入未受理，不读取过期账本");
+		sm.appendCustomEntry("rp-turn-settlement", { version: 1, narrativeEntryId: id, ...checkpoint, status: "settling", ledgerDone: true }); sm.flush();
+		const postBranch = sm.getBranch() as BranchEntryLike[], anchor = sm.getLeafId();
+		const manifest = worldManifestFromBranch(postBranch), world = modularWorldFromBranch(postBranch, manifest);
+		const ecology = literaryEcologyFromBranch(postBranch), postState = stateFromBranch(postBranch);
+		const history = rebuildHistory(postBranch, materials.promptRules).history;
+		const degraded: string[] = (checkpoint?.degradedDomains ?? []).filter(x=>x!=="world"&&x!=="ecology"&&x!=="presentation");
+		let nextWorld: ReturnType<typeof commitModularWorldTransition> | undefined;
+		let auditEntry: ReturnType<typeof worldAuditEntry> | undefined;
+		let approvedRecoveryAudit: import("./literary-world-transition.ts").WorldTransitionAudit | undefined;
+		const recordedWorld = postBranch.some(e => (e.customType === LITERARY_WORLD_ENTRY_TYPE && (e.data as Record<string, unknown> | undefined)?._diagnosticSourceEntryId === id) || (e.customType === WORLD_AUDIT_ENTRY_TYPE && (e.data as Record<string, unknown> | undefined)?.narrativeEntryId === id && (e.data as Record<string,unknown> | undefined)?.status === "committed"));
+		const recordedEcology = postBranch.some(e => e.customType === LITERARY_ECOLOGY_ENTRY_TYPE && (e.data as Record<string, unknown> | undefined)?._diagnosticSourceEntryId === id && !(e.data as Record<string,unknown> | undefined)?.degraded);
+		if (!checkpoint?.worldDone && !recordedWorld && config.literaryWorldEnabled && manifest) {
+			const facts = workflowSkill(materials.skillFiles, "world-facts"), rules = workflowSkill(materials.skillFiles, "world"), audit = workflowSkill(materials.skillFiles, "world-audit");
+			if (facts && rules && audit) {
+				const fp = buildBeatFactPrompt(facts.body, { userText, narrativeText: narrative, rpState: postState, world: projectLiteraryWorldV1(world), history, manifest });
+				const f = await side("literaryWorldFacts", fp.systemPrompt, fp.userText);
+				let parsed = typeof f === "string" ? normalizeBeatFactEnvelope(f, { userText, narrativeText: narrative }) : undefined;
+				if(typeof f==="string"&&!parsed?.envelope){const fixed=await this.#repairStructured("literaryWorldFacts",fp,f,parsed?.errors??["事实信封无效"],8192,recoveryObservation);if(typeof fixed==="string")parsed=normalizeBeatFactEnvelope(fixed,{userText,narrativeText:narrative});}
+				if (parsed?.envelope) {
+					const env = parsed.envelope, due = dueWorldModules(manifest, env);
+					if (due.length) {
+						const pp = buildWorldProposalPrompt(rules.body, { envelope: env, world, rpState: postState, manifest, dueModuleIds: due.map(m => m.id), moduleSkillBodies: worldModuleSkillPacks(materials.skillFiles, due).map(x => ({ name: x.name, body: x.body })), ecologySignals: ecologySignalsForWorld(ecology) });
+						const pt = await side("literaryWorld", pp.systemPrompt, pp.userText);
+						let proposal = typeof pt === "string" ? normalizeModularWorldProposal(pt, world, env, manifest) : undefined;
+						if(typeof pt==="string"&&!proposal?.proposal){const fixed=await this.#repairStructured("literaryWorld",pp,pt,proposal?.errors??["世界提案无效"],8192,recoveryObservation);if(typeof fixed==="string")proposal=normalizeModularWorldProposal(fixed,world,env,manifest);}
+						if (proposal?.proposal) {
+							const ap = buildWorldAuditPrompt(audit.body, { envelope: env, proposal: proposal.proposal, world, rpState: postState, manifest, preflightWarnings: proposal.warnings });
+							const a = await side("literaryWorldAudit", ap.systemPrompt, ap.userText);
+							let normalized = typeof a === "string" ? normalizeWorldTransitionAudit(a, env) : undefined;
+							if(typeof a==="string"&&!normalized?.audit){const fixed=await this.#repairStructured("literaryWorldAudit",ap,a,normalized?.errors??["审计报告无效"],8192,recoveryObservation);if(typeof fixed==="string")normalized=normalizeWorldTransitionAudit(fixed,env);}
+							if(normalized?.audit?.verdict!=="approve") {
+								const errors=normalized?.audit?.issues.filter(x=>x.severity==="error").map(x=>x.message)??normalized?.errors??["世界审计未返回有效报告"];
+								ev.onActivity?.(`世界恢复审计拒绝：${errors.join("；")}；修复原提案后再次独立审计。`);
+								const fixed=await this.#repairStructured("literaryWorld",pp,JSON.stringify(proposal.proposal),errors,8192,recoveryObservation);
+								if(typeof fixed==="string"){
+									const revised=normalizeModularWorldProposal(fixed,world,env,manifest);
+									if(revised.proposal){const retryAudit=buildWorldAuditPrompt(audit.body,{envelope:env,proposal:revised.proposal,world,rpState:postState,manifest,preflightWarnings:revised.warnings});const value=await side("literaryWorldAudit",retryAudit.systemPrompt,retryAudit.userText);const check=typeof value==="string"?normalizeWorldTransitionAudit(value,env):undefined;if(check?.audit?.verdict==="approve"){approvedRecoveryAudit=check.audit;nextWorld=commitModularWorldTransition(world,revised.proposal,worldTransitionHash(check.audit),manifest);}else ev.onActivity?.(`修复后审计仍拒绝：${check?.audit?.summary??check?.errors.join("；")??"请求失败"}`);}
+								}
+							}
+							else { approvedRecoveryAudit=normalized.audit;nextWorld = commitModularWorldTransition(world, proposal.proposal, worldTransitionHash(normalized.audit), manifest); }
+						}
+						if (!nextWorld) degraded.push("world");
+					}
+				} else degraded.push("world");
+			} else degraded.push("world");
+			auditEntry = worldAuditEntry({ status: degraded.includes("world") ? "rejected" : "committed", narrativeEntryId: id, baseRound: world.round, baseStateHash: worldTransitionHash(world), cardKey: manifest.cardKey, manifestRevision: manifest.profileRevision, errors: degraded.includes("world") ? ["恢复结算未通过世界证据/审计，保留旧快照"] : [], ...(approvedRecoveryAudit ? {audit:approvedRecoveryAudit} : {}) });
+		}
+		let nextEcology: LiteraryEcologyState | undefined;
+		if (!checkpoint?.ecologyDone && !recordedEcology && config.literaryEcologyEnabled) {
+			const skill = workflowSkill(materials.skillFiles, "ecology-runtime"), pools = loadEcologyPools(this.#deps.cwd, config.card, card.name);
+			if (skill) {
+				const ep = buildEcologyRuntimePrompt(skill.body, { phase: "aftermath", ecology, global: pools.global, cardPool: pools.card, state: postState, history, userText, userEntryId: userEntry?.id, narrativeText: narrative, trustedNarrative, worldSignals: worldSignalsForEcology(world) });
+				const r = await side("ecologyRuntime", ep.systemPrompt, ep.userText, 16384);
+				let parsed = typeof r === "string" ? normalizeLiteraryEcologyState(r, ecology) : undefined;
+				if(typeof r==="string"&&!parsed){const fixed=await this.#repairStructured("ecologyRuntime",ep,r,["生态JSON不可解析"],16384,recoveryObservation);if(typeof fixed==="string")parsed=normalizeLiteraryEcologyState(fixed,ecology);}
+				if (parsed && !validateEcologyTransition(ecology, parsed, worldSignalsForEcology(world), { latestUserText: userText, latestUserEntryId: userEntry?.id, committedState: ecology, trustedNarrative }).length) nextEcology = commitLiteraryEcologyRound(parsed, ecology.round);
+			}
+			if (!nextEcology) { degraded.push("ecology"); nextEcology = degradedLiteraryEcologyRound(ecology, ecology.round, "aftermath", "恢复结算未通过，保留原有内容"); }
+		}
+		if (!stable(anchor) || this.#abort?.signal.aborted) throw new Error("恢复结果因分支变化或取消丢弃，本条输入未受理");
+		if (recordedWorld && checkpoint?.worldDone === false && !auditEntry) {
+			const snapshot=[...postBranch].reverse().find(e=>e.customType===LITERARY_WORLD_ENTRY_TYPE&&(e.data as Record<string,unknown>|undefined)?._diagnosticSourceEntryId===id);
+			if(snapshot){ev.onActivity?.("世界已经按本拍来源提交；校正旧失败收据，不重复推进或伪造新的模型审阅。");auditEntry=worldAuditEntry({status:"committed",narrativeEntryId:id,baseRound:world.round,nextRound:world.round,baseStateHash:worldTransitionHash(world),nextStateHash:worldTransitionHash(world),errors:[]});}
+		}
+		if (auditEntry) sm.appendCustomEntry(WORLD_AUDIT_ENTRY_TYPE, auditEntry);
+		if (nextWorld) sm.appendCustomEntry(LITERARY_WORLD_ENTRY_TYPE, { ...nextWorld, _diagnosticSourceEntryId: id });
+		if (nextEcology && (!degraded.includes("ecology") || config.allowDegradedGeneration === true)) sm.appendCustomEntry(LITERARY_ECOLOGY_ENTRY_TYPE, { ...nextEcology, _diagnosticSourceEntryId: id });
+		let presentationRestored = checkpoint?.presentationDone;
+		if (checkpoint?.presentationDone === false || checkpoint?.degradedDomains?.includes("presentation")) {
+			const delivered = await this.#deliverAgentPresentation(materials, sm, id, narrative,
+				typeof details.rpAuthorDraft === "string" ? details.rpAuthorDraft : narrative, stable, recoveryObservation);
+			presentationRestored = delivered.ok;
+			if (!delivered.ok) degraded.push("presentation");
+		}
+		sm.appendCustomEntry("rp-turn-settlement", { version: 1, narrativeEntryId: id, presentationDone:presentationRestored, status: degraded.some(x=>x==="world"||x==="ecology"||x==="presentation") && config.allowDegradedGeneration !== true ? "pending" : degraded.length ? "degraded" : "complete", recovered:true,ledgerDone:true,worldDone:!degraded.includes("world"),ecologyDone:!degraded.includes("ecology"),degradedDomains:degraded });
+		sm.flush();
+		if (degraded.some(x=>x==="world"||x==="ecology"||x==="presentation") && config.allowDegradedGeneration !== true) throw new Error(`上一拍${degraded.join("/")}仍未恢复；已诊断，不接收新输入，不跳过失败。`);
 	}
 
 	/** 每剧情库 N 拍提取一次事件账本；失败不推进游标，下一拍自动扩大窗口重试。 */
@@ -2607,16 +3051,21 @@ export class StageEngine {
 		let starts = cursorIndex >= 0 ? beatStarts.filter((index) => index > cursorIndex) : beatStarts.slice(-every);
 		if (starts.length < every) return;
 		starts = starts.slice(-Math.max(every, every * 4));
-		const window = bounded.slice(starts[0]!);
-		let narrative = serializeForSummary(window, materials.config.userName, materials.card.name);
-		if (narrative.length < 20) return;
-		if (narrative.length > 24_000) narrative = narrative.slice(-24_000);
-		const refs: Array<{ entryId: string; entryType?: string; turn?: number }> = [];
-		let turn = 0;
-		for (const entry of window) {
-			if (entry.type === "message" && entry.message?.role === "user") turn++;
-			if (entry.id) refs.push({ entryId: entry.id, entryType: entry.type, ...(turn ? { turn } : {}) });
+		const memoryWindow = narrativeMemoryWindow(bounded, sourceEntryId, starts.length);
+		if (!memoryWindow) return;
+		let remaining = 24_000;
+		const sent: typeof memoryWindow.entries = [];
+		const refs: Array<{ entryId: string; entryType: string; turn: number; textBasis: "rpNarrative" | "entryText"; charFrom: number; charTo: number }> = [];
+		for (const entry of [...memoryWindow.entries].reverse()) {
+			const take = Math.min(remaining, entry.text.length);
+			if (take <= 0) break;
+			sent.unshift({ ...entry, text: entry.text.slice(-take) });
+			refs.unshift({ entryId: entry.entryId, entryType: entry.entryType, turn: entry.turn, textBasis: entry.textBasis,
+				charFrom: entry.text.length - take, charTo: entry.text.length });
+			remaining -= take;
 		}
+		const narrative = sent.map((entry) => `【sourceRef ${JSON.stringify(refs.find((ref) => ref.entryId === entry.entryId))}】\n${entry.role === "assistant" ? materials.card.name : materials.config.userName}：${entry.text}`).join("\n\n");
+		if (narrative.length < 20 || !refs.length) return;
 		const existingAll = book.listEvents();
 		const preferred = existingAll.filter((event) => event.importance === "core" || event.importance === "major");
 		const existing = [...preferred, ...existingAll.slice(-30)].filter((event, index, list) => list.findIndex((item) => item.id === event.id) === index).slice(0, 12);
@@ -2698,7 +3147,8 @@ export class StageEngine {
 	): Promise<CompactOutcome> {
 		const ev = this.#deps.events ?? {};
 		const sm = this.#deps.getSessionManager();
-		const { config, card } = loadStageMaterials(this.#deps.cwd);
+		const materials = loadStageMaterials(this.#deps.cwd);
+		const { config, card } = materials;
 		try {
 			const branch = sm.getBranch() as BranchEntryLike[];
 			const memoryExpectedLeaf = sm.getLeafId();
@@ -2791,6 +3241,7 @@ ${skill.body ?? ""}`;
 					userName: config.userName,
 					charName: card.name,
 					everyNTurns,
+					memoryInstructions: workflowSkill(materials.skillFiles, "memory")?.body,
 					...(minChars !== undefined ? { minChars } : {}),
 				},
 			);
@@ -2846,8 +3297,6 @@ ${skill.body ?? ""}`;
 		_blog?: (event: string, data: string) => void;
 		/** 有界的独立谢幕格式指令。 */
 		curtain?: string;
-		/** 是否向主演暴露 ask 工具。 */
-		allowAsk?: boolean;
 	}): Promise<{ final: AssistantMsgLike | null; errored?: string; text: string; tailText?: string; curtainText?: string; pendingDraft?: string; stoppedByUser?: boolean }> {
 		const rawEv2 = o.events ?? this.#deps.events ?? {};
 		const blog = o._blog ?? (() => {});
@@ -2945,7 +3394,7 @@ ${skill.body ?? ""}`;
 						// ask 裁决席位同样消失。兜底封笔前补一次（verdictInjected 守卫防循环）。
 						if (!verdictInjected && o.ws.plan.length > 0 && draftBodyCharsOf(o.ws) > 0) {
 							verdictInjected = true;
-							convo.push(nowMsg(verdictInjection(o.wsDeps.userName, o.allowAsk)));
+							convo.push(nowMsg(verdictInjection(o.wsDeps.userName)));
 						} else {
 							// 兜底封笔（催告已给过/全量稿天然封笔）→ 记账：停手不越站
 							if (!o.ws.sealed) {
@@ -3006,45 +3455,6 @@ ${skill.body ?? ""}`;
 				for (const call of calls) {
 					const name = call.name ?? "";
 					let r: ToolRunResult | MediaStageResult;
-					// P7：ask 工具——弹出选择卡等用户应答，答案作为新输入回喂模型。
-					// 用户停止（undefined）→ 本拍收束：不再续轮，直接以现稿定稿。
-					if (name === "ask" && this.#deps.askUser) {
-						const q = String(call.arguments?.question ?? "").trim() || "请你定夺";
-						const raw = call.arguments?.options;
-						const options = Array.isArray(raw)
-							? raw.map((s) => String(s).trim()).filter(Boolean)
-							: [];
-						// 停下来等用户：回合制共创，不设超时；abort 信号透传（用户点停止即收敛）
-						const answer = await waitForUserChoice(this.#deps.askUser(q, options, this.#abort?.signal), this.#abort?.signal);
-						o.ws.lookups++; // 用户参与选择＝这一拍有戏（draft_write 门禁判据）
-						if (answer === undefined) {
-							// 用户停止：笔还给用户，本拍收束——标记后跳出循环
-							ev.onActivity?.(`ask「${q.slice(0, 24)}」· 用户停止`);
-							userStopped = true;
-							recordSegment(o.ws, {
-								kind: "tool",
-								activity: { kind: "tool_start", name: "ask", detail: "用户停止——笔还给用户" },
-							});
-							break;
-						}
-						r = {
-							text: `用户已作答：「${answer}」。`,
-							activity: `ask「${q.slice(0, 24)}」· 用户作答`,
-						};
-						ev.onActivity?.(r.activity);
-						recordSegment(o.ws, {
-							kind: "tool",
-							activity: { kind: "tool_start", name: "ask", detail: r.activity },
-						});
-						convo.push({
-							role: "toolResult",
-							toolCallId: call.id,
-							toolName: "ask",
-							content: [{ type: "text", text: r.text }],
-							timestamp: Date.now(),
-						});
-						continue;
-					}
 					// 记账轮的结构信号（§2.3）：写账工具被调＝记账仍在进行；面板写入计数进工作区
 					if (LEDGER_TOOLS.has(name)) ledgerCallThisRound = true;
 					if (name === "panel_write" || name === "panel_close") o.ws.panelWrites++;
@@ -3079,7 +3489,7 @@ ${skill.body ?? ""}`;
 							ok: false,
 						};
 					} else if (
-						// 抢跑 seal 时序保证（PLAN-ASK §2.2）：判定是唯一 ask 裁决席位，模型直接封笔会整个
+						// 抢跑 seal 时序保证：封笔前先读取本轮的稿纸回执，模型直接封笔会整个
 						// 跳过它（8/11 实弹）。首次抢跑不受理，回执即判定文案（同一席位提前送达）；下一轮再调
 						// seal 照常受理。8/12 放宽：不再要求路标全勾——模型没勾完就封笔同样会跳过判定
 						// （实弹：勾 2/3 直接封笔，判定整个消失），判定送达不该依赖模型自觉勾选。
@@ -3092,7 +3502,7 @@ ${skill.body ?? ""}`;
 					) {
 						verdictInjected = true;
 						r = {
-							text: verdictInjection(o.wsDeps.userName, o.allowAsk),
+							text: verdictInjection(o.wsDeps.userName),
 							activity: "封笔暂缓——先判定",
 							ok: false,
 						};
@@ -3192,7 +3602,7 @@ ${skill.body ?? ""}`;
 			// 每次成功落下一段后固定回看一次；回看是内部控制信号，不会进入正文稿纸。
 			if (appendedThisRound && !o.ws.sealed) {
 				convo.push(nowMsg(CREATIVE_REVIEW_INJECTION));
-				ev.onActivity?.("主演分段回看：检查声音、潜台词、节奏与模板化表达");
+				ev.onActivity?.("主演分段回看：稿纸已更新");
 			}
 
 			// 五注入日程（工具轮后半程）：seal 之后记账→谢幕；未封笔注进度/判定（§2\.3）。
@@ -3221,7 +3631,7 @@ ${skill.body ?? ""}`;
 					// 勾完但没落笔 → 继续进度行，判定等正文真出现
 					if (allDone && !verdictInjected && draftBodyCharsOf(o.ws) > 0) {
 						verdictInjected = true;
-						convo.push(nowMsg(verdictInjection(o.wsDeps.userName, o.allowAsk)));
+						convo.push(nowMsg(verdictInjection(o.wsDeps.userName)));
 					} else {
 						replaceProgressLine(convo, progressLine(o.ws));
 					}
@@ -3442,7 +3852,7 @@ ${skill.body ?? ""}`;
 			listLore: () => loadStageMaterials(cwd).entries,
 			fingerprint: loreFingerprint,
 			...(this.#deps.setDisabledLore ? { toggleLore: this.#deps.setDisabledLore } : {}),
-			gate: () => ({ lastUserText, creationMode: loadStageConfig(cwd).creationMode }),
+			gate: () => ({ lastUserText }),
 			searchMemory: async (query) => {
 				const search = this.#deps.searchMemory;
 				if (!search) return [];
@@ -3572,156 +3982,74 @@ ${skill.body ?? ""}`;
 		};
 	}
 
-	async #sideText(
-		step: SideModelStep,
-		systemPrompt: string,
-		userText: string,
-		maxTokens = 8192,
-		reasoning: string | undefined = "off",
-		signal: AbortSignal | undefined = this.#abort?.signal,
-		observation?: StageRequestObservation,
-	): Promise<string | { error: string }> {
-		const owner: StageRequestObservation | undefined = observation ?? (step === "writer" ? { phase: "curtain" as const, preflight: new WriterContextPreflight(), notify: (message: string) => this.#deps.events?.onNotify?.("warning", message) } : undefined);
-		const end = owner?.collector?.beginPhase(owner.phase);
-		let status: PerformanceStatus = "failed";
-		try {
-			const result = await this.#sideTextRequest(step, systemPrompt, userText, maxTokens, reasoning, signal, owner);
-			status = typeof result === "string" ? "success" : signal?.aborted ? "aborted" : "failed";
-			return result;
-		} finally { end?.(status); }
+	async #repairStructured(step:SideModelStep,prompt:{systemPrompt:string;userText:string},invalid:string,errors:string[],maxTokens=8192,observation?:StageRequestObservation):Promise<string|{error:string}> {
+		const materials=loadStageMaterials(this.#deps.cwd),protocol=materials.skillFiles.find(x=>x.workflow==="structured-repair")?.body;
+		if(!protocol)return {error:"缺少结构化校验修复Skill，未绕过校验"};
+		this.#deps.events?.onActivity?.(`步骤${step}校验失败：${errors.slice(0,4).join("；")}；按回执修复同一工件并重新校验，不改正文。`);
+		const previous=[...(observation?.diagnostics??[])].reverse().find(x=>x.step===step);
+		observation?.diagnostics?.push({phase:observation.phase,step,provider:previous?.provider??"validation",model:previous?.model??"schema",attempt:(previous?.attempt??0)+1,status:"failed",kind:"format",reason:classifyModelFailure("JSON/schema："+errors.join("；")).reason,durationMs:0});
+		return this.#sideText(step,prompt.systemPrompt+"\n\n"+protocol,prompt.userText+"\n\n"+JSON.stringify({invalid_report:invalid.slice(0,24000),validation_errors:errors.slice(0,16)}),maxTokens,"off",this.#abort?.signal,observation,!!materials.config.analysisRecoveryModel);
 	}
 
-	async #sideTextRequest(
-		step: SideModelStep,
-		systemPrompt: string,
-		userText: string,
-		maxTokens = 8192,
-		reasoning: string | undefined = "off",
-		signal: AbortSignal | undefined = this.#abort?.signal,
-		observation?: StageRequestObservation,
+	async #sideText(
+		step: SideModelStep, systemPrompt: string, userText: string, maxTokens = 8192,
+		reasoning: string | undefined = "off", signal: AbortSignal | undefined = this.#abort?.signal,
+		observation?: StageRequestObservation, forceRecovery = false,
 	): Promise<string | { error: string }> {
 		const config = loadStageConfig(this.#deps.cwd);
-		const resolved = resolveStepModel(
-			step,
-			config.stepModels,
-			this.#deps.getModel(),
-			(provider, id) => this.#deps.findModel?.(provider, id),
-			(id) => this.#deps.findModelById?.(id),
-		);
-		const model = resolved.model;
-		if (!model) return { error: "尚未配置剧情模型" };
-		if (resolved.fallback && resolved.requested) {
-			const key = `${step}:${resolved.requested.provider}/${resolved.requested.id}`;
-			if (!this.#warnedSideModelFallbacks.has(key)) {
-				this.#warnedSideModelFallbacks.add(key);
-				this.#deps.events?.onNotify?.("warning", `步骤 ${step} 配置的模型 ${resolved.requested.provider}/${resolved.requested.id} 不可用，本次已继承剧情总插头。`);
-			}
-		}
-		let auth: { apiKey?: string; headers?: Record<string, string> };
-		try {
-			auth = await this.#deps.getAuth(model);
-			if (model.baseUrl?.includes("magicv4.ltd")) auth.headers = { ...(auth.headers ?? {}), "user-agent": "undici" };
-		} catch (error) {
-			return { error: error instanceof Error ? error.message : String(error) };
-		}
-		const requestController = new AbortController();
-		const abortRequest = () => requestController.abort();
-		if (signal) {
-			if (signal.aborted) requestController.abort();
-			else signal.addEventListener("abort", abortRequest, { once: true });
-		}
-		const timeoutMs = sideTextTimeoutMs(step);
-		const maxRetries = sideTextRetryLimit(step);
-		const options: Record<string, unknown> = {
-			apiKey: auth.apiKey,
-			headers: auth.headers,
-			maxTokens,
-			signal: requestController.signal,
-			// 精修/场记/压缩是 harness 的机械窄题，默认强制关思考：zen go 对 low/high 无可靠节流
-			//（8/02 实测），放开推理会把 maxTokens 整个烧在隐形思考里、正文零输出。
-			// 合约声明是判断题（整卡+预设通读），由调用点透传会话思考档（undefined＝随供应商默认）。
-			...(reasoning !== undefined ? { reasoning } : {}),
-		};
-		const call = async (attempt: number): Promise<string | { error: string }> => {
-			// 每次尝试独立计时；超时也必须走与显式 provider error 相同的重试路径。
-			const attemptSignal = AbortSignal.any([requestController.signal, AbortSignal.timeout(timeoutMs)]);
-			// 旁路是结构化窄任务。第一次优先非流式；若返回空文本，再用原模型形态补试。
-			// 每次底层请求自身最多重试九次，并遵守 provider 退避；流式中途错误同样按退避重试。
-			const callModel = attempt === 0
-				? { ...model, compat: { ...((model.compat as Record<string, unknown> | undefined) ?? {}), streaming: false } }
-				: model;
-			// 限流与瞬时网络错误交给 provider 的退避策略，避免本层无间隔连打形成请求风暴。
-			const callOptions = { ...options, signal: attemptSignal, maxRetries: attempt === 0 ? MODEL_MAX_RETRIES : 0 };
+		const resolved = resolveStepModel(step, config.stepModels, this.#deps.getModel(),
+			(provider, id) => this.#deps.findModel?.(provider, id), id => this.#deps.findModelById?.(id));
+		const recoveryRef = config.analysisRecoveryModel;
+		const recovery = recoveryRef ? this.#deps.findModel?.(recoveryRef.provider, recoveryRef.id) : undefined;
+		const primary = forceRecovery ? recovery : resolved.model;
+		if (!primary) return { error: forceRecovery ? "未配置可用恢复模型，结构化报告未修复" : "尚未配置可用剧情模型" };
+		if (resolved.fallback && resolved.requested && !forceRecovery) this.#deps.events?.onNotify?.("warning", `步骤 ${step} 的${resolved.requested.provider}/${resolved.requested.id}不在当前可用配置，已转当前剧情模型，未使用旧仓库渠道。`);
+		const models = [primary, ...(!forceRecovery && recovery && (recovery.provider !== primary.provider || recovery.id !== primary.id) ? [recovery] : [])];
+		let last = "模型调用失败";
+		for (let index = 0; index < models.length; index++) {
+			if (signal?.aborted) return { error: "本拍已取消，未启动恢复请求" };
+			const model = models[index]!;
+			const started = Date.now();
+			const attempt: ModelAttemptDiagnostic = { phase: observation?.phase ?? "background", step, provider: String(model.provider ?? ""), model: model.id, attempt:index+1, status:"failed", durationMs:0 };
+			let auth: {apiKey?:string;headers?:Record<string,string>} = {};
 			try {
-			const s = this.#observedStream(
-				callModel,
-				{
-					systemPrompt,
-					messages: [{ role: "user", content: [{ type: "text", text: userText }], timestamp: Date.now() }],
-				},
-				callOptions,
-				observation,
-			);
-			let final: AssistantMsgLike | null = null;
-			for await (const e of s) {
-				if (e.type === "done") final = e.message ?? null;
-				else if (e.type === "error") {
-					const error = e.error?.errorMessage || `stopReason=${e.error?.stopReason ?? "?"}`;
-					if (isConfirmedContextOverflow(error)) return { error };
-					if (attemptSignal.aborted) {
-						if (!requestController.signal.aborted && attempt < maxRetries) return call(attempt + 1);
-						return { error: "旁路请求已取消或超时" };
+				auth = await this.#deps.getAuth(model);
+				if (model.baseUrl?.includes("magicv4.ltd")) auth.headers = { ...auth.headers, "user-agent":"undici" };
+				const timeoutMs = step === "writer" ? WRITER_STREAM_TIMEOUT_MS : Math.max(60_000, Math.min(1800_000, (config.analysisTimeoutMinutes ?? 10) * 60_000));
+				const requestController = new AbortController();
+				const requestSignal = signal ? AbortSignal.any([signal,requestController.signal]) : requestController.signal;
+				const timer = setTimeout(() => requestController.abort(), timeoutMs);
+				try {
+					const source = this.#observedStream(model, {systemPrompt,messages:[{role:"user",content:[{type:"text",text:userText}],timestamp:Date.now()}]},
+						{apiKey:auth.apiKey,headers:auth.headers,maxTokens,signal:requestSignal,maxRetries:0,...(reasoning !== undefined ? {reasoning} : {})},observation);
+					let final: AssistantMsgLike | null = null;
+					for await (const e of streamWithTimeout(source,timeoutMs,requestSignal)) {
+						if (e.type === "done") final=e.message??null;
+						else if (e.type === "error") throw new Error(e.error?.errorMessage || "供应商请求失败");
 					}
-					// 流式中途失败（如上游 worker 断流）也应退避重试；耗尽后才如实失败。
-					if (attempt < maxRetries) {
-						await new Promise((r) => setTimeout(r, 600 * Math.min(2 ** attempt, 8)));
-						return call(attempt + 1);
-					}
-					return { error };
-				}
+					if (requestSignal.aborted) throw new Error(signal?.aborted ? "本拍已取消" : `步骤${step}超时(${timeoutMs}ms)`);
+					if (!final) throw new Error("流未返回完成消息");
+					if (final.stopReason === "error" || final.stopReason === "aborted") throw new Error(final.errorMessage || `请求${final.stopReason}`);
+					const text=textOfAssistant(final);
+					if (!text) throw new Error("完成消息无文本，结构化任务未执行成功");
+					attempt.status="success";attempt.durationMs=Date.now()-started;if(index || forceRecovery) attempt.recovered=true;
+					observation?.diagnostics?.push(attempt);
+					if(index || forceRecovery) this.#deps.events?.onActivity?.(`步骤${step}已由${attempt.provider}/${attempt.model}恢复完成，重新执行原任务，未跳过。`);
+					return text;
+				} finally { clearTimeout(timer);requestController.abort(); }
+			} catch (err) {
+				const raw = err instanceof Error ? err.message : String(err);
+				const clean = auth.apiKey ? raw.split(auth.apiKey).join("[redacted]") : raw;
+				const failure=classifyModelFailure(clean);
+				attempt.status=signal?.aborted ? "cancelled" : "failed";attempt.kind=failure.kind;attempt.reason=failure.reason;attempt.statusCode=failure.statusCode;attempt.durationMs=Date.now()-started;
+				observation?.diagnostics?.push(attempt);last=`${attempt.provider}/${attempt.model} [${failure.kind}${failure.statusCode ? ":"+failure.statusCode : ""}] ${failure.reason}`;
+				this.#deps.events?.onActivity?.(`步骤${step}失败：${last}${index+1<models.length&&!signal?.aborted ? "；诊断后使用已配置恢复模型重做同任务。" : "；没有隐藏为成功。"}`);
+				if(signal?.aborted || isConfirmedContextOverflow(err)) break;
+				// Authentication fails for the provider, not one model id. Same-provider retry cannot fix an expired key.
+				if(failure.kind==="auth" && models[index+1]?.provider === model.provider) break;
 			}
-			if (!final) {
-				if (attemptSignal.aborted) {
-					if (!requestController.signal.aborted && attempt < maxRetries) return call(attempt + 1);
-					return { error: "旁路请求已取消或超时" };
-				}
-				if (attempt < maxRetries) {
-					await new Promise((r) => setTimeout(r, 500));
-					return call(attempt + 1);
-				}
-				return { error: "流未产出最终消息" };
-			}
-			if (isConfirmedContextOverflow(final.errorMessage)) return { error: final.errorMessage! };
-			const text = textOfAssistant(final);
-			if (text) return text;
-			if (attempt < maxRetries) return call(attempt + 1);
-			// 部分 OpenAI 兼容层在 SSE/compat 非流式均可能只返回空 content；最后使用
-			// 原 model + response-format 倾向的非流式兼容再试一次，仍失败才如实停链。
-			return { error: "最终消息无文本" };
-		} catch (err) {
-			if (isConfirmedContextOverflow(err)) return { error: err instanceof Error ? err.message : String(err) };
-			if (attemptSignal.aborted) {
-				if (!requestController.signal.aborted && attempt < maxRetries) return call(attempt + 1);
-				return { error: "旁路请求已取消或超时" };
-			}
-			return attempt < maxRetries ? call(attempt + 1) : { error: err instanceof Error ? err.message : String(err) };
 		}
-		};
-		const request = call(0);
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		const timeout = new Promise<{ error: string }>((resolve) => {
-			timer = setTimeout(() => {
-				requestController.abort();
-				resolve({ error: `步骤 ${step} 超时（${timeoutMs}ms）` });
-			}, timeoutMs);
-		});
-		try {
-			const result = await Promise.race([request, timeout]);
-			return result;
-		} finally {
-			if (timer) clearTimeout(timer);
-			if (signal) signal.removeEventListener("abort", abortRequest);
-			void request.catch(() => undefined);
-		}
+		return {error:last};
 	}
+
 }

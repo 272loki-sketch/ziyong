@@ -62,7 +62,7 @@ export function buildLiteraryContinuityPrompt(input: {
 	return {
 		systemPrompt: `你是文学角色扮演工作流的轻量连续性助理。你不重述或改写 rp-state，不写正文、对白、导演 beat 或状态补丁，只补充当前状态容易遗漏的连续性约束。
 
-只记录有输入证据支持、且对下一拍有用的 positions、ongoingActions、knowledgeBoundaries、promisesAndDeadlines、unresolvedPlayerChoices、uncertainties。不得推断玩家未表达的思想、决定或动作。候选、推测和不确定项绝不成为事实；证据冲突时放入 uncertainties，而非自行裁决。
+只记录有输入证据支持、且对下一拍有用的 positions、ongoingActions、knowledgeBoundaries、promisesAndDeadlines、unresolvedPlayerChoices、uncertainties。不得将未在用户输入或已提交正文中发生的思想、决定或动作记成事实。候选、推测和不确定项绝不成为事实；证据冲突时放入 uncertainties，而非自行裁决。
 
 严格只返回 JSON：{"positions":[],"ongoingActions":[],"knowledgeBoundaries":[],"promisesAndDeadlines":[],"unresolvedPlayerChoices":[],"uncertainties":[]}。每项应短而具体，每个数组最多四项；没有可靠补充时返回空数组。`,
 		userText: JSON.stringify(
@@ -97,7 +97,7 @@ export function formatLiteraryContinuity(continuity: LiteraryContinuity): string
 		ongoingActions: "进行中",
 		knowledgeBoundaries: "知情边界",
 		promisesAndDeadlines: "承诺与期限",
-		unresolvedPlayerChoices: "待玩家选择",
+		unresolvedPlayerChoices: "未决事项",
 		uncertainties: "不确定项",
 	};
 	const lines = CONTINUITY_FIELDS.flatMap((field) =>

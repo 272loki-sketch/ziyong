@@ -201,12 +201,9 @@ export function repairDefaultProvider(cwd: string, config: LiyuanAgentConfig): L
 export function syncAgentConfigToRuntime(cwd: string, agentDir: string, config: LiyuanAgentConfig): void {
 	const cfg = normalizeAgentConfig(config);
 
-	// providers → models.json：当前启用渠道 + 仓库全部渠道（运行时支持多渠道并存，
-	// 让文学/生态旁路模型插头可选用任何已配置的模型，故事总插头不受影响）。
+	// Only currently enabled configuration is runnable; saved profiles may have expired keys.
+	// Enabling a profile is explicit. Do not merge the whole warehouse back into requests.
 	const providers = { ...cfg.providers };
-	for (const [pname, p] of Object.entries(warehouseProviders(cwd))) {
-		if (!providers[pname]) providers[pname] = p;
-	}
 	writeJsonBackup(join(agentDir, "models.json"), { providers });
 
 	const patchSettings = (path: string, fields: Record<string, unknown>) => {

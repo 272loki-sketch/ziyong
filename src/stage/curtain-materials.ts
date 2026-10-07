@@ -45,7 +45,7 @@ function buildFormatPlan(statusBarFormats: string[], formatTexts: string[]): Cur
 	const nativeTags = [...declared].filter((tag) => NATIVE_TAGS.has(tag));
 	const modelTags = [...declared].filter((tag) => !NATIVE_TAGS.has(tag));
 	for (const hint of statusBarFormats) {
-		for (const tag of tagNamesOf(hint)) if (!modelTags.includes(tag)) modelTags.unshift(tag);
+		for (const tag of tagNamesOf(hint)) if (!NATIVE_TAGS.has(tag) && !deterministicTags.includes(tag) && !modelTags.includes(tag)) modelTags.unshift(tag);
 	}
 	const selected = new Set([...modelTags, ...nativeTags, ...deterministicTags]);
 	const forbiddenTags = [...KNOWN_PAIR_TAGS, "stateN"].filter((tag) => !selected.has(tag));

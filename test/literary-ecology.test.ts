@@ -255,9 +255,9 @@ test("ecology：三件工作流 Skill 均可被装载", () => {
 		const skills = scanSkillFiles(cwd);
 		assert.match(workflowSkill(skills, "ecology-global")?.body ?? "", /叙事发动机/);
 		assert.match(workflowSkill(skills, "ecology-card")?.body ?? "", /人物语法/);
-		assert.match(workflowSkill(skills, "ecology-runtime")?.body ?? "", /用户是世界中的探索者/);
+		assert.match(workflowSkill(skills, "ecology-runtime")?.body ?? "", /生态维护人物、场所与事件/);
 		assert.match(workflowSkill(skills, "ecology-runtime")?.body ?? "", /Small_theater/);
-		assert.match(workflowSkill(skills, "ecology-runtime")?.body ?? "", /不得替用户接受或提交申请/);
+		assert.match(workflowSkill(skills, "ecology-runtime")?.body ?? "", /生态结算不补写镜头内行动/);
 	} finally { rmSync(cwd, { recursive: true, force: true }); }
 });
 
@@ -354,5 +354,5 @@ test("ecology：降级warning随arrival/aftermath和分支快照保留", () => {
 
 test("ecology：运行prompt传递用户entryId，非语义regex判定", () => {
 	const prompt = buildEcologyRuntimePrompt("承诺语义由 Skill 判断。", { phase: "arrival", ecology: defaultLiteraryEcologyState(), global: emptyEcologyGlobalPool(), cardPool: emptyEcologyCardPool("card", "卡"), state: { time: "", location: "", characters: {}, inventory: [], flags: {}, plot_threads: [] }, history: [], userText: commitmentOptions.latestUserText, userEntryId: "user-1" });
-	assert.deepEqual(JSON.parse(prompt.userText).latest_turn, { user: commitmentOptions.latestUserText, user_entry_id: "user-1", narrative: "" });
+	assert.deepEqual(JSON.parse(prompt.userText).latest_turn, { user: commitmentOptions.latestUserText, user_entry_id: "user-1", narrative: "", narrative_entry_id: null });
 });

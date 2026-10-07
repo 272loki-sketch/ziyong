@@ -6,7 +6,7 @@
  * 过程条是元信息层（agent 工作过程），与正文明确区隔。
  */
 
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { createContext, memo, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { apiGet, apiPost } from "../api.ts";
 import { attachmentUrl, splitAttachments } from "../attachments.ts";
 import { applyCardSkin } from "../cardSkin.ts";
@@ -22,9 +22,13 @@ import { serializeCalendarSource } from "../../../src/presentation.ts";
 import type { EcologyWireView } from "../../../src/stage/literary-ecology.ts";
 import { estimateTokens, formatTokenCount, type TurnSegment } from "../timeline.ts";
 import { HtmlFrame } from "./HtmlFrame.tsx";
+import { generationStageLabel, generationStageStatusPresentation } from "../generation-workflow-ui.ts";
 
 /** 一档卡皮肤：显示向规则 + 宏名（Task 7 由 App 注入） */
 export type SkinProp = SkinMacros;
+/** A record preview may read saved media but must never start generation. Normal chat defaults unchanged. */
+export const ReadOnlyMessagesContext = createContext(false);
+type GenerationWorkflow = NonNullable<WireMsg["generationWorkflow"]>;
 import {
 	IconChevronLeft,
 	IconChevronRight,
@@ -76,6 +80,7 @@ function enqueueNovelAi<T>(task: () => Promise<T>): Promise<T> {
 }
 
 function NovelAiImageButton({ prompt, title }: { prompt: string; title: string }) {
+	const readOnly = useContext(ReadOnlyMessagesContext);
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState("");
 	const [src, setSrc] = useState("");
@@ -84,7 +89,7 @@ function NovelAiImageButton({ prompt, title }: { prompt: string; title: string }
 	const readBrowserCache = () => { try { return window.localStorage.getItem(browserCacheKey) || ""; } catch { return ""; } };
 	const writeBrowserCache = (value: string) => { try { window.localStorage.setItem(browserCacheKey, value); } catch { /* storage may be disabled */ } };
 	const generate = async () => {
-		if (running.current) return;
+		if (readOnly || running.current) return;
 		running.current = true;
 		setBusy(true);
 		setError("");
@@ -104,15 +109,15 @@ function NovelAiImageButton({ prompt, title }: { prompt: string; title: string }
 		const browserSrc = readBrowserCache();
 		if (browserSrc) { setSrc(browserSrc); return () => { alive = false; }; }
 		void apiGet<{ src: string | null }>(`/api/novelai/cached?prompt=${encodeURIComponent(prompt)}`, { bypassCache: true })
-			.then((result) => { if (alive && result.src) { writeBrowserCache(result.src); setSrc(result.src); } else if (alive) void generate(); })
-			.catch(() => { if (alive) void generate(); });
+			.then((result) => { if (alive && result.src) { if (!readOnly) writeBrowserCache(result.src); setSrc(result.src); } else if (alive && !readOnly) void generate(); })
+			.catch(() => { if (alive && !readOnly) void generate(); });
 		// 自动生图只在该图片槽首次挂载时排队一次；generate 内部 running 防重入。
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 		return () => { alive = false; };
-	}, [prompt]);
+	}, [prompt, readOnly]);
 	return (
 		<div className="nai-image-slot">
-			{src ? <ZoomImg src={src} alt={title} title={title} /> : <button type="button" className="nai-generate-btn" disabled={busy} onClick={generate}>{busy ? "NovelAI 生图中…" : `生成图片 · ${title}`}</button>}
+			{src ? <ZoomImg src={src} alt={title} title={title} /> : readOnly ? <div className="nai-readonly-note"><strong>插图位置 · {title}</strong><p>此记录未保存实际图片；只读查看不会触发生图。</p><details><summary>查看本处绘图提示词</summary><pre>{prompt}</pre></details></div> : <button type="button" className="nai-generate-btn" disabled={busy} onClick={generate}>{busy ? "NovelAI 生图中…" : `生成图片 · ${title}`}</button>}
 			{error && <div className="nai-image-error">{error}</div>}
 		</div>
 	);
@@ -544,11 +549,14 @@ export function BackstageGroup({
 	const mid = msgs.slice(0, -1);
 	const toolCount = msgs.reduce((n, m) => n + (m.activities?.filter((a) => a.kind === "tool_start").length ?? 0), 0);
 	const name = final.name || fallbackName;
+	const generationWorkflow = final.generationWorkflow;
+	const generationMode = final.generationMode ?? generationWorkflow?.mode;
 	return (
 		<div className="msg msg-backstage">
 			<div className="msg-head">
 				<MsgAvatar src={avatarUrl} name={name} kind="char" />
 				<span className="msg-name">{name}</span>
+				{generationMode && <span className={`chip generation-mode-badge ${generationMode}`}>{generationMode === "direct" ? "直出" : "导演流程"}</span>}
 				<span className="chip chip-backstage">助手</span>
 			</div>
 			{mid.length > 0 && (
@@ -559,9 +567,11 @@ export function BackstageGroup({
 					</summary>
 					{mid.map((m, i) => (
 						<BackstageStep key={i} msg={m} />
-					))}
+				))}
 				</details>
 			)}
+			{generationWorkflow && <GenerationWorkflowCard workflow={generationWorkflow} />}
+			{msgs.some(m=>m.modelDiagnostics?.length) ? <ModelDiagnosticsCard calls={msgs.flatMap(m=>m.modelDiagnostics??[])} /> : null}
 			<details className="bs-final" open={open}>
 				<summary>{open ? "回复" : `回复：${firstLine(final.text)}`}</summary>
 				{final.thinking && <ThinkingBlock text={final.thinking} />}
@@ -834,6 +844,8 @@ export function Bubble({
 	const tavernVariables = !isUser ? msg.tavernVariables as TavernVariablesView | undefined : undefined;
 	const ecology = !isUser ? msg.ecology as EcologyWireView | undefined : undefined;
 	const workflow = !isUser ? msg.workflow as WireBeatWorkflow | undefined : undefined;
+	const generationWorkflow = !isUser ? msg.generationWorkflow : undefined;
+	const generationMode = !isUser ? msg.generationMode ?? generationWorkflow?.mode : undefined;
 	const displayBody = !isUser && presentation
 		? stripProjectedFormats(body, { options: !!presentation.options?.length })
 		: body;
@@ -849,6 +861,7 @@ export function Bubble({
 				<div className="msg-head">
 					<MsgAvatar src={avatarUrl} name={name} kind={isUser ? "user" : "char"} />
 					<span className={`msg-name ${isUser ? "" : "msg-name-char"}`}>{name}</span>
+					{generationMode && <span className={`chip generation-mode-badge ${generationMode}`}>{generationMode === "direct" ? "直出" : "导演流程"}</span>}
 					{msg.channel === "greeting" && <span className="chip">开场白</span>}
 					{!isUser && msg.unfinished && (
 						<span className="chip chip-unfinished" title="生成被中断；发送「继续」可接着写">
@@ -866,6 +879,7 @@ export function Bubble({
 					{formatTokenCount(msg.metrics.outputTokens)} tokens
 				</div>
 			)}
+			{stage && generationMode && <div className="generation-mode-stage-badge">生成模式 · {generationMode === "direct" ? "直出" : "导演流程"}</div>}
 			{/* 有时间线时思考内联在时间线里（按发生顺序）；旧消息才走顶部固定块 */}
 			{!timeline && msg.thinking && !editing && (
 				<ThinkingBlock text={msg.thinking} defaultOpen={msg.unfinished === true} />
@@ -927,8 +941,11 @@ export function Bubble({
 					)}
 					{/* 时间线态的工具步骤已内联在各自发生位置，不再末端重挂一份 */}
 					{!timeline && msg.activities && msg.activities.length > 0 && <ActivityBar activities={msg.activities} />}
-					{workflow && <BeatWorkflowCard workflow={workflow} />}
-					{!workflow && msg.performance && <PerformanceRows performance={msg.performance} />}
+					{generationWorkflow && <GenerationWorkflowCard workflow={generationWorkflow} />}
+					{msg.presentationDelivery && <details className="generation-workflow-card"><summary>卡格式交付 · {msg.presentationDelivery.status === "complete" ? "交付结构已校验" : "待恢复（未当作成功）"}</summary><div className="world-state-body"><p>原始资料 {msg.presentationDelivery.inputSourceCount ?? 0} 份 · {msg.presentationDelivery.inputChars?.toLocaleString() ?? 0} 字 · 格式重交 {msg.presentationDelivery.retryCount ?? 0} 次</p>{msg.presentationDelivery.formatNames?.length ? <p>本次核对：{msg.presentationDelivery.formatNames.join("、")}</p> : null}<p>图片、选项与卡自定义格式按当前卡交付；校验不是文学评分。</p></div></details>}
+					{msg.modelDiagnostics?.length ? <ModelDiagnosticsCard calls={msg.modelDiagnostics} /> : null}
+					{workflow && !generationWorkflow && <BeatWorkflowCard workflow={workflow} />}
+					{(!workflow || generationWorkflow) && msg.performance && <PerformanceRows performance={msg.performance} />}
 					{worldModules && (worldModules.round > 0 || worldAudit) ? <ModularWorldCard world={worldModules} audit={worldAudit} /> : world && (world.round > 0 || worldAudit) && <WorldStateCard world={world} audit={worldAudit} />}
 					{presentation && <PresentationCards view={presentation} skin={skin} onSelectOption={onSelectOption} hideOptions={bodyOwnsOptions} />}
 					{ecology && (ecology.round > 0 || ecology.public.actors.length > 0 || ecology.public.events.length > 0 || ecology.public.locations.length > 0 || ecology.discovered.actors.length > 0 || ecology.discovered.events.length > 0) && <EcologyStateCard ecology={ecology} />}
@@ -1127,6 +1144,50 @@ function BeatWorkflowCard({ workflow }: { workflow: WireBeatWorkflow }) {
 			<div className="bwf-metrics"><span><small>计划</small><b>{writer.planWrites}</b></span><span><small>稿段</small><b>{writer.appends || writer.writes}</b></span><span><small>重评估拦截</small><b>{writer.appendRejects}</b></span><span><small>模型轮次</small><b>{writer.rounds}</b></span><span><small>正文</small><b>{writer.narrativeChars}</b></span><span><small>输出 tokens</small><b>{formatTokenCount(writer.outputTokens)}</b></span><span><small>耗时</small><b>{(writer.durationMs / 1000).toFixed(1)}s</b></span><span><small>检索</small><b>{writer.lookups}</b></span></div>
 			{workflow.performance && <PerformanceRows performance={workflow.performance} />}
 			<div className="bwf-privacy">只展示结构化工件和运行结果，不包含模型隐藏思维链、prompt 或原始旁路输出。</div>
+		</div>
+	</details>;
+}
+
+function ModelDiagnosticsCard({calls}: {calls:NonNullable<WireMsg["modelDiagnostics"]>}) {
+	const failed=calls.filter(x=>x.status!=="success"&&!x.validationOnly),recovered=calls.filter(x=>x.recovered),validationFailures=calls.filter(x=>x.validationOnly);
+	return <details className="generation-workflow-card"><summary>模型诊断 · {failed.length} 次请求失败 · {recovered.length} 次恢复{validationFailures.length?` · ${validationFailures.length} 次交付校验失败`:""}</summary>{calls.map((x,i)=><div key={i}><b>{x.step}</b> · {x.provider}/{x.model} · {x.validationOnly?"交付校验失败":x.status==="success"?x.recovered?"恢复成功":"成功":x.status==="cancelled"?"已取消":"失败"} · {(x.durationMs/1000).toFixed(1)}秒{x.statusCode&&` · HTTP ${x.statusCode}`}{x.reason&&<p>{x.reason}</p>}</div>)}</details>;
+}
+
+function GenerationWorkflowCard({ workflow }: { workflow: GenerationWorkflow }) {
+	const failed = workflow.stages.filter((stage) => stage.status === "failed").length;
+	const degraded = workflow.stages.filter((stage) => stage.status === "degraded").length;
+	const skipped = workflow.stages.filter((stage) => stage.status === "skipped").length;
+	const overall = failed > 0
+		? `失败阶段 ${failed}`
+		: degraded > 0
+			? `报告待复核阶段 ${degraded}`
+			: workflow.toolFallback
+				? "使用文本工具协议"
+				: skipped > 0
+					? `未执行阶段 ${skipped}`
+					: workflow.stages.length > 0
+						? "正文阶段完成"
+						: "无阶段记录";
+	const overallClass = failed > 0 ? "failed" : degraded > 0 || workflow.toolFallback ? "degraded" : skipped > 0 || workflow.stages.length === 0 ? "partial" : "success";
+	return <details className="world-state-card generation-workflow-card">
+		<summary>
+			<span className="world-state-title">生成流程 · {workflow.mode === "direct" ? "直出" : "导演流程"}</span>
+			<span className={`generation-workflow-overall ${overallClass}`}>{overall}</span>
+			<span className="world-state-digest">主 writer 轮次 {workflow.writerRounds}</span>
+		</summary>
+		<div className="world-state-body generation-workflow-body">
+			{workflow.stages.length > 0 ? <div className="generation-workflow-stages" role="list" aria-label="生成阶段状态">
+				{workflow.stages.map((stage, index) => {
+					const presentation = generationStageStatusPresentation(stage.status);
+					return <div className={`generation-workflow-stage ${stage.status}`} role="listitem" key={`${stage.stage}-${index}`}>
+						<strong>{generationStageLabel(stage.stage)}</strong>
+						<span className={`generation-workflow-status ${stage.status}`} aria-label={presentation.label}>{presentation.icon} {presentation.label}</span>
+						<span>{stage.calls} {(["evidence","ideas","review"] as string[]).includes(stage.stage)?"固定岗位":"次阶段操作"}</span>
+					</div>;
+				})}
+			</div> : <div className="field-hint">后端未提供阶段记录。</div>}
+			<div className={`generation-workflow-fallback ${workflow.toolFallback ? "degraded" : "clear"}`}>工具协议：{workflow.toolFallback ? workflow.toolFallbackReason === "configured" ? "文本协议（配置声明不支持工具）" : workflow.toolFallbackReason === "unsupported" ? "文本协议（上游明确不支持工具）" : "历史兼容兜底（未记录原因）" : "原生工具（未切换文本协议）"}</div>
+			<div className="bwf-privacy">只描述正文创作阶段，固定岗位数不等于底层API次数；不代表世界/生态结算或文学评分通过。报告待复核、请求失败与工具协议切换是不同状态；已恢复的API尝试保留诊断，不等于当前岗位失败。不包含prompt或原始旁路输出。</div>
 		</div>
 	</details>;
 }

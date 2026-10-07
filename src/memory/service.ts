@@ -522,7 +522,7 @@ export async function onNarrativeTurnEnd(
 	scope: MemoryScope,
 	assistantText: string,
 	opts?: {
-		entries?: Array<{ entryId: string; entryType?: MemorySourceRef["entryType"]; turn?: number; text: string }>;
+		entries?: Array<{ entryId: string; entryType?: MemorySourceRef["entryType"]; turn?: number; text: string; textBasis?: MemorySourceRef["textBasis"] }>;
 		branchLeafId?: string;
 	},
 ): Promise<{
@@ -544,7 +544,7 @@ export async function onNarrativeTurnEnd(
 	return withScopeStoreLock(lockKey(cwd, "config", "turnCounter"), async () => {
 		const cfg = loadMemoryConfig(cwd);
 		const store = cfg.stores.find((s) => s.id === "narrative" && s.enabled);
-		if (!store || store.everyNTurns <= 0) return { stored: false, counter: 0 };
+		if (!cfg.enabled || !store || store.everyNTurns <= 0) return { stored: false, counter: 0 };
 		const scopeKey = memoryScopeId(sc);
 		const counters = { ...(cfg.turnCounters ?? {}) };
 		const next = (counters[scopeKey] ?? 0) + 1;
@@ -570,7 +570,7 @@ export async function onNarrativeTurnEnd(
 									source: "narrative",
 									kind: "digest",
 									evidenceLevel: "summary-only",
-									sourceRefs: [{ entryId: entry.entryId, entryType: entry.entryType, turn: entry.turn, charFrom: part.charFrom, charTo: part.charTo }],
+									sourceRefs: [{ entryId: entry.entryId, entryType: entry.entryType, turn: entry.turn, charFrom: part.charFrom, charTo: part.charTo, ...(entry.textBasis ? { textBasis: entry.textBasis } : {}) }],
 									branchLeafId: opts?.branchLeafId,
 								},
 							});
@@ -645,7 +645,7 @@ export async function memoryArchiveCompacted(
 	cwd: string,
 	scope: MemoryScope,
 	text: string,
-	opts?: { sourceRefs?: MemorySourceRef[] | null; perEntry?: Array<{ entryId: string; entryType?: string; turn?: number; text: string }> },
+	opts?: { sourceRefs?: MemorySourceRef[] | null; perEntry?: Array<{ entryId: string; entryType?: string; turn?: number; text: string; textBasis?: MemorySourceRef["textBasis"] }> },
 ): Promise<{ archived: boolean; added?: number; chunks?: number; reason?: string }> {
 	const cfg = loadMemoryConfig(cwd);
 	if (!cfg.enabled) return { archived: false, reason: "memory disabled" };
@@ -665,7 +665,7 @@ export async function memoryArchiveCompacted(
 							source: "archive",
 							kind: "evidence",
 							title: "早期剧情归档",
-							sourceRefs: [{ entryId: entry.entryId, entryType: entry.entryType as MemorySourceRef["entryType"], ...(entry.turn ? { turn: entry.turn } : {}), charFrom: part.charFrom, charTo: part.charTo }],
+							sourceRefs: [{ entryId: entry.entryId, entryType: entry.entryType as MemorySourceRef["entryType"], ...(entry.turn ? { turn: entry.turn } : {}), charFrom: part.charFrom, charTo: part.charTo, ...(entry.textBasis ? { textBasis: entry.textBasis } : {}) }],
 							sessionId: sc.sessionId,
 							card: sc.card,
 						},

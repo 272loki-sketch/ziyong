@@ -28,11 +28,10 @@ import {
 } from "../../src/codex.ts";
 import { buildGreeting } from "../../src/greeting.ts";
 import { memoryArchiveCompacted, memoryRecallForTurn, memorySearch } from "../../src/memory/index.ts";
-import { GATED_TOOLS, WRITE_REQUEST_RE } from "../../src/tools/gate.ts";
 import {
 	constantEntries,
 	appendOverlayEntry,
-	applyDisabledLore,
+	applyLoreSourceState,
 	loadLorebookFile,
 	mergeEntries,
 	mountedLorebookPaths,
@@ -135,9 +134,6 @@ const RP_TOOLS = [
 	"assistant_run",
 ];
 
-/** 决策门禁工具（PLAN-PHASE4 柱 1）：仅 creationMode==="ask" 时进活跃集，停笔向用户询问剧情决策 */
-const ASK_TOOL = "ask_director";
-
 /** 命令描述统一取自清单（src/commands.ts，与 Web 补全同源） */
 const cmdDesc = (name: string): string => {
 	const c = findCommand(name);
@@ -201,12 +197,12 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 	 */
 	const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 	const applyRpToolset = () => {
-		// 决策门禁开时把 ask_director 并入剧情工具集（silent 档不注册，模型无从调用=旧行为）
-		const rpTools = config.creationMode === "ask" ? [...RP_TOOLS, ASK_TOOL] : RP_TOOLS;
+		// creationMode 已退役；剧情工具集不再接入决策询问。
+		const rpTools = RP_TOOLS;
 		const withMcp = [...rpTools, ...mcpToolNames];
 		if (config.backendControl !== false) {
 			const general = (savedTools ?? []).filter(
-				(t) => !rpTools.includes(t) && t !== ASK_TOOL && !t.startsWith("mcp__") && !mcpToolNames.includes(t),
+				(t) => !rpTools.includes(t) && t !== "ask_director" && !t.startsWith("mcp__") && !mcpToolNames.includes(t),
 			);
 			const base = general.length > 0 ? general : BUILTIN_TOOLS;
 			try {
@@ -1275,6 +1271,7 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 			appCwd = ctx.cwd;
 			if (existsSync(configPath)) {
 				const raw = { ...DEFAULT_CONFIG, ...(JSON.parse(readFileSync(configPath, "utf8")) as Partial<RpConfig>) };
+			delete (raw as unknown as Record<string, unknown>).creationMode;
 				// 旧 lorebook 单本 → lorebooks[]；与 REST loadConfig 一致
 				config = setMountedLorebooks(raw, mountedLorebookPaths(raw));
 			}
@@ -1283,17 +1280,17 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 				card = loadCardFile(cardAbs);
 			}
 
-			// 世界书只来自「已挂载的独立书（0..N 本）」+ agent 补充设定集；
-			// 卡内 character_book 不自动进上下文（与角色卡解耦，可另存为独立书再挂）。
+			// 旧扩展的独立书/补充设定集合；Web台上引擎由 loadStageMaterials 另含卡内书。
+			// 来源覆盖先应用再合并，不改变旧扩展的提示词装配边界。
 			const fileGroups: LorebookEntry[][] = [];
 			for (const rel of mountedLorebookPaths(config)) {
 				const abs = resolvePath(ctx.cwd, rel);
-				if (existsSync(abs)) fileGroups.push(loadLorebookFile(abs));
+				if (existsSync(abs)) fileGroups.push(applyLoreSourceState(loadLorebookFile(abs), config, "file", rel));
 			}
 			const fileEntries = mergeEntries(...fileGroups);
 			overlayFile = overlayPathFor(ctx.cwd, card.name);
-			const overlayEntries = existsSync(overlayFile) ? loadLorebookFile(overlayFile) : [];
-			entries = applyDisabledLore(mergeEntries(fileEntries, overlayEntries), config.disabledLore);
+			const overlayEntries = existsSync(overlayFile) ? applyLoreSourceState(loadLorebookFile(overlayFile), config, "agent", config.card) : [];
+			entries = mergeEntries(fileEntries, overlayEntries);
 
 			// 转换后的预设（可选）：system 块进 system prompt，postHistory 块进末端注入
 			// 工作草稿（preset-override.json）优先，与 hotReload 一致
@@ -1395,9 +1392,9 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 				}
 			}
 
-			const toolCount = RP_TOOLS.length + (config.creationMode === "ask" ? 1 : 0) + mcpToolNames.length;
+			const toolCount = RP_TOOLS.length + mcpToolNames.length;
 			const mcpNote = mcpToolNames.length ? `，MCP ${mcpToolNames.length}` : "";
-			notify(ctx, `RP 模式：${card.name} 已装载（世界书 ${entries.length} 条，工具 ${toolCount} 个${mcpNote}${config.creationMode === "ask" ? "，决策门禁：开" : ""}）`);
+			notify(ctx, `RP 模式：${card.name} 已装载（世界书 ${entries.length} 条，工具 ${toolCount} 个${mcpNote}）`);
 		} catch (err) {
 			if (process.env.RP_DEBUG) {
 				console.error(`[rp-debug] session_start 装载失败：`, err);
@@ -1443,40 +1440,6 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 	// 新的固定流水线将在此处重建。
 	// ============================================================
 
-
-	/** 取本拍最后一条用户原文（写入门禁判定用）。从会话 entries 倒序找第一条 user 消息。 */
-	const lastUserText = (ctx: { sessionManager?: { getEntries?: () => Array<Record<string, unknown>> } }): string => {
-		const entries = ctx.sessionManager?.getEntries?.() ?? [];
-		for (let i = entries.length - 1; i >= 0; i--) {
-			const e = entries[i];
-			if (e.type === "message") {
-				const msg = e.message as { role?: string; content?: unknown } | undefined;
-				if (msg?.role === "user") {
-					if (typeof msg.content === "string") return msg.content;
-					if (Array.isArray(msg.content)) {
-						const texts = (msg.content as Array<{ type?: string; text?: string }>)
-							.filter((b) => b?.type === "text")
-							.map((b) => b.text ?? "");
-						return texts.join("");
-					}
-					return "";
-				}
-			}
-		}
-		return "";
-	};
-
-	pi.on("tool_call", async (event, ctx) => {
-		if (!rpMode || config.creationMode !== "ask") return undefined;
-		if (!GATED_TOOLS.includes(event.toolName)) return undefined;
-		// 用户本轮主动要求写入 → 放行（不再弹确认卡）
-		if (WRITE_REQUEST_RE.test(lastUserText(ctx))) return undefined;
-		return {
-			block: true,
-			reason:
-				"写入设定集/知识库需用户明确要求：本轮用户并未要求记录，本次写入已拒绝。不要写、也不要用 ask_director 询问「是否写入」；若用户后续明确要求再执行。",
-		};
-	});
 
 	/** 等待在途的场记调用归位（树导航前必须等：否则快照会写到导航后的位置上） */
 	const waitForScribe = async (ms = 20000) => {
@@ -1950,6 +1913,7 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 		const configPath = resolveConfigPath(cwd);
 		if (existsSync(configPath)) {
 			const raw = { ...DEFAULT_CONFIG, ...(JSON.parse(readFileSync(configPath, "utf8")) as Partial<RpConfig>) };
+			delete (raw as unknown as Record<string, unknown>).creationMode;
 			config = setMountedLorebooks(raw, mountedLorebookPaths(raw));
 		}
 		{
@@ -1959,12 +1923,12 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 		const fileGroups: LorebookEntry[][] = [];
 		for (const rel of mountedLorebookPaths(config)) {
 			const abs = resolvePath(cwd, rel);
-			if (existsSync(abs)) fileGroups.push(loadLorebookFile(abs));
+			if (existsSync(abs)) fileGroups.push(applyLoreSourceState(loadLorebookFile(abs), config, "file", rel));
 		}
 		const fileEntries = mergeEntries(...fileGroups);
 		overlayFile = overlayPathFor(cwd, card.name);
-		const overlayEntries = existsSync(overlayFile) ? loadLorebookFile(overlayFile) : [];
-		entries = applyDisabledLore(mergeEntries(fileEntries, overlayEntries), config.disabledLore);
+		const overlayEntries = existsSync(overlayFile) ? applyLoreSourceState(loadLorebookFile(overlayFile), config, "agent", config.card) : [];
+		entries = mergeEntries(fileEntries, overlayEntries);
 		preset = null;
 		if (config.preset) {
 			// 工作草稿优先（面板改开关/正文立即生效但不写盘）；无草稿才读预设文件

@@ -1,42 +1,27 @@
-# AGENTS.md — 梨园项目助手须知
+# AGENTS.md — 梨园项目维护约束
 
-## 当前基线与文档使用
+进入项目先读本文件，再读 `docs/DOCUMENTATION-INDEX.md`、`ARCHITECTURE-OVERVIEW.md`、`GENERATION-MODES.md` 与 `PLAN-ROUND-FLOW.md`。本地v1.8.6，发布状态/实际门禁单列，不据工作区版本冒称公开Release。
 
-- 当前发布基线为 v1.7.4；维护时先读架构总览与各 PLAN 顶部现存的校准段。文学工作流仍以 PLAN 顶部的 v1.7.3 校准机制为有效基线；本次发布只迁移公开仓库来源并延续隐私隔离，不代表文学机制改动。
-- 旧 RELEASE、INCIDENT、REALWORLD 与早期设计数字是历史证据，不代表当前测试结果或部署状态。
-- 文档导航见 `docs/DOCUMENTATION-INDEX.md`；个人配置、人设、头像、会话和用户覆盖不得进入提交。发现疑似历史敏感数据必须先报告，不擅自强推或改旧标签。
+## 必守边界
 
-本文件是任何 AI 助手（Claude Code / opencode / 其他）进入本仓库的**第一读**。
+1. 用户只让同步/只读时不改代码；明确更新/修复任务才动手。不要reset/覆盖继承dirty改动，不擅自commit/push/Release。
+2. 新Web只有direct/director，普通文本单主Agent；专家只报告，固定3/2/2分工。旧SDK稿纸兼容代码不是当前正文流程，不恢复ask/心理画像/每段门禁。
+3. 原始预设与启用卡材料决定写法/格式；系统Skill负责职责和执行协议。提示词在 `skills/*/SKILL.md`，用户覆盖 `.liyuan-stage-skills/` 不随版本被替换；本任务不偷改生成提示词。
+4. Session Tree/`rpNarrative`是故事权威，布局、原交付、摘要、报告、候选和工具回执分工清楚。修改引擎必须说明如何符合现行流程，取消/切支/恢复不能重复事实。
+5. 读会话/思考先读 `docs/READING-THINKING.md`，按真实id/条目timestamp和时区，不用mtime猜最新。只需状态时不读原文；私人文本/Key/OAuth/SSH/会话/截图/用户素材不进提交。
+6. 工具能力开关按模型保存，默认支持；修改须保留当前启用渠道、默认模型、岗位与其它兼容字段，不能用旧仓库子集覆盖运行配置。模型独立分工，禁止把Gemini 3.7/3.8 Flash全部换为Luna。仅Luna旧名迁移为原生gpt-6-luna，连接需真实端点验证，嵌入另有配置。
+7. 内嵌世界书自动随卡加载，不复制挂载；管理写操作带source/cardIdentity/entryKey，原关闭模块不自动开启。生产PNG不拿来试写。
+8. 记忆按session/card/祖先来源：完整周期窗口、规范正文及偏移基准；生产只读，金丝雀用临时库，不重生成故事来凑测试成功。
+9. 升级先临时build、离线/浏览器、空闲与备份，再验证health/hello/bundle/SW/会话和私有数据。不要为方便放宽私有资料权限或默默启用旧渠道。
 
-## 铁律
+## 当前代码入口
 
-1. **禁止直接动手改代码**，除非用户明确说「开始/动手」。
-   用户会说「先同步情况」「你来告诉我」「只读」——那期间只能读、不能改。
-2. **读思考记录必须先读** `docs/READING-THINKING.md`——按文件 mtime 找最新会话
-   会读错位置（旧会话被 model_change 碰过 mtime 会排到前面）。必须用行级
-   timestamp 核对北京时间。
-3. **流程与提示词的最终形态**定义在 `docs/PLAN-ROUND-FLOW.md`——任何提示词/
-   引擎改动都要回答「离这个流程近了多少」。
-4. 预设拆层规则见 `docs/PRESET-SPLIT-TAXONOMY.md`；RP agent 执行计划见
-   `docs/PLAN-RP-AGENT-EXEC.md`。
-5. **文学工作流的提示词全部在 Skill 里**（`skills/*/SKILL.md`，面板可编辑，
-   用户覆盖在 `.liyuan-stage-skills/`）。`src/stage/literary-*.ts` 只负责编排与
-   解析，不写提示词正文；改流程优先改 Skill 文件，不硬编码进 TS。
+- `src/stage/engine.ts` / `agent-turn.ts` / `agent-director.ts`：模式、作者、阶段、保存与共用结算。
+- `agent-presentation.ts` / `materials.ts` / `assemble.ts`：原文资料、事实/格式边界。
+- `literary-world-*.ts` / `literary-ecology.ts`：世界与生态，另见相关现行PLAN。
+- `src/memory/` / `stage/compact.ts`：SQLite、完整N拍、事件/证据/摘要。
+- `src/outline/` / `src/novel-play/`：导演室、大纲、研究、小说消化和开演。
+- `src/tools/` / `.liyuan/extensions/roleplay.ts`：能力投影和旧SDK/热刷新接线。
+- `server/` / `web/src/`：会话宿主、REST/WS、两模式UI和只读诊断。
 
-## 快速索引
-
-- `docs/ARCHITECTURE-OVERVIEW.md` — **结构总览（AI/维护者第一读）**：权威边界、目录地图、一拍流程、关键机制现状、文档导航、测试与维护要点
-- `docs/PLAN-ROUND-FLOW.md` — 分轮演出流程（最终形态 + 关键路径分级 + 落地记录）
-- `docs/PLAN-WORLD-ENGINE.md` — 角色卡自适应模块化世界引擎（画像/Manifest/事实信封/审计/模块化状态）权威设计
-- `docs/PLAN-LIVING-ECOLOGY.md` — 鲜活世界生态（三层权威 + 后台双池 running/ready）权威设计
-- `docs/PLAN-NOVEL-DIGEST.md` — 小说长文消化与研究库扩容（上传→分块摘要→套路库，导演室后台管道）权威设计；**§17 含实现状态与未做事项（URL 抓取等），新会话先读这节**
-- `docs/STANDALONE-INTEGRATION-BASELINE.md` — 文学工作流 Skill 化权威边界
-- `docs/READING-THINKING.md` — 读思考记录的**正确方法**（先读这个再碰会话文件）
-- `src/stage/` — 台上引擎（assemble 提示词 / engine 回合循环 / workspace 稿纸 /
-  tools 工具 schema / literary-*.ts 拍前分析 / literary-world-profile.ts 卡级画像+Manifest /
-  literary-world-modular.ts 模块化世界 v2 / literary-world-transition.ts 事实信封+提案+审计 /
-  literary-world-signals.ts 跨域信号 / literary-ecology.ts 生态 / skill-store.ts Skill 装载）
-- `src/outline/corpus.ts` — **小说长文消化管道**：解码/清洗/分章/分块 + 串行 CorpusEngine（断点续跑、暂停/恢复/删除、预算闸门）
-- `skills/` — 内置工作流 Skill（随版本更新；含世界模块包 `世界模块-*`）
-- `.liyuan-stage-skills/` — Skill 的用户覆盖（gitignore，不随版本覆盖；「世界推演」在此）
-- 测试：`npm test`（需 Node ≥ 22.19.0；直接使用 Node 原生 TypeScript 支持，不临时下载 tsx）
+测试使用 `/opt/node22/bin/node` 或符合manifest最低版本的Node；`npm run verify`仅声明其实际覆盖范围。老架构日记、废弃计划和过期测试数字已退出活动文档，备份留受限运维产物；不要把它们重新粘回现行指南。

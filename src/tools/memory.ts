@@ -118,13 +118,14 @@ export const memorySearch: ToolSpec<MemoryDeps> = {
 		ctx.surface === "stage"
 			? `检索本对话的记忆库：被压缩出上下文的早期正文、滚动摘要、导入资料。` +
 				`重新带回【登场名录】里那些你已记不清细节的人物/物品/剧情线之前，必须先查——不得臆造早先已确立的事实。` +
-				`用${ctx.language}检索。`
+				`用${ctx.language}组织短查询：人物姓名＋关键行为/物品＋已知时间地点或所问结果；不要只查“以前/约定”，不把猜测当查询事实。` +
+				`先核对命中是否对应同一人物、事件与阶段；必要且额度允许时换一个缺口导向的查询。事件概括不等于逐字原文，无命中不等于事情没发生或角色忘记。`
 			: `检索当前剧情对话的记忆库（剧情摘要、早期归档正文、导入资料），用于诊断「模型记得什么」。` +
 				`记忆按对话隔离，此处搜的是**当前**剧情会话的库。`,
 	parameters: () => ({
 		type: "object",
 		properties: {
-			query: { type: "string", description: "关键词或一句话问题（关于过去发生的事）" },
+			query: { type: "string", description: "短查询：相关人物姓名＋具体事件/行为/物品＋已知时间地点或待核对结果；保留确知称呼，不猜日期、别名或答案" },
 		},
 		required: ["query"],
 	}),
@@ -148,7 +149,7 @@ export const memorySearch: ToolSpec<MemoryDeps> = {
 			return {
 				text: stage
 					? "剧情库无命中（可能未启用向量记忆，或该内容未被归档）。不要臆造当年的具体细节——" +
-						"正文里模糊化处理（角色可以「记不太清」），或沿用【世界状态】【登场名录】里已有的事实。"
+						"必要且剩余检索额度允许时，换成相关人物＋关键行为/物品的短查询。仍缺证据时只对缺失细节模糊化处理，沿用已确认事实；无命中不表示事情没发生、角色失忆或承诺未兑现，不擅自改人物记忆与关系。"
 					: `（记忆库未命中「${query}」；也可能是向量记忆未启用，或该内容尚未入库。）`,
 				activity: `查剧情库「${query}」· 无命中`,
 			};
@@ -160,13 +161,21 @@ export const memorySearch: ToolSpec<MemoryDeps> = {
 				let body = h.text;
 				if (h.meta?.kind === "event") {
 					try {
-						const event = JSON.parse(h.text) as { title?: string; summary?: string; tags?: string[] };
-						body = [event.title, event.summary, event.tags?.length ? `标签：${event.tags.join("、")}` : ""].filter(Boolean).join("\n");
+						const event = JSON.parse(h.text) as { title?: string; summary?: string; tags?: string[]; participants?: string[]; time?: string; location?: string; arc?: string };
+						body = [event.title,
+							Array.isArray(event.participants) && event.participants.length ? `人物：${event.participants.join("、")}` : "",
+							event.time ? `时间：${event.time}` : "", event.location ? `地点：${event.location}` : "",
+							event.arc ? `剧情线：${event.arc}` : "", event.summary,
+							Array.isArray(event.tags) && event.tags.length ? `标签：${event.tags.join("、")}` : "",
+						].filter(Boolean).join("\n");
 					} catch {
 						// 旧事件数据保持原文。
 					}
 				}
-				return `${i + 1}. 〔${tag}〕${body}`;
+				const basis = h.meta?.kind === "event" ? "〔事件概括，非逐字原文〕"
+					: h.meta?.kind === "evidence" ? "〔原文证据片段，仍需核对所问事件〕"
+						: h.meta?.kind === "digest" ? "〔记忆定位，未必包含所问细节〕" : "";
+				return `${i + 1}. 〔${tag}〕${basis}${body}`;
 			})
 			.join("\n\n");
 		return {

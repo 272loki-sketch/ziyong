@@ -105,9 +105,9 @@ export interface EcologyPublicSurface {
 	scope: string;
 }
 
-/** Provenance anchor, not a deterministic proof of the quote's consent semantics. */
+/** Fictional participation provenance; never real-world user/tool authorization. */
 export interface EcologyUserCommitmentEvidence {
-	source: "latest-user";
+	source: "latest-user" | "narrative";
 	sourceEntryId: string;
 	occurrenceId: string;
 	quote: string;
@@ -119,6 +119,8 @@ export interface EcologyUserCommitmentEvidence {
 export interface EcologyTransitionOptions {
 	latestUserText?: string;
 	latestUserEntryId?: string;
+	/** Supplied by the engine only AFTER canonical narrative persistence on this branch. */
+	trustedNarrative?: { entryId: string; text: string };
 	/** The authoritative pre-turn snapshot. Never substitute an arrival/model candidate here. */
 	committedState?: LiteraryEcologyState;
 }
@@ -345,11 +347,11 @@ export function saveEcologyPools(cwd: string, cardPath: string, pools: { global?
 function normalizeUserCommitment(value: unknown): EcologyUserCommitmentEvidence | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 	const source = value as Record<string, unknown>;
-	if (source.source !== "latest-user" || typeof source.quote !== "string" || !source.quote.trim() || source.quote.length > 2_000
+	if (!["latest-user", "narrative"].includes(String(source.source)) || typeof source.quote !== "string" || !source.quote.trim() || source.quote.length > 2_000
 		|| typeof source.sourceEntryId !== "string" || !source.sourceEntryId || source.sourceEntryId.length > 160
 		|| typeof source.occurrenceId !== "string" || !source.occurrenceId || source.occurrenceId.length > 80) return undefined;
 	return {
-		source: "latest-user", sourceEntryId: source.sourceEntryId, occurrenceId: source.occurrenceId, quote: source.quote,
+		source: source.source as EcologyUserCommitmentEvidence["source"], sourceEntryId: source.sourceEntryId, occurrenceId: source.occurrenceId, quote: source.quote,
 		...(Object.hasOwn(source, "start") ? { start: source.start as number } : {}),
 		...(Object.hasOwn(source, "end") ? { end: source.end as number } : {}),
 	};
@@ -455,9 +457,12 @@ export function dueEcologyActors(state: LiteraryEcologyState, maximum = 8): Arra
 
 function checkedUserCommitment(occurrence: EcologyOccurrence, options: EcologyTransitionOptions): EcologyUserCommitmentEvidence | undefined {
 	const evidence = occurrence.userCommitment;
-	const text = options.latestUserText;
-	if (!evidence || !options.latestUserEntryId || typeof text !== "string" || evidence.source !== "latest-user"
-		|| evidence.sourceEntryId !== options.latestUserEntryId || evidence.occurrenceId !== occurrence.id
+	const anchor = evidence?.source === "latest-user"
+		? { entryId: options.latestUserEntryId, text: options.latestUserText }
+		: evidence?.source === "narrative" ? options.trustedNarrative : undefined;
+	const text = anchor?.text;
+	if (!evidence || !anchor?.entryId || typeof text !== "string"
+		|| evidence.sourceEntryId !== anchor.entryId || evidence.occurrenceId !== occurrence.id
 		|| !evidence.quote.trim() || evidence.quote.length > 2_000) return undefined;
 	let start: number;
 	if (evidence.start !== undefined || evidence.end !== undefined) {
@@ -468,7 +473,7 @@ function checkedUserCommitment(occurrence: EcologyOccurrence, options: EcologyTr
 		start = text.indexOf(evidence.quote);
 		if (start < 0 || text.indexOf(evidence.quote, start + 1) >= 0) return undefined;
 	}
-	return { source: "latest-user", sourceEntryId: options.latestUserEntryId, occurrenceId: occurrence.id, quote: evidence.quote, start, end: start + evidence.quote.length };
+	return { source: evidence.source, sourceEntryId: anchor.entryId, occurrenceId: occurrence.id, quote: evidence.quote, start, end: start + evidence.quote.length };
 }
 
 /**
@@ -495,7 +500,7 @@ export function validateEcologyTransition(previous: LiteraryEcologyState, next: 
 		else {
 			occurrence.userRole = "optional";
 			delete occurrence.userCommitment;
-			warnings.push(`事件 ${occurrence.id} 的新用户承诺缺少匹配的本拍用户原文锚点，已降为 optional；引文匹配也不等于语义承诺证明。`);
+			warnings.push(`事件 ${occurrence.id} 的新角色承诺缺少匹配的本拍用户原文锚点或已保存正文锚点，已降为 optional；引文匹配也不等于语义承诺证明。`);
 		}
 	}
 	if (warnings.length) next.commitmentWarnings = [...new Set(warnings)].slice(-12);
@@ -621,9 +626,9 @@ export function buildEcologyCardPrompt(skillBody: string, input: { global: Ecolo
 	return { systemPrompt: skillPrompt("角色卡生态适配池", skillBody), userText: JSON.stringify({ current_card_pool: { ...input.cardPool, templates }, global_prototypes: prototypes, character_card: { name: input.card.name, description: clipPromptText(input.card.description, 8_000), personality: clipPromptText(input.card.personality, 5_000), scenario: clipPromptText(input.card.scenario, 5_000), tags: input.card.tags.slice(0, 30) }, world_lore: boundedLore(input.lore, 30, 28_000), current_state: input.state, recent_history: boundedHistory(input.history, 12, 36_000) }, null, 2) };
 }
 
-export function buildEcologyRuntimePrompt(skillBody: string, input: { phase: "arrival" | "aftermath"; ecology: LiteraryEcologyState; global: EcologyGlobalPool; cardPool: EcologyCardPool; lore?: LorebookEntry[]; state: WorldState; history: BeatMsg[]; userText: string; userEntryId?: string; narrativeText?: string; worldSignals?: unknown[] }): { systemPrompt: string; userText: string } {
+export function buildEcologyRuntimePrompt(skillBody: string, input: { phase: "arrival" | "aftermath"; ecology: LiteraryEcologyState; global: EcologyGlobalPool; cardPool: EcologyCardPool; lore?: LorebookEntry[]; state: WorldState; history: BeatMsg[]; userText: string; userEntryId?: string; narrativeText?: string; trustedNarrative?: { entryId: string; text: string }; worldSignals?: unknown[] }): { systemPrompt: string; userText: string } {
 	const templates = input.cardPool.templates.filter((item) => item.status === "active").sort((a, b) => a.useCount - b.useCount).slice(0, 40);
-	return { systemPrompt: skillPrompt("人物与场所生态运行", skillBody), userText: JSON.stringify({ phase: input.phase, current_ecology: input.ecology, due_actors: dueEcologyActors(input.ecology), global_pool_digest: input.global.digest, card_ecology: { ...input.cardPool, templates }, world_lore: boundedLore(input.lore ?? [], 40, 24_000), current_scene_state: input.state, world_constraints: input.worldSignals ?? [], recent_history: boundedHistory(input.history, 16), latest_turn: { user: clipPromptText(input.userText, 8_000), user_entry_id: input.userEntryId ?? null, narrative: clipPromptText(input.narrativeText, 20_000) } }, null, 2) };
+	return { systemPrompt: skillPrompt("人物与场所生态运行", skillBody), userText: JSON.stringify({ phase: input.phase, current_ecology: input.ecology, due_actors: dueEcologyActors(input.ecology), global_pool_digest: input.global.digest, card_ecology: { ...input.cardPool, templates }, world_lore: boundedLore(input.lore ?? [], 40, 24_000), current_scene_state: input.state, world_constraints: input.worldSignals ?? [], recent_history: boundedHistory(input.history, 16), latest_turn: { user: clipPromptText(input.userText, 8_000), user_entry_id: input.userEntryId ?? null, narrative: clipPromptText(input.phase === "aftermath" ? input.trustedNarrative?.text ?? input.narrativeText : input.narrativeText, 20_000), narrative_entry_id: input.phase === "aftermath" ? input.trustedNarrative?.entryId ?? null : null } }, null, 2) };
 }
 
 export function formatLiteraryEcologyInjection(ecology: LiteraryEcologyState, maxChars = 6000): string | undefined {

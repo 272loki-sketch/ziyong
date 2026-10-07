@@ -122,3 +122,19 @@ test("world transition v2：模块提案原子提交并派生兼容 v1 投影", 
 	assert.equal(projectLiteraryWorldV1(committed).winds[0]?.topic, "递信");
 	assert.equal(moduleKindForId("cultivation-system"), "rules");
 });
+
+
+test("world transition：正文演出的主角日常行动可结算，但不冒充用户授权", () => {
+	const sources = { userText: "继续当前场景。", narrativeText: "沈舟把折好的信收进外套内袋。" };
+	const input = {
+		evidence: [{ id: "ev_narrative", source: "narrative", locator: "narrative", quote: sources.narrativeText }],
+		facts: [{ id: "fact_store_letter", kind: "action", subject: "沈舟", predicate: "把信收进内袋", actuality: "established", visibility: "limited", agency: "other", evidenceIds: ["ev_narrative"] }],
+		elapsed: { kind: "unknown", evidenceIds: [] }, triggerFactIds: ["fact_store_letter"], uncertainties: [],
+	};
+	const narrated = normalizeBeatFactEnvelope(input, sources);
+	assert.ok(narrated.envelope, "镜头内已提交的普通主角行动仍可作为剧情事实");
+	assert.equal(narrated.envelope.facts[0].agency, "other");
+	const inventedConsent = normalizeBeatFactEnvelope({ ...input, facts: [{ ...input.facts[0], agency: "user-voluntary" }] }, sources);
+	assert.equal(inventedConsent.envelope, undefined, "叙事代写许可不等于屏幕外用户本人作出事件承诺");
+	assert.match(inventedConsent.errors.join("；"), /没有用户输入证据/);
+});

@@ -21,5 +21,6 @@ test("生态剧情适配解析和注入保留候选、因果、伏笔及行动�
 	assert.equal(adapted?.selected?.status, "selected");
 	const formatted = formatPlotAdaptation(adapted);
 	assert.match(formatted ?? "", /不是已发生事实/);
-	assert.match(formatted ?? "", /只出现疑点/);
+	assert.doesNotMatch(formatted ?? "", /只出现疑点|用户决定是否查看|玩家空间/);
+	assert.equal(adapted?.selected?.progressLimit, "只出现疑点", "旧字段解析兼容，但不回注正文");
 });

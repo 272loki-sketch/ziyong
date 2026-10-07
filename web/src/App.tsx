@@ -6,12 +6,14 @@
  * 手机（<1000px）：面板变全屏抽屉。
  */
 
+import { RealTestRecords } from "./components/RealTestRecords.tsx";
 import { useCallback, useEffect, useMemo, useRef, useState, Fragment } from "react";
 import {
 	apiGet,
 	apiGetCacheClear,
 	apiGetCacheClearForPanel,
 	apiPost,
+	apiPut,
 	personaAvatarUrl,
 	prefetchPanelApis,
 	uploadFile,
@@ -37,6 +39,15 @@ import { UpdateModal, UpdateToast } from "./components/UpdateFlow.tsx";
 import { PanelRefreshContext } from "./components/kit.tsx";
 import { NovelGuidePanel, type NovelGuideData } from "./components/NovelGuidePanel.tsx";
 import { registerTavernChatBridge } from "./tavernShim.ts";
+import {
+	buildStoryPromptFrame,
+	DEFAULT_GENERATION_MODE,
+	modeForPromptSubmission,
+	resolveGenerationMode,
+	restoredPromptMode,
+	type GenerationMode,
+	type RestoredPromptMode,
+} from "./generation-mode.ts";
 import { setAtHome, shouldShowHomeOnBoot, touchVisit } from "./visit.ts";
 import { getBuildVersionAlignment, getFrontendBuildVersion, readServerVersion } from "./build-version.ts";
 import {
@@ -97,6 +108,7 @@ import { RosterPanel } from "./components/RosterPanel.tsx";
 import { SessionsPanel } from "./components/SessionsPanel.tsx";
 import { SettingsPanel } from "./components/SettingsPanel.tsx";
 import { SessionStatsBar, StatusStrip } from "./components/StatusStrip.tsx";
+import { GenerationModeControl } from "./components/GenerationModeControl.tsx";
 import { UploadsPanel } from "./components/UploadsPanel.tsx";
 import { StoreModal, WorldlinePanel } from "./components/WorldlinePanel.tsx";
 import { StoryPlanningWorkbench } from "./planning/StoryPlanningWorkbench.tsx";
@@ -256,6 +268,8 @@ export default function App() {
 	const [updateToastDismissed, setUpdateToastDismissed] = useState(false);
 	const updateErrRef = useRef<string | null>(null);
 	const [input, setInput] = useState("");
+	const [generationMode, setGenerationMode] = useState<GenerationMode>(DEFAULT_GENERATION_MODE);
+	const [restoredModeHint, setRestoredModeHint] = useState<GenerationMode | null>(null);
 	// 待发送附件（附件随消息，上传即落服务端 .liyuan-uploads/，发送时路径附在消息尾行）
 	const [pending, setPending] = useState<PendingUpload[]>([]);
 	const [uploading, setUploading] = useState(false);
@@ -406,6 +420,9 @@ export default function App() {
 	const sendRef = useRef<(frame: import("./wire.ts").ClientFrame) => void>(() => {});
 	// 仅编辑器交接信息，不是正文副本；ACK 前保留输入/附件，避免拒绝后清空。
 	const composerSubmissionsRef = useRef(new Map<string, { input: string; files: string[]; sessionId?: string }>());
+	const storyHelloSeenRef = useRef(false);
+	const generationModeChosenRef = useRef(false);
+	const restoredPromptModeRef = useRef<RestoredPromptMode | null>(null);
 	const [assistantRecovery, setAssistantRecovery] = useState<string | null>(null);
 	const toastSeq = useRef(0);
 	const listRef = useRef<HTMLDivElement>(null);
@@ -464,6 +481,19 @@ export default function App() {
 		window.setTimeout(() => {
 			setToasts((ts) => ts.filter((t) => t.id !== id));
 		}, TOAST_TTL_MS[level]);
+	}, []);
+
+	const onGenerationModeChange = useCallback((mode: GenerationMode) => {
+		generationModeChosenRef.current = true;
+		setGenerationMode(mode);
+		void apiPut("/api/config", { generationMode: mode }).catch((error) => {
+			pushToast("warning", `模式已用于后续输入，但保存配置失败：${error instanceof Error ? error.message : String(error)}`);
+		});
+	}, [pushToast]);
+
+	const onConfigGenerationMode = useCallback((mode: unknown) => {
+		if (storyHelloSeenRef.current || generationModeChosenRef.current || restoredPromptModeRef.current) return;
+		setGenerationMode(resolveGenerationMode(mode));
 	}, []);
 
 	const doTts = useCallback(
@@ -657,6 +687,10 @@ export default function App() {
 				}
 				case "hello": {
 					setServerVersion(readServerVersion(frame));
+					storyHelloSeenRef.current = true;
+					if (!generationModeChosenRef.current && !restoredPromptModeRef.current) {
+						setGenerationMode(resolveGenerationMode(frame.generationMode));
+					}
 					const hydratedMessages = frame.messages.map((m) => {
 						if (!m.timeline || m.timeline.length === 0) return m;
 						return { ...m, segments: m.timeline as unknown as TurnSegment[] };
@@ -684,6 +718,8 @@ export default function App() {
 						busyRef.current = false; setBusy(false); setTurnStartedAt(null); setThinkingLive(false); setToolNote(null);
 					}
 					setNovelGuide(frame.novelGuide ?? null);
+					apiGetCacheClear("/api/lorebook");
+					setAgentTick((tick) => tick + 1);
 					setCharName(frame.charName);
 					setUserName(frame.userName);
 					// 同会话生成中重连时，hello 只有已落树历史，不能覆盖浏览器尚未落树的实时稿。
@@ -1215,21 +1251,39 @@ export default function App() {
 		return (a === "(" || a === "（") && (b === ")" || b === "）");
 	};
 
+	const storyPromptForText = useCallback((text: string, restoredText = text) => {
+		const restored = restoredPromptModeRef.current;
+		const mode = modeForPromptSubmission(restoredText, generationMode, restored);
+		if (restored && restored.text !== restoredText) {
+			restoredPromptModeRef.current = null;
+			setRestoredModeHint(null);
+		}
+		return buildStoryPromptFrame(text, mode);
+	}, [generationMode]);
+
 	const send = useCallback(() => {
 		const typed = input.trim();
+		if (restoredPromptModeRef.current && restoredPromptModeRef.current.text !== typed) {
+			restoredPromptModeRef.current = null;
+			setRestoredModeHint(null);
+		}
 		const attachLine = pending.length > 0 ? buildAttachmentLine(pending.map((p) => p.file)) : "";
 		const text = attachLine ? (typed ? `${typed}\n${attachLine}` : attachLine) : typed;
 		if (!text) return;
 		if (/^\/store\s*$/i.test(typed) && pending.length === 0) { openStoreModal(); setInput(""); return; }
 		if (/^\/line\s*$/i.test(typed) && pending.length === 0) { setCenterMenu(null); openLeft("worldline"); setInput(""); return; }
-		const result = ws.send({ type: "prompt", text });
+		const result = ws.send(storyPromptForText(text, typed));
 		if (!result.accepted) return; // 拒绝/存储失败不清输入
+		if (restoredPromptModeRef.current) {
+			restoredPromptModeRef.current = null;
+			setRestoredModeHint(null);
+		}
 		if (result.messageId) composerSubmissionsRef.current.set(result.messageId, { input: typed, files: pending.map((p) => p.file), sessionId: result.sessionId });
 		setWelcome(false); setAtHome(false); touchVisit();
 		if (looksBackstage(typed)) { setAsstUnread(false); openRight("assistant"); }
 		while (composerSubmissionsRef.current.size > 32) composerSubmissionsRef.current.delete(composerSubmissionsRef.current.keys().next().value!);
 		atBottomRef.current = true; setAtBottom(true);
-	}, [input, pending, ws, openStoreModal, openRight, openLeft]);
+	}, [input, pending, ws, openStoreModal, openRight, openLeft, storyPromptForText]);
 
 	// 卡 HTML（如 某卡 开场表单）调用 triggerSlash(`/send …|/trigger`)
 	// 须接到输入框 / WS，否则界面显示「档案已发送」但聊天栏空白
@@ -1261,8 +1315,12 @@ export default function App() {
 				setAtHome(false);
 				touchVisit();
 				setInput(body);
-				const result = ws.send({ type: "prompt", text: body });
+				const result = ws.send(storyPromptForText(body));
 				if (!result.accepted) return;
+				if (restoredPromptModeRef.current) {
+					restoredPromptModeRef.current = null;
+					setRestoredModeHint(null);
+				}
 				if (result.messageId) composerSubmissionsRef.current.set(result.messageId, { input: body, files: [], sessionId: result.sessionId });
 				atBottomRef.current = true;
 				setAtBottom(true);
@@ -1276,7 +1334,7 @@ export default function App() {
 			notify: (level, text) => pushToast(level === "success" ? "info" : level, text),
 		});
 		return () => registerTavernChatBridge(null);
-	}, [ws, pushToast]);
+	}, [ws, pushToast, storyPromptForText]);
 
 	// 上传：即时落服务端 .liyuan-uploads/，成功后进 pending（chip 显示，发送时随消息）
 	const doUpload = useCallback(
@@ -1517,7 +1575,12 @@ export default function App() {
 			case "powers":
 				return <PowersPanel toast={pushToast} />;
 			case "settings":
-				return <SettingsPanel toast={pushToast} />;
+				return <SettingsPanel
+					toast={pushToast}
+					generationMode={generationMode}
+					onGenerationModeChange={onGenerationModeChange}
+					onConfigGenerationMode={onConfigGenerationMode}
+				/>;
 			case "card":
 				return (
 					<CardPanel
@@ -1923,7 +1986,12 @@ export default function App() {
 									hidden={centerMenu !== "settings"}
 									style={centerMenu === "settings" ? undefined : { display: "none" }}
 								>
-									<SettingsPanel toast={pushToast} />
+									<SettingsPanel
+									toast={pushToast}
+									generationMode={generationMode}
+									onGenerationModeChange={onGenerationModeChange}
+									onConfigGenerationMode={onConfigGenerationMode}
+								/>
 								</div>
 							)}
 							{(dropKeep === "panels" || centerMenu === "panels") && (
@@ -2214,10 +2282,10 @@ export default function App() {
 						{(ws.outbox.length > 0 || assistantRecovery) && <details className="composer-shell" aria-label="未确认输入恢复">
 							<summary>未确认输入 {ws.outbox.length + (assistantRecovery ? 1 : 0)} 条 · ACK 前保留，可复制；命令不自动重放</summary>
 							{ws.outbox.map((item) => <div key={item.frame.messageId}>
-								<div className="field-hint">{item.frame.type === "prompt" ? "剧情" : "助手"} · {item.state === "pending" ? "等待确认" : item.reason || "草稿保留"}</div>
+				<div className="field-hint">{item.frame.type === "prompt" ? `剧情 · ${item.frame.generationMode === "direct" ? "直出" : item.frame.generationMode === "director" ? "导演" : "未标注模式"}` : "助手"} · {item.state === "pending" ? "等待确认" : item.reason || "草稿保留"}</div>
 								<textarea readOnly className="field-input" rows={2} value={item.frame.text} aria-label="可复制的未确认草稿" />
 								<button type="button" className="drawer-btn" onClick={() => void copyDraft(item.frame.text)}>复制</button>
-								{item.state === "rejected" && item.frame.type === "prompt" && <button type="button" className="drawer-btn" onClick={() => { if ((input.trim() || pending.length) && !window.confirm("恢复这条草稿将替换当前输入和附件选择，是否继续？")) return; setInput(item.frame.text); setPending([]); inputRef.current?.focus(); }}>恢复到输入框</button>}
+				{item.state === "rejected" && item.frame.type === "prompt" && <button type="button" className="drawer-btn" onClick={() => { if ((input.trim() || pending.length) && !window.confirm("恢复这条草稿将替换当前输入和附件选择，是否继续？")) return; const restored = item.frame.type === "prompt" ? restoredPromptMode(item.frame.text, item.frame.generationMode) : null; restoredPromptModeRef.current = restored; setRestoredModeHint(restored?.generationMode ?? null); setInput(item.frame.text); setPending([]); inputRef.current?.focus(); }}>恢复到输入框</button>}
 								{item.state === "rejected" && <button type="button" className="drawer-btn" onClick={() => ws.discard(item.frame.messageId)}>移除本机草稿</button>}
 							</div>)}
 							{assistantRecovery && <div><div className="field-hint">助手未发送，请复制到助手框重试</div><textarea readOnly className="field-input" rows={2} value={assistantRecovery} /><button type="button" className="drawer-btn" onClick={() => setAssistantRecovery(null)}>关闭副本</button></div>}
@@ -2241,6 +2309,12 @@ export default function App() {
 								{uploading && <span className="attach-chip attach-uploading">上传中…</span>}
 							</div>
 						)}
+						<div className="composer-shell composer-mode-row">
+							<span className="field-hint">{restoredModeHint ? `恢复草稿按${restoredModeHint === "direct" ? "直出" : "导演流程"}提交` : "剧情模式"}</span>
+							<GenerationModeControl compact value={generationMode} onChange={onGenerationModeChange} />
+							<RealTestRecords compact />
+							<button type="button" className="drawer-btn" disabled={busy} title="重做未完成的领域结算，不重写正文" onClick={()=>{void apiPost<{error?:string}>("/api/turn/retry-settlement",{}).then(r=>pushToast(r.error?"error":"info",r.error??"未完成结算已恢复，正文未重写")).catch(e=>pushToast("error",String(e)))}}>重试结算</button>
+						</div>
 						<div className="composer-shell composer-box">
 							{suggestions.length > 0 && (
 								<div className="cmd-pop">
@@ -2356,6 +2430,10 @@ export default function App() {
 									}
 								}}
 								onChange={(e) => {
+									if (restoredPromptModeRef.current && restoredPromptModeRef.current.text !== e.target.value) {
+										restoredPromptModeRef.current = null;
+										setRestoredModeHint(null);
+									}
 									setInput(e.target.value);
 									setCmdDismissed(false);
 									setCmdIndex(0);
@@ -2447,10 +2525,14 @@ export default function App() {
 										if (injected && injected !== input.trim()) {
 											setWelcome(false);
 											setAtHome(false);
-											touchVisit();
-											setInput(injected);
-											const result = ws.send({ type: "prompt", text: injected });
-											if (result.accepted && result.messageId) composerSubmissionsRef.current.set(result.messageId, { input: injected, files: [], sessionId: result.sessionId });
+							touchVisit();
+							setInput(injected);
+							const result = ws.send(storyPromptForText(injected));
+							if (result.accepted && restoredPromptModeRef.current) {
+								restoredPromptModeRef.current = null;
+								setRestoredModeHint(null);
+							}
+							if (result.accepted && result.messageId) composerSubmissionsRef.current.set(result.messageId, { input: injected, files: [], sessionId: result.sessionId });
 											return;
 										}
 										send();

@@ -7,7 +7,9 @@
  * - 角色卡存放在 keyword 为 "ccv3"（V3）或 "chara"（V2/V1）的 tEXt 中，text 为 base64(JSON)
  */
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, realpathSync, statSync, openSync, writeSync, fsyncSync, closeSync, fchmodSync, renameSync, existsSync, unlinkSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { dirname, join } from "node:path";
 import type { CharacterCard, LorebookEntry, MacroContext } from "./types.ts";
 import { normalizeEntries } from "./lorebook.ts";
 
@@ -196,7 +198,7 @@ function buildPngChunk(type: string, data: Buffer): Buffer {
 /**
  * 把角色卡 JSON 写回 PNG 的 chara/ccv3 tEXt（优先改已有 keyword；都没有则在 IEND 前插入 chara）。
  */
-export function writeCardJsonToPng(buf: Buffer, json: unknown): Buffer {
+export function writeCardJsonToPng(buf: Buffer, json: unknown, options: { syncCharacterBook?: boolean } = {}): Buffer {
 	if (buf.length < 8 || !buf.subarray(0, 8).equals(PNG_SIGNATURE)) {
 		throw new Error("不是有效的 PNG 文件");
 	}
@@ -222,6 +224,45 @@ export function writeCardJsonToPng(buf: Buffer, json: unknown): Buffer {
 			if (kw === keyword) {
 				out.push(buildPngChunk("tEXt", textData));
 				replaced = true;
+			} else if (options.syncCharacterBook && (kw === "chara" || kw === "ccv3")) {
+				const decoded: unknown = JSON.parse(Buffer.from(data.subarray(sep + 1).toString("latin1"), "base64").toString("utf8"));
+				if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) throw new Error("PNG角色卡副本JSON无效，未改写卡文件");
+				const secondary = decoded as Record<string, unknown>;
+				const primary = json as Record<string, unknown>;
+				const primaryData = cardDataTarget(primary);
+				const primaryBook = ("character_book" in primaryData ? primaryData.character_book : primary.character_book) as Record<string, unknown>;
+				const secondaryData = cardDataTarget(secondary);
+				const secondaryTarget = "character_book" in secondaryData ? secondaryData : secondary;
+				const oldBook = secondaryTarget.character_book && typeof secondaryTarget.character_book === "object" ? secondaryTarget.character_book as Record<string, unknown> : {};
+				const oldRows = oldBook.entries && typeof oldBook.entries === "object" ? Object.entries(oldBook.entries) : [];
+				const used = new Set<string>();
+				const rows = primaryBook.entries && typeof primaryBook.entries === "object" ? Object.entries(primaryBook.entries).map(([key, value]) => {
+					if (!value || typeof value !== "object") return [key, value] as const;
+					const entry = value as Record<string, unknown>;
+					const available = oldRows.filter(([oldKey, oldValue]) => !used.has(oldKey) && oldValue && typeof oldValue === "object");
+					const match = available.find(([, old]) => (entry.id !== undefined && (old as Record<string, unknown>).id === entry.id) || (entry.uid !== undefined && (old as Record<string, unknown>).uid === entry.uid))
+						?? available.find(([, old]) => (old as Record<string, unknown>).content === entry.content)
+						?? available.find(([oldKey]) => oldKey === key);
+					if (match) used.add(match[0]);
+					if (!match) return [key, entry] as const;
+					const oldEntry = match[1] as Record<string, unknown>;
+					const norm = normalizeEntries([entry])[0], oldNorm = normalizeEntries([oldEntry])[0];
+					const next = { ...oldEntry };
+					// 只同步语义有差异的规范字段；副本自身的 spec、未知字段和未变条目原文不动。
+					if (norm.content !== oldNorm.content) next.content = entry.content;
+					if (norm.comment !== oldNorm.comment) { next.comment = norm.comment; next.name = norm.comment; }
+					if (JSON.stringify(norm.keys) !== JSON.stringify(oldNorm.keys)) { next.key = norm.keys; next.keys = norm.keys; }
+					if (JSON.stringify(norm.secondaryKeys) !== JSON.stringify(oldNorm.secondaryKeys)) { next.keysecondary = norm.secondaryKeys; next.secondary_keys = norm.secondaryKeys; }
+					if (norm.constant !== oldNorm.constant) next.constant = norm.constant;
+					if (norm.selective !== oldNorm.selective) next.selective = norm.selective;
+					if (norm.order !== oldNorm.order) { next.order = norm.order; next.insertion_order = norm.order; }
+					if (norm.enabled !== oldNorm.enabled) { next.enabled = norm.enabled; next.disable = !norm.enabled; }
+					return [match[0], next] as const;
+				}) : [];
+				secondaryTarget.character_book = { ...primaryBook, ...oldBook,
+					entries: Array.isArray(oldBook.entries) || !oldBook.entries ? rows.map(([, value]) => value) : Object.fromEntries(rows) };
+				const secondaryText = Buffer.from(JSON.stringify(secondary), "utf8").toString("base64");
+				out.push(buildPngChunk("tEXt", Buffer.concat([Buffer.from(kw, "latin1"), Buffer.from([0]), Buffer.from(secondaryText, "latin1")])));
 			} else {
 				out.push(whole);
 			}
@@ -255,13 +296,41 @@ function cardDataTarget(raw: Record<string, unknown>): Record<string, unknown> {
 	return (raw.data && typeof raw.data === "object" ? raw.data : raw) as Record<string, unknown>;
 }
 
-function writeCardRaw(path: string, isPng: boolean, raw: Record<string, unknown>): void {
-	if (isPng) {
-		const buf = readFileSync(path);
-		writeFileSync(path, writeCardJsonToPng(buf, raw));
-	} else {
-		writeFileSync(path, `${JSON.stringify(raw, null, "\t")}\n`, "utf8");
+/** 原始卡字节的同目录原子替换；保权限、保软链接，不截断原文件。 */
+export function writeCardBytesAtomic(path: string, bytes: Buffer): void {
+	const target = realpathSync(path);
+	const temp = join(dirname(target), `.liyuan-card-${randomUUID()}.tmp`);
+	let fd: number | undefined;
+	try {
+		const mode = statSync(target).mode & 0o777;
+		fd = openSync(temp, "wx", mode); fchmodSync(fd, mode);
+		let offset = 0;
+		while (offset < bytes.length) offset += writeSync(fd, bytes, offset, bytes.length - offset);
+		fsyncSync(fd); closeSync(fd); fd = undefined;
+		renameSync(temp, target);
+	} finally {
+		if (fd !== undefined) closeSync(fd);
+		if (existsSync(temp)) unlinkSync(temp);
 	}
+}
+
+function writeCardRaw(path: string, isPng: boolean, raw: Record<string, unknown>, atomicLore = false): void {
+	const bytes = isPng ? writeCardJsonToPng(readFileSync(path), raw, { syncCharacterBook: atomicLore }) : Buffer.from(`${JSON.stringify(raw, null, "\t")}\n`, "utf8");
+	if (atomicLore) writeCardBytesAtomic(path, bytes);
+	else writeFileSync(path, bytes);
+}
+
+/** 修改当前卡的内嵌书；复用卡原文写回，PNG像素/卡字段/未知扩展保持原样。 */
+export function editCardLorebook<T>(path: string, mutate: (book: Record<string, unknown>) => T): T {
+	const { isPng, raw } = readCardRawJson(path);
+	const data = cardDataTarget(raw);
+	// normalizeCard 兼容 data 缺字段时回落顶层；写操作必须与读取命中同一位置。
+	const target = "character_book" in data ? data : raw;
+	const book = target.character_book;
+	if (!book || typeof book !== "object" || Array.isArray(book)) throw new Error("当前角色卡没有内嵌世界书");
+	const result = mutate(book as Record<string, unknown>);
+	writeCardRaw(path, isPng, raw, true);
+	return result;
 }
 
 /**

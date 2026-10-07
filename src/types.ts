@@ -25,6 +25,8 @@ export interface CharacterCard {
 /** 归一化后的世界书条目（兼容 ST world info 格式与卡内嵌 character_book 格式） */
 export interface LorebookEntry {
 	uid: number;
+	/** 管理来源中的原始数组索引/对象键；不作为剧情检索权威。 */
+	entryKey?: string;
 	keys: string[];
 	secondaryKeys: string[];
 	comment: string;
@@ -107,14 +109,14 @@ export interface RpConfig {
 	greetingIndex?: number;
 	/** 被用户停用的世界书条目（内容指纹列表，见 lorebook.ts loreFingerprint；跨 uid 冲突稳定） */
 	disabledLore?: string[];
+	/** 明确来源的旧全局停用豁免；键由 loreSourceKey 构造，仅原生 enabled 条目可豁免。 */
+	loreEntryOverrides?: Record<string, boolean>;
 	/** /import 清洗时额外剥离的标签（叠加在默认思维链/状态栏列表之上，按预设约定配置） */
 	importStripTags?: string[];
 	/** 转换后的预设文件路径（liyuan-preset.json，可选；由 scripts/convert-preset.mjs 生成） */
 	preset?: string;
 	/** 本机工具总开关：开则 bash/读写等回到工具底座；本机开发默认开，分发默认关 */
 	backendControl?: boolean;
-	/** 决策门禁档位（PLAN-PHASE4 柱 1）：ask=关键剧情决策点停笔询问用户；silent=不问，等同旧行为。默认 silent */
-	creationMode?: "ask" | "silent";
 	/**
 	 * 固定楼层压缩：每 N 个叙事轮主动压缩一次早期正文（被裁正文先完整归档进剧情库供召回）。
 	 * 0 = 关闭自动压缩（仍可手动触发）。缺省 30。
@@ -127,6 +129,16 @@ export interface RpConfig {
 	assistantModel?: { provider: string; id: string };
 	/** 一档卡皮肤:显示向美化正则被用户关闭的卡路径列表(默认开;spec 2026-07-22 §7 P1) */
 	cardSkinOff?: string[];
+	/** 本拍正文工作流；缺省在 Web 宿主中采用 director。 */
+	generationMode?: "direct" | "director";
+	/** Main Agent execution budget; absent means director 60 / direct 30 minutes. */
+	generationTimeoutMinutes?: number;
+	/** Each analysis/settlement attempt; relay upstream limits are separate. */
+	analysisTimeoutMinutes?: number;
+	/** Explicitly selected, confirmed-working recovery route. No warehouse fallback. */
+	analysisRecoveryModel?: { provider: string; id: string };
+	/** False by default: failed fixed expert stages must be repaired or stop. */
+	allowDegradedGeneration?: boolean;
 	/** 文学工作流：profile=周期画像；guided=画像+条件连续性+每拍导演；均不修改状态 */
 	literaryQuality?: "off" | "profile" | "guided";
 	/** 文学画像刷新周期（完成的叙事拍数）；首次启用会在第一拍后生成 */
@@ -174,7 +186,6 @@ export const DEFAULT_CONFIG: RpConfig = {
 	literaryProfileEveryNTurns: 8,
 	literaryWorldEnabled: false,
 	literaryEcologyEnabled: false,
-	creationMode: "silent",
 	webResearchMode: "off",
 	researchSearchSchedule: { enabled: false, hour: 6, minute: 0, maxPerRun: 3, topics: ["校园恋爱中的慢热互信", "日常剧情中的关系推进", "悬疑故事的信息分配"] },
 	novelDigest: {

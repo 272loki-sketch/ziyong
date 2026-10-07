@@ -29,5 +29,6 @@ test("角色排演结果宽容解析并格式化为正文参考", () => {
 	const formatted = formatCharacterRehearsals([rehearsal!]);
 	assert.match(formatted, /林霜/);
 	assert.match(formatted, /可能动作：先反问/);
-	assert.match(formatted, /不要替用户决定行动/);
+	assert.doesNotMatch(formatted, /人物代写边界|冻结主角/);
+	assert.doesNotMatch(formatted, /不要替用户决定行动/);
 });

@@ -77,3 +77,13 @@ export async function runUnifiedStageTool(
 	if (!spec) return null;
 	return spec.run(args, deps, ctxFor(language));
 }
+
+
+/** 按工具注册表权限分类，不用名称后缀猜测读写。 */
+export function unifiedStageReadToolNames(deps: UnifiedStageDeps): string[] {
+	return availableSpecs(deps).filter(spec => spec.mode === "read").map(spec => spec.name);
+}
+
+export function unifiedStageWriteToolNames(deps: UnifiedStageDeps): string[] {
+	return availableSpecs(deps).filter(spec => spec.mode === "write").map(spec => spec.name);
+}

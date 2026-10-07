@@ -20,6 +20,7 @@ import {
 	type ModelInfo,
 	type ModelsResponse,
 } from "../api.ts";
+import { modelSupportsTools, withConfigModelToolsSupport, withModelToolsSupport } from "../model-tool-support.ts";
 import { bumpModelCatalog, ConfirmButton, Field, PanelStatus, useAction, usePanelData } from "./kit.tsx";
 
 const API_TYPES = [
@@ -60,9 +61,17 @@ export interface ProfileListItem {
 	hasKey: boolean;
 }
 
+interface ProfileListResponse {
+	profiles: ProfileListItem[];
+}
+
 interface Draft {
 	/** 仓库 id / 配置名 */
 	name: string;
+	/** 仓库显示名独立于 provider key，单改模型能力时不重命名档案。 */
+	profileDisplayName?: string;
+	/** 编辑态所投影的原 provider key；生成态按 name 创建单 provider。 */
+	providerName: string | null;
 	baseUrl: string;
 	api: string;
 	apiKey: string;
@@ -73,11 +82,16 @@ interface Draft {
 	streaming: boolean;
 	/** 原 compat 里流式开关以外的字段（面板不管，保存时原样带回） */
 	compatRest: Record<string, unknown>;
+	/** 编辑态保留完整顶层配置，生成态没有。 */
+	baseConfig?: LiyuanAgentConfig;
+	/** 编辑态当前 provider 的面板未编辑字段。 */
+	providerRest: Record<string, unknown>;
 }
 
 function emptyDraft(): Draft {
 	return {
 		name: "",
+		providerName: null,
 		baseUrl: "",
 		api: API_TYPES[0].value,
 		apiKey: "",
@@ -85,6 +99,7 @@ function emptyDraft(): Draft {
 		editId: null,
 		streaming: true,
 		compatRest: {},
+		providerRest: {},
 	};
 }
 
@@ -116,27 +131,45 @@ function normalizeModelNumericFields(m: ModelEntry): ModelEntry {
 	return out;
 }
 
-/** 生成器输出：一份完整 Agent 配置（通常单渠道） */
+/** 生成器输出为单渠道；编辑态则在原配置上只替换当前 provider。 */
 function draftToConfig(d: Draft): LiyuanAgentConfig {
 	const name = d.name.trim();
-	const providers: LiyuanAgentConfig["providers"] = {};
-	const models = d.models.map((m) => normalizeModelNumericFields(m));
-	if (name) {
-		const compat: Record<string, unknown> = { ...d.compatRest };
-		delete compat.safetyThreshold; // 已废弃：第三方反代传不到官方 safetySettings，一律不再下发
+	const providerName = d.editId && d.providerName ? d.providerName : name;
+	const providers: LiyuanAgentConfig["providers"] = d.editId && d.baseConfig ? { ...d.baseConfig.providers } : {};
+	const models = d.models.map((m) =>
+		d.editId ? { ...m, id: String(m.id) } : normalizeModelNumericFields(m),
+	);
+	if (providerName) {
+		const originalProvider = d.editId && d.baseConfig
+			? d.baseConfig.providers[providerName]
+			: undefined;
+		const originalCompat = originalProvider?.compat as Record<string, unknown> | undefined;
+		const compat: Record<string, unknown> = { ...(d.editId ? originalCompat : {}), ...d.compatRest };
+		if (!d.editId) delete compat.safetyThreshold; // 生成新配置不再下发已废弃 safetyThreshold
 		if (d.streaming) {
-			delete compat.streaming;
+			if (d.editId && originalCompat?.streaming === true) compat.streaming = true;
+			else delete compat.streaming;
 		} else {
 			compat.streaming = false;
 		}
 
-		providers[name] = {
-			baseUrl: d.baseUrl.trim(),
-			api: d.api.trim() || "openai-completions",
-			apiKey: d.apiKey.trim() || "placeholder",
+		providers[providerName] = {
+			...(d.editId ? d.providerRest : {}),
+			baseUrl:
+				d.editId && originalProvider && d.baseUrl === String(originalProvider.baseUrl ?? "")
+					? originalProvider.baseUrl
+					: d.baseUrl.trim(),
+			api:
+				d.editId && originalProvider && d.api === String(originalProvider.api ?? "openai-completions")
+					? originalProvider.api
+					: d.api.trim() || "openai-completions",
+			apiKey: d.apiKey.trim() || (d.editId ? originalProvider?.apiKey : "placeholder"),
 			models,
 			...(Object.keys(compat).length > 0 && { compat }),
 		};
+	}
+	if (d.editId && d.baseConfig) {
+		return { ...d.baseConfig, providers };
 	}
 	const firstThink = models.find((m) => typeof m.thinkingLevel === "string" && m.thinkingLevel.trim());
 	return {
@@ -154,25 +187,31 @@ function draftFromConfig(id: string, name: string, config: LiyuanAgentConfig): D
 	const pname = config.defaultProvider && config.providers[config.defaultProvider] ? config.defaultProvider : keys[0] ?? id;
 	const p = config.providers[pname] ?? {};
 	const models = Array.isArray(p.models)
-		? p.models.map((m) => ({
-				...m,
-				id: String(m.id),
-				thinkingLevel: typeof m.thinkingLevel === "string" ? m.thinkingLevel : "",
-			}))
+		? p.models.map((m) => ({ ...m, id: String(m.id) }))
 		: [];
 	const compat = (p as Record<string, unknown>).compat as Record<string, unknown> | undefined;
 	const compatRest = { ...compat };
 	delete compatRest.streaming;
 	delete compatRest.safetyThreshold;
+	const providerRest = { ...(p as Record<string, unknown>) };
+	delete providerRest.baseUrl;
+	delete providerRest.api;
+	delete providerRest.apiKey;
+	delete providerRest.models;
+	delete providerRest.compat;
 	return {
 		editId: id,
 		name: pname || name,
+		profileDisplayName: name,
+		providerName: pname,
 		baseUrl: String(p.baseUrl ?? ""),
 		api: String(p.api ?? "openai-completions"),
 		apiKey: "", // 不回显；留空=保留
 		models,
 		streaming: compat?.streaming !== false,
 		compatRest,
+		baseConfig: config,
+		providerRest,
 	};
 }
 
@@ -197,6 +236,11 @@ function modelMaxTokensOf(cfg: LiyuanAgentConfig, provider: string, modelId: str
 	const m = list.find((x) => String(x.id) === modelId);
 	const n = m?.maxTokens;
 	return typeof n === "number" && Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+function configModelOf(cfg: LiyuanAgentConfig, provider: string, modelId: string): ModelEntry | undefined {
+	const list = cfg.providers?.[provider]?.models;
+	return Array.isArray(list) ? list.find((entry) => String(entry.id) === modelId) : undefined;
 }
 
 /** 解析 token 数字：128000 / 500k / 1.5m / 16k */
@@ -444,13 +488,54 @@ function StreamingInput({
 	);
 }
 
+/** 单个模型的原生工具调用能力；默认支持，model.compat 覆盖 provider.compat。 */
+function ToolsSupportInput({
+	value,
+	busy,
+	onCommit,
+}: {
+	value: boolean;
+	busy: boolean;
+	onCommit: (on: boolean) => void;
+}) {
+	return (
+		<label
+			className="conn-thinking"
+			style={{
+				marginTop: 8,
+				display: "flex",
+				flexDirection: "row",
+				alignItems: "center",
+				justifyContent: "space-between",
+				gap: 8,
+				cursor: "pointer",
+			}}
+		>
+			<span className="field-label">支持工具调用</span>
+			<input
+				type="checkbox"
+				aria-label="支持工具调用"
+				checked={value}
+				disabled={busy}
+				onChange={(e) => onCommit(e.target.checked)}
+			/>
+		</label>
+	);
+}
+
 type Mode = null | { kind: "gen" } | { kind: "edit"; id: string };
 
 export function ConnectPanel({ toast }: { toast: (level: "info" | "warning" | "error", text: string) => void }) {
 	const modelsData = usePanelData(() => apiGet<ModelsResponse>("/api/models"), { cacheKey: "/api/models" });
 	const agentCfg = usePanelData(() => apiGet<AgentConfigResponse>("/api/agent-config"), { cacheKey: "/api/agent-config" });
-	const profilesData = usePanelData(() => apiGet<{ profiles: ProfileListItem[] }>("/api/agent-profiles"), { cacheKey: "/api/agent-profiles" });
+	const profilesData = usePanelData(() => apiGet<ProfileListResponse>("/api/agent-profiles"), { cacheKey: "/api/agent-profiles" });
 	const { busy, run } = useAction(toast);
+	const [modelsOverride, setModelsOverride] = useState<ModelsResponse | null>(null);
+	const [agentConfigOverride, setAgentConfigOverride] = useState<AgentConfigResponse | null>(null);
+	const [profilesOverride, setProfilesOverride] = useState<ProfileListResponse | null>(null);
+	useEffect(() => setModelsOverride(null), [modelsData.data]);
+	useEffect(() => setAgentConfigOverride(null), [agentCfg.data]);
+	useEffect(() => setProfilesOverride(null), [profilesData.data]);
 
 	const [mode, setMode] = useState<Mode>(null);
 	const [draft, setDraft] = useState<Draft>(emptyDraft());
@@ -461,10 +546,10 @@ export function ConnectPanel({ toast }: { toast: (level: "info" | "warning" | "e
 	/** 配置 JSON 预览：非 null 时表示用户在改 textarea，保存前需先应用或与 draft 合并 */
 	const [jsonOverride, setJsonOverride] = useState<string | null>(null);
 
-	const current = modelsData.data?.current ?? null;
-	const allModels = modelsData.data?.models ?? [];
-	const activeConfig: LiyuanAgentConfig = agentCfg.data?.config ?? { version: 1, providers: {} };
-	const profiles = profilesData.data?.profiles ?? [];
+	const current = (modelsOverride ?? modelsData.data)?.current ?? null;
+	const allModels = (modelsOverride ?? modelsData.data)?.models ?? [];
+	const activeConfig: LiyuanAgentConfig = (agentConfigOverride ?? agentCfg.data)?.config ?? { version: 1, providers: {} };
+	const profiles = (profilesOverride ?? profilesData.data)?.profiles ?? [];
 
 	/** 当前生效展示：优先配置文件（模型条目 > default），再回退会话，避免「配置 high、顶栏仍 off」 */
 	const liveThinking = (() => {
@@ -494,11 +579,33 @@ export function ConnectPanel({ toast }: { toast: (level: "info" | "warning" | "e
 					return compat?.streaming !== false;
 				})()
 			: true;
+	const liveSupportsTools = current
+		? modelSupportsTools(
+				configModelOf(activeConfig, current.provider, current.id),
+				(activeConfig.providers?.[current.provider] as Record<string, unknown> | undefined)?.compat,
+			)
+		: true;
 
 	const reloadAll = () => {
+		setModelsOverride(null);
+		setAgentConfigOverride(null);
+		setProfilesOverride(null);
 		modelsData.reload();
 		agentCfg.reload();
 		profilesData.reload();
+		bumpModelCatalog();
+	};
+
+	const refreshAfterToolsSave = async () => {
+		const [config, models, _catalog, refreshedProfiles] = await Promise.all([
+			apiGet<AgentConfigResponse>("/api/agent-config", { bypassCache: true }),
+			apiGet<ModelsResponse>("/api/models", { bypassCache: true }),
+			apiGet<unknown>("/api/models/catalog", { bypassCache: true }),
+			apiGet<ProfileListResponse>("/api/agent-profiles", { bypassCache: true }),
+		]);
+		setAgentConfigOverride(config);
+		setModelsOverride(models);
+		setProfilesOverride(refreshedProfiles);
 		bumpModelCatalog();
 	};
 
@@ -527,11 +634,19 @@ export function ConnectPanel({ toast }: { toast: (level: "info" | "warning" | "e
 
 	const openEdit = (id: string) =>
 		run(async () => {
-			const r = await apiGet<{ id: string; name: string; config: LiyuanAgentConfig }>(
-				`/api/agent-profiles/one?id=${encodeURIComponent(id)}`,
-			);
+			const [profile, latestProfiles] = await Promise.all([
+				apiGet<{ id: string; name: string; config: LiyuanAgentConfig }>(
+					`/api/agent-profiles/one?id=${encodeURIComponent(id)}`, { bypassCache: true },
+				),
+				apiGet<ProfileListResponse>("/api/agent-profiles", { bypassCache: true }),
+			]);
+			// An older active warehouse copy can lack independently enabled channels.
+			// Editing that active configuration must retain its real enabled scope.
+			const config = latestProfiles.profiles.some((p) => p.id === id && p.active)
+				? (await apiGet<AgentConfigResponse>("/api/agent-config", { bypassCache: true })).config
+				: profile.config;
 			setMode({ kind: "edit", id });
-			setDraft(draftFromConfig(r.id, r.name, r.config));
+			setDraft(draftFromConfig(profile.id, profile.name, config));
 			setProbe(null);
 			setDiscovered([]);
 			setJsonOverride(null);
@@ -655,6 +770,39 @@ export function ConnectPanel({ toast }: { toast: (level: "info" | "warning" | "e
 			reloadAll();
 		}, on ? "已开启流式传输" : "已关闭流式传输（该中转将改用非流式接口）");
 
+	/** 只写当前模型 compat.supportsTools；不改选择模型、思考档或 stepModels。 */
+	const setCurrentModelTools = (on: boolean) =>
+		run(async () => {
+			if (!current) throw new Error("尚未启用模型");
+			const [latestConfig, latestProfiles] = await Promise.all([
+				apiGet<AgentConfigResponse>("/api/agent-config", { bypassCache: true }),
+				apiGet<ProfileListResponse>("/api/agent-profiles", { bypassCache: true }),
+			]);
+			// The enabled runtime may contain more channels than its older warehouse
+			// profile. Never base this one-model edit on a stale/subset profile: doing
+			// so would silently disable the other enabled APIs.
+			const cfg = withConfigModelToolsSupport(latestConfig.config, current.provider, current.id, on);
+			const active = latestProfiles.profiles.find((p) => p.active);
+			try {
+				if (active) {
+					// Updating the active profile also persists it to the runtime config.
+					await apiPut("/api/agent-profiles", { id: active.id, name: active.name, config: cfg });
+				} else {
+					await apiPut("/api/agent-config", { config: cfg });
+				}
+			} catch (error) {
+				// A lost response may follow a successful server write; refresh what is actually saved,
+				// but preserve the write error and never show the success toast.
+				try {
+					await refreshAfterToolsSave();
+				} catch {
+					// Preserve the original write failure.
+				}
+				throw error;
+			}
+			await refreshAfterToolsSave();
+		}, on ? "已为当前模型开启工具调用" : "已为当前模型关闭工具调用");
+
 	const enableProfile = (id: string) =>
 		run(async () => {
 			await apiPost("/api/agent-profiles/enable", { id });
@@ -693,8 +841,13 @@ export function ConnectPanel({ toast }: { toast: (level: "info" | "warning" | "e
 			providers: raw.providers && typeof raw.providers === "object" && !Array.isArray(raw.providers) ? raw.providers : {},
 		};
 		const id = mode?.kind === "edit" ? mode.id : draft.name.trim() || "profile";
-		const next = draftFromConfig(id, draft.name.trim() || id, config);
+		const next = draftFromConfig(id, draft.profileDisplayName || draft.name.trim() || id, config);
 		if (mode?.kind === "gen") {
+			// JSON 导入仍走单 provider 生成器；仅编辑仓库时才保留 baseConfig 全量投影。
+			next.editId = null;
+			next.providerName = null;
+			next.baseConfig = undefined;
+			next.providerRest = {};
 			const pk = config.providers[next.name] ?? Object.values(config.providers)[0];
 			if (pk && typeof pk.apiKey === "string" && pk.apiKey && pk.apiKey !== "placeholder") {
 				next.apiKey = pk.apiKey;
@@ -737,17 +890,10 @@ export function ConnectPanel({ toast }: { toast: (level: "info" | "warning" | "e
 			if (working.models.length === 0) throw new Error("请至少添加一个模型");
 
 			const config = draftToConfig(working);
-			// 编辑时：key 留空则从原配置保留
-			if (mode?.kind === "edit" && !working.apiKey.trim()) {
-				const prev = await apiGet<{ config: LiyuanAgentConfig }>(`/api/agent-profiles/one?id=${encodeURIComponent(mode.id)}`);
-				const pk = prev.config.providers[name] ?? Object.values(prev.config.providers)[0];
-				if (pk && typeof pk.apiKey === "string") {
-					config.providers[name] = { ...config.providers[name], apiKey: pk.apiKey };
-				}
-			}
+			// draftToConfig retains the exact base provider key when the replacement is blank.
 
 			if (mode?.kind === "edit") {
-				await apiPut("/api/agent-profiles", { id: mode.id, name: working.name.trim(), config });
+				await apiPut("/api/agent-profiles", { id: mode.id, name: working.profileDisplayName || working.name.trim(), config });
 			} else {
 				await apiPost("/api/agent-profiles", { id: name, name, config });
 			}
@@ -788,7 +934,7 @@ export function ConnectPanel({ toast }: { toast: (level: "info" | "warning" | "e
 			toast("warning", `「${mid}」已在清单中`);
 			return;
 		}
-		patchDraft({ models: [...draft.models, { id: mid, thinkingLevel: "" }] });
+		patchDraft({ models: [...draft.models, withModelToolsSupport({ id: mid, thinkingLevel: "" }, true)] });
 	};
 
 	const genPreview = useMemo(() => draftToConfig(draft), [draft]);
@@ -903,6 +1049,22 @@ export function ConnectPanel({ toast }: { toast: (level: "info" | "warning" | "e
 										</button>
 									</div>
 									<div className="conn-model-fields">
+										<label className="conn-model-field" title="模型设置优先于渠道设置；未配置时默认支持">
+											<span className="conn-model-field-label">支持工具调用</span>
+											<input
+												type="checkbox"
+												aria-label={`${m.id} 支持工具调用`}
+												disabled={busy}
+												checked={modelSupportsTools(m, draft.compatRest)}
+												onChange={(e) =>
+													patchDraft({
+														models: draft.models.map((x) =>
+															x.id === m.id ? withModelToolsSupport(x, e.target.checked) : x,
+														),
+													})
+												}
+											/>
+										</label>
 										<label className="conn-model-field">
 											<span className="conn-model-field-label">思考档</span>
 											<input
@@ -1148,8 +1310,9 @@ export function ConnectPanel({ toast }: { toast: (level: "info" | "warning" | "e
 							onCommit={(lv) => void setThinking(lv)}
 						/>
 						<ContextWindowInput value={liveContext} busy={busy} onCommit={(n) => void setContextWindow(n)} />
-						<MaxTokensInput value={liveMaxTokens} busy={busy} onCommit={(n) => void setMaxTokens(n)} />
-						<StreamingInput value={liveStreaming} busy={busy} onCommit={(on) => void setStreaming(on)} />
+							<MaxTokensInput value={liveMaxTokens} busy={busy} onCommit={(n) => void setMaxTokens(n)} />
+							<StreamingInput value={liveStreaming} busy={busy} onCommit={(on) => void setStreaming(on)} />
+							<ToolsSupportInput value={liveSupportsTools} busy={busy || !allModels.some((m) => m.provider === current.provider && m.id === current.id)} onCommit={(on) => void setCurrentModelTools(on)} />
 						{activeProviders.length > 0 && (
 							<ul className="conn-pick-list" style={{ marginTop: 10 }}>
 								{activeProviders.flatMap((pk) =>

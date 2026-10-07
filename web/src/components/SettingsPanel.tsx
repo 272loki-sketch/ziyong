@@ -6,8 +6,10 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, apiGet, apiPut, type ModelRef, type ModelsResponse, type RpConfigView, type SideModelStep, type StepModelOverrides } from "../api.ts";
+import type { GenerationMode } from "../generation-mode.ts";
 import { getTheme, setTheme, type ThemeMode } from "../theme.ts";
 import { PanelStatus, SliderField, Toggle, useAction, usePanelData } from "./kit.tsx";
+import { GenerationModeControl } from "./GenerationModeControl.tsx";
 import { ModelPlugSelector } from "./ModelPlugSelector.tsx";
 import { WorldProfileSection } from "./WorldProfileSection.tsx";
 
@@ -695,7 +697,17 @@ function AccessSection({ toast }: { toast: (level: "info" | "warning" | "error",
 	);
 }
 
-export function SettingsPanel({ toast }: { toast: (level: "info" | "warning" | "error", text: string) => void }) {
+export function SettingsPanel({
+	toast,
+	generationMode,
+	onGenerationModeChange,
+	onConfigGenerationMode,
+}: {
+	toast: (level: "info" | "warning" | "error", text: string) => void;
+	generationMode: GenerationMode;
+	onGenerationModeChange: (mode: GenerationMode) => void;
+	onConfigGenerationMode: (mode: unknown) => void;
+}) {
 	const { data, error, loading, reload } = usePanelData(() => apiGet<{ config: RpConfigView }>("/api/config"), { cacheKey: "/api/config" });
 	const modelData = usePanelData(() => apiGet<ModelsResponse>("/api/models/catalog"), { cacheKey: "/api/models/catalog", watchModels: true });
 
@@ -703,10 +715,9 @@ export function SettingsPanel({ toast }: { toast: (level: "info" | "warning" | "
 	const [maxLore, setMaxLore] = useState(3);
 	const [compactEvery, setCompactEvery] = useState(30);
 	const [backendControl, setBackendControl] = useState(true);
-	const [askMode, setAskMode] = useState(false);
-	const [literaryProfile, setLiteraryProfile] = useState(false);
-	const [literaryGuided, setLiteraryGuided] = useState(false);
-	const [literaryEvery, setLiteraryEvery] = useState(8);
+	const [generationTimeoutMinutes, setGenerationTimeoutMinutes] = useState(60);
+	const [analysisTimeoutMinutes, setAnalysisTimeoutMinutes] = useState(10);
+	const [analysisRecoveryModel,setAnalysisRecoveryModel] = useState<ModelRef|null>(null);
 	const [literaryWorldEnabled, setLiteraryWorldEnabled] = useState(true);
 	const [literaryEcologyEnabled, setLiteraryEcologyEnabled] = useState(false);
 	const [webResearchMode, setWebResearchMode] = useState<"off" | "auto" | "manual">("off");
@@ -725,11 +736,11 @@ export function SettingsPanel({ toast }: { toast: (level: "info" | "warning" | "
 			setScanDepth(data.config.scanDepth);
 			setMaxLore(data.config.maxLoreInjections);
 			setCompactEvery(data.config.compactEveryNTurns ?? 30);
+			setGenerationTimeoutMinutes(data.config.generationTimeoutMinutes ?? 60);
+			setAnalysisTimeoutMinutes(data.config.analysisTimeoutMinutes ?? 10);
+			setAnalysisRecoveryModel(data.config.analysisRecoveryModel??null);
 			setBackendControl(data.config.backendControl !== false);
-			setAskMode(data.config.creationMode === "ask");
-			setLiteraryProfile(data.config.literaryQuality === "profile" || data.config.literaryQuality === "guided");
-			setLiteraryGuided(data.config.literaryQuality === "guided");
-			setLiteraryEvery(data.config.literaryProfileEveryNTurns ?? 8);
+			onConfigGenerationMode(data.config.generationMode);
 			setLiteraryWorldEnabled(data.config.literaryWorldEnabled === true);
 			setLiteraryEcologyEnabled(data.config.literaryEcologyEnabled === true);
 			setWebResearchMode(data.config.webResearchMode ?? "off");
@@ -737,7 +748,7 @@ export function SettingsPanel({ toast }: { toast: (level: "info" | "warning" | "
 			stepModelsDirtyRef.current = false;
 			setDirty(false);
 		}
-	}, [data]);
+	}, [data, onConfigGenerationMode]);
 
 	const touch = () => {
 		revisionRef.current += 1;
@@ -765,10 +776,8 @@ export function SettingsPanel({ toast }: { toast: (level: "info" | "warning" | "
 				scanDepth,
 				maxLoreInjections: maxLore,
 				compactEveryNTurns: compactEvery,
+				generationTimeoutMinutes, analysisTimeoutMinutes, analysisRecoveryModel,
 				backendControl,
-				creationMode: askMode ? "ask" : "silent",
-				literaryQuality: literaryGuided ? "guided" : literaryProfile ? "profile" : "off",
-				literaryProfileEveryNTurns: literaryEvery,
 				literaryWorldEnabled,
 				literaryEcologyEnabled,
 				webResearchMode,
@@ -787,13 +796,13 @@ export function SettingsPanel({ toast }: { toast: (level: "info" | "warning" | "
 			savingRef.current = false;
 			setSaving(false);
 		}
-	}, [backendControl, compactEvery, data, dirty, askMode, literaryEcologyEnabled, literaryEvery, literaryGuided, literaryProfile, literaryWorldEnabled, maxLore, reload, scanDepth, stepModels, toast, webResearchMode]);
+	}, [analysisRecoveryModel, analysisTimeoutMinutes, generationTimeoutMinutes, backendControl, compactEvery, data, dirty, literaryEcologyEnabled, literaryWorldEnabled, maxLore, reload, scanDepth, stepModels, toast, webResearchMode]);
 
 	useEffect(() => {
 		if (!data || !dirty || saving || failedRevisionRef.current === revisionRef.current) return;
 		const timer = window.setTimeout(() => void save(), 450);
 		return () => window.clearTimeout(timer);
-	}, [data, dirty, saving, save, scanDepth, maxLore, compactEvery, backendControl, askMode, literaryProfile, literaryGuided, literaryEvery, literaryWorldEnabled, literaryEcologyEnabled, webResearchMode, stepModels]);
+	}, [data, dirty, saving, save, generationTimeoutMinutes, analysisTimeoutMinutes, scanDepth, maxLore, compactEvery, backendControl, literaryWorldEnabled, literaryEcologyEnabled, webResearchMode, stepModels]);
 
 	return (
 		<div className="panel-body panel-body-sticky" aria-busy={saving} style={saving ? { pointerEvents: "none", opacity: 0.72 } : undefined}>
@@ -813,6 +822,20 @@ export function SettingsPanel({ toast }: { toast: (level: "info" | "warning" | "
 			<NovelAiSection toast={toast} />
 			{data && (
 				<>
+					<section className="sp-section">
+						<h4>剧情生成模式</h4>
+						<GenerationModeControl value={generationMode} onChange={onGenerationModeChange} />
+						<div className="field-hint">固定专家失败会先诊断并通过已配置恢复模型重做；仍失败则停止该阶段，不跳过审阅。</div>
+						<label className="field-label">整拍总时间预算（分钟，含结算）</label><input className="field-input" type="number" min={1} max={120} value={generationTimeoutMinutes} disabled={formDisabled} onChange={e=>{setGenerationTimeoutMinutes(Math.max(1,Math.min(120,Number(e.target.value)||60)));touch()}} />
+						<label className="field-label">单次分析/结算预算（分钟）</label><input className="field-input" type="number" min={1} max={30} value={analysisTimeoutMinutes} disabled={formDisabled} onChange={e=>{setAnalysisTimeoutMinutes(Math.max(1,Math.min(30,Number(e.target.value)||10)));touch()}} />
+						<div className="field-hint">预算延长不改变网关自身的超时限制。失败模型、原因及恢复结果会记录在每拍诊断中。</div>
+						<ModelPlugSelector label="分析失败恢复模型（重做原岗位，不跳阶段）" value={analysisRecoveryModel} models={modelData.data} disabled={formDisabled||modelData.loading||!!modelData.error} onChange={value=>{setAnalysisRecoveryModel(value);touch()}} />
+						<div className="field-hint">
+							直出使用已有记忆与世界生态材料，由正常文学导演统筹、单主演直接输出，不新增生态备料、心理画像、脑暴或审稿；导演流程由固定专家团队每拍进行三写前分析、两路构思候选和二审阅，专家不写正文，唯一主 writer 单独写作。
+							当前选择只作用于之后提交的剧情输入。
+						</div>
+					</section>
+
 					<section className="sp-section">
 						<h4>世界书</h4>
 						<SliderField
@@ -865,11 +888,9 @@ export function SettingsPanel({ toast }: { toast: (level: "info" | "warning" | "
 							总插头是连接面板当前选择的剧情模型。保存“主演正文 / 小说开演”也会立即切换当前会话模型；Novel Play 内部卡始终跟随这个当前模型，不冻结创建角色卡时的旧路由。下列其他步骤可分别选择模型。
 						</div>
 						{([
-							["writer", "主演正文 / 小说开演"],
-							["literaryContinuity", "连续性补充"],
-							["literaryDirector", "文学导演"],
-							["literaryCharacter", "角色画像 Sogon"],
-							["literaryPersona", "用户画像 Sigon"],
+							["writer", "共用主演正文 / 小说开演"],
+							["literaryContinuity", "导演连续性证据"],
+							["literaryDirector", "正常文学导演（直出模式）"],
 							["literaryWorld", "后台世界推演"],
 							["worldProfile", "角色卡世界画像"],
 							["literaryWorldFacts", "拍后事实信封"],
@@ -878,6 +899,10 @@ export function SettingsPanel({ toast }: { toast: (level: "info" | "warning" | "
 							["ecologyGlobal", "全局叙事原型池"],
 							["ecologyCard", "角色卡生态池"],
 							["ecologyRuntime", "人物与场所生态"],
+							["directorSetting", "导演设定核对"],
+							["directorIdeas", "导演角度构思"],
+							["directorReviewFacts", "导演事实审阅"],
+							["directorReviewStyle", "导演预设审阅"],
 							["outlineBootstrap", "大纲首次规划"],
 							["outlineChat", "大纲编剧讨论"],
 							["outlineReconcile", "大纲剧情校准"],
@@ -925,49 +950,6 @@ export function SettingsPanel({ toast }: { toast: (level: "info" | "warning" | "
 					</section>
 
 					<section className="sp-section">
-						<h4>文学画像</h4>
-						<div className="toggle-row">
-							<span>周期角色与用户画像（Sogon / Sigon）</span>
-							<Toggle
-								checked={literaryProfile}
-								onChange={(v) => {
-									setLiteraryProfile(v);
-									if (!v) setLiteraryGuided(false);
-									touch();
-								}}
-							/>
-						</div>
-						<div className="field-hint">
-							默认关闭。开启后按周期增加两次旁路模型调用，结果从下一拍起作为可修订写作参考，不修改角色卡、剧情事实或世界状态。
-						</div>
-						<div className="toggle-row">
-							<span>每拍文学导演候选</span>
-							<Toggle
-								checked={literaryGuided}
-								onChange={(v) => {
-									setLiteraryGuided(v);
-									if (v) setLiteraryProfile(true);
-									touch();
-								}}
-							/>
-						</div>
-						<div className="field-hint">
-							开启后每拍增加一次短旁路调用，只给角色主动性、个人线、幕后线和玩家停点；具体步骤仍由 beat_plan 决定。
-						</div>
-						<SliderField
-							label="画像刷新周期"
-							hint="每 N 个完成的剧情轮更新一次；首次开启会在下一拍完成后建立画像"
-							value={literaryEvery}
-							min={1}
-							max={30}
-							onChange={(v) => {
-								setLiteraryEvery(v);
-								touch();
-							}}
-						/>
-					</section>
-
-					<section className="sp-section">
 						<h4>上下文压缩</h4>
 						<SliderField
 							label="固定楼层压缩周期"
@@ -996,19 +978,6 @@ export function SettingsPanel({ toast }: { toast: (level: "info" | "warning" | "
 						</div>
 						<div className="field-hint">
 							开启后 agent 能操作本机（调用你的其他项目、查资料）；全部调用都会显示在过程条。仅在自己的设备上开启。
-						</div>
-						<div className="toggle-row">
-							<span>决策门禁（戏内选择卡）</span>
-							<Toggle
-								checked={askMode}
-								onChange={(v) => {
-									setAskMode(v);
-									touch();
-								}}
-							/>
-						</div>
-						<div className="field-hint">
-							开=询问档：剧情相关（含「我该怎么办」）一律戏内，用选择卡共创；关=静默档自行推进。戏外只办系统事，不处理剧情。
 						</div>
 					</section>
 

@@ -68,7 +68,7 @@ function tempCwd(): string {
 	return cwd;
 }
 
-test("仓库渠道合并进运行时 models.json：启用配置不含 hajimi 时仍可选", () => {
+test("未启用仓库渠道不恢复进运行时 models.json：过期API不混入可用配置", () => {
 	const cwd = tempCwd();
 	const agentDir = join(cwd, "agent-runtime");
 	saveProfile(cwd, "hajimi", "hajimi", {
@@ -95,8 +95,7 @@ test("仓库渠道合并进运行时 models.json：启用配置不含 hajimi 时
 		providers: { new: { baseUrl: "https://new.example/v1", api: "openai-completions", apiKey: "sk-new", models: [{ id: "deepseek-v4-flash" }] } },
 	});
 	const runtime = JSON.parse(readFileSync(join(agentDir, "models.json"), "utf8")) as { providers: Record<string, { models?: Array<{ id: string }> }> };
-	assert.ok(runtime.providers.hajimi, "hajimi 渠道应合并进运行时");
-	assert.ok(runtime.providers.hajimi.models?.some((m) => m.id === "gemini-3.1-pro-preview"));
+	assert.equal(runtime.providers.hajimi, undefined, "保留仓库档案不等于启用其API");
 	assert.ok(runtime.providers.new, "当前启用渠道保留");
 	assert.deepEqual(Object.keys(warehouseProviders(cwd)), ["hajimi"]);
 });

@@ -1,79 +1,26 @@
-# 如何正确读取梨园的思考记录（必读，防止找错位置）
+# 正确定位会话、流程和思考记录
 
-> 血泪教训（2026-08-08）：曾把**下午 17:27/17:29 的旧会话生成**当成「刚刚跑的两次」，
-> 把 11k 字英文思考误报为用户当场所见——用户当场否认「最多 1K」。根因：只按文件
-> mtime 排序取最新，而旧会话文件会被 model_change 等记录「碰」到最新时间。
-> 本文是唯一正确的阅读流程，任何助手要读思考必须先走完下面的定位步骤。
+先读本文件再读私人会话。旧文件mtime可能被model-change、重命名或设置更新触碰，不能用mtime排序断言“最新生成”。
 
-## 0. 会话文件位置
+## 定位
 
-```
-<USER>\.liyuan\agent\sessions\--E--silly-agent-Liyuan-dev--\*.jsonl
-```
+1. 先以当前WS hello/显式会话id确认目标，不把隔离实战记录当生产会话。
+2. 找该session对应的真实JSONL，逐行检查timestamp（毫秒或ISO），按明确时区转换。
+3. 依据user父节点、assistant正文id和当前祖先链区分输入、swipe/重Roll和兄弟分支。
+4. 核对用户所说时刻后才查看正文/思考；不符则停止，不猜是哪一局。
 
-每个文件 = 一个会话。文件名 `2026-08-08T11-37-40-681Z_<sessionId>.jsonl` 里
-的时间戳是**会话创建时间（UTC）**，不是最后生成时间。
+## 当前模式字段
 
-## 1. 定位「用户说的那两次」——绝不能只按 mtime
+- `rpGenerationMode`：该输入/正文使用的direct或director。
+- `rpGenerationWorkflow`、`rp-turn-performance`：阶段与安全观测，不是文学质量证明。
+- `rpNarrative`：故事事实；`rpAuthorDraft`：主作者原交付；presentation工件只是绑定正文的布局。
+- 最终message可含thinking块，但不能据此宣称已经拿到所有生成轮/专家思考。完整私有trace和安全Wire是不同层。
+- `rpTimeline`是旧稿纸路径的重要记录，不是新模式全部工作流的可靠替代。
 
-**错误做法**：`Get-ChildItem | Sort LastWriteTime -Descending | 取前 2`。
-旧会话会被 model_change 等系统行碰过 mtime，排到最前面，导致读错会话。
+## 检查记忆
 
-**正确做法**：找到目标会话后，**用每行的顶层 `timestamp` 字段核对生成时刻**：
+只需状态/次数时，不读原文或thinking。按session＋card scope、成功正文拍数、周期、sourceRefs/分支、存量向量模式/维度核对；当前空库不能用其他会话记录冒充成功。
 
-```python
-import io, json
-from datetime import datetime, timezone, timedelta
-CST = timezone(timedelta(hours=8))
-def ts(t):
-    return datetime.fromtimestamp(t / 1000, CST).strftime('%m-%d %H:%M:%S') if t else '?'
-rows = [json.loads(l) for l in io.open(path, encoding='utf-8') if l.strip()]
-for i, r in enumerate(rows):
-    m = r.get('message') or {}
-    print(i, r.get('type'), m.get('role'), ts(r.get('timestamp')),
-          str(r.get('id'))[:14], 'parent=' + str(r.get('parentId'))[:14])
-```
+## 报告纪律
 
-关键判据：
-- **assistant 行的 `timestamp`（北京时间）必须落在用户说的那个时刻**。
-  例如用户说「7 点 35 左右跑了两条」→ assistant 行时间应为 19:35±几分钟，
-  差一小时以上（如 17:27）就是找错文件了。
-- 顶层 `timestamp` 是 UTC 毫秒；显示时 +8 小时转北京时间。
-- 文件名时间戳是 UTC，直接看会差 8 小时，别拿它当生成时间。
-
-## 2. 区分「拍」与「swipe 变体」
-
-同一 `parentId`（= 同一条 user 消息）下的多个 assistant = 同一次输入的不同
-swipe，不是多拍。要看「用户跑了哪几次」= 数不同的 user 消息 / 不同 parentId。
-
-## 3. 思考正文在哪：`details.rpTimeline`
-
-- 落树消息的 `content` 里只有**最后一轮**的 thinking（`content[].thinking`），
-  不是全拍思考。
-- **全拍思考链在 `message.details.rpTimeline`**：数组，每项 `{kind: "thinking"|"tool"|"text", ...}`。
-- ⚠ **timeline 的 tool 段字段是 `activities`（数组）**，不是 `activity`——
-  读错字段会得到空工具名，误判「模型没调工具」（8/08 犯过）。
-
-```python
-tl = (m.get('details') or {}).get('rpTimeline') or []
-for s in tl:
-    if s.get('kind') == 'thinking':
-        print('思考', len(s.get('text') or ''), '字:', (s.get('text') or '')[:60])
-    elif s.get('kind') == 'tool':
-        for a in s.get('activities') or []:      # 是 activities，不是 activity！
-            print('工具', a.get('name'), ':', a.get('detail'))
-    elif s.get('kind') == 'text':
-        print('正文段', len(s.get('text') or ''), '字')
-```
-
-## 4. 读完整时间线的最小脚本
-
-已存于 `<USER>\AppData\Local\Temp\opencode\dump-tl2.py`（按上面 §3 正确
-字段实现）。用法：改脚本里的文件名 → 运行 → 得到「思考→工具→正文段」全链。
-
-## 5. 汇报时的纪律
-
-1. **先报时间核对**：列出目标 assistant 行的北京时间，与用户说的时刻对齐后才读正文。
-2. 汇报里写明是**哪一次**（几点几分、主生成还是 swipe）。
-3. 思考长度用「每段」报，不要只报最大段或总和——分段结构本身是评估对象。
-4. 若文件时间对不上用户说的时刻，先停下问，不要拿错会话的数据下结论。
+记录具体会话角色、当地时间、源正文id的内部核对结果；公开报告只出脱敏状态/计数。工具记录字段以实际schema为准，不把“没显示”当“没调用”。原文、thinking、API Key和私人截图不得复制到公开文档或提交。

@@ -21,7 +21,7 @@ export interface LiteraryDirection {
 	withheldInformation?: string[];
 	relationshipLimit?: string;
 	playerStop?: string;
-	/** 每拍固定生成的写作控制：只约束表现，不是剧情事实。 */
+	/** 旧写作控制字段仅保留存档解析兼容，不生成或回注给主演。 */
 	sceneMode?: string;
 	subtext?: string;
 	rhythm?: string;
@@ -76,20 +76,18 @@ export function buildLiteraryDirectorPrompt(input: {
 	charName: string;
 	userName: string;
 	characterIdentityIndex?: string;
+	characterCard?: { name: string; description: string; personality: string; scenario: string };
+	userPersona?: string;
 }): { systemPrompt: string; userText: string } {
 	return {
-		systemPrompt: `你是梨园文学工作流唯一的拍前导演。你只给主演一块简短、受限的 Stitches 风格方向，不写正文、对白、状态补丁、输出格式或事件顺序，也不复述输入。
+		systemPrompt: `你是梨园文学工作流唯一的拍前导演。遵循随附 Stitches 工作流 Skill；只输出候选数据，不写正文、对白或状态补丁。不得创造新事实，不得把候选写成已发生历史。
 
-判断场景压力、各角色的动机/即时意图/行动上限、个人线、幕后线、可选拍点、应暂扣的信息、关系推进上限，以及涉及玩家行动、思想、对白或重大选择前的停点。每一拍还必须给出 sceneMode、subtext、rhythm、dialogueRatio、sensoryFocus、avoid，供主演控制现场感、节奏和反八股；这些是写作约束，不是正文内容。
-
-continuity 仅是连续性约束，research 仅是参考材料。不得创造新事实，不得把 candidateBeats 或其他候选写成已发生历史，不得替玩家选择。具体发生什么和怎么写均由下游主演决定。
-
-单拍边界是硬约束：默认只推进最新用户输入所在的当前场景和眼前一次互动。用户只说一句话、做一个动作或补充当前场景时，candidateBeats 只能覆盖对方即时反应、一次必要交互与把话递回玩家；不得擅自跳到稍后、放学、夜晚、次日，不得把交流会、夜跑、复盘、入睡等后续日程塞进同一拍。只有用户明确要求时间跳转、概述一段时期或当前场景已自然结束，才允许跨场景。最新输入若复述或细化上拍中的瞬间，视为从当前分支叶继续，不得重演已经发生的后续。
-
-严格只返回 JSON：{"scenePressure":"...","characterInitiatives":[{"character":"...","motive":"...","immediateIntent":"...","limit":"..."}],"personalThreads":[],"offstageThreads":[],"candidateBeats":[],"withheldInformation":[],"relationshipLimit":"...","playerStop":"...","sceneMode":"...","subtext":"...","rhythm":"slow|medium|fast","dialogueRatio":0.6,"sensoryFocus":[],"avoid":[]}。所有数组最多三项；dialogueRatio 为 0 到 1；不适用时使用空字符串或空数组。`,
+严格只返回 JSON：{"scenePressure":"","characterInitiatives":[],"personalThreads":[],"offstageThreads":[],"candidateBeats":[],"withheldInformation":[],"relationshipLimit":""}。characterInitiatives 每项为 {"character":"","motive":"","immediateIntent":"","limit":""}。所有数组最多三项；不适用项使用空字符串或空数组。`,
 		userText: JSON.stringify(
 			{
 				participants: { character: input.charName, user: input.userName },
+				declared_user_persona: clipPromptText(input.userPersona, 6000),
+				character_card_reference: input.characterCard ? { name: input.characterCard.name, description: clipPromptText(input.characterCard.description, 7000), personality: clipPromptText(input.characterCard.personality, 5000), scenario: clipPromptText(input.characterCard.scenario, 4000) } : null,
 				current_state: input.state,
 				prior_summary: input.summary ?? "",
 				recent_history: boundedHistory(input.history, 20),
@@ -176,12 +174,5 @@ export function formatLiteraryDirection(direction: LiteraryDirection): string {
 	if (direction.candidateBeats?.length) lines.push(`候选拍点（非事实）：${direction.candidateBeats.join("；")}`);
 	if (direction.withheldInformation?.length) lines.push(`暂扣信息：${direction.withheldInformation.join("；")}`);
 	if (direction.relationshipLimit) lines.push(`关系上限：${direction.relationshipLimit}`);
-	if (direction.playerStop) lines.push(`玩家停点：${direction.playerStop}`);
-	if (direction.sceneMode) lines.push(`场景模式：${direction.sceneMode}`);
-	if (direction.subtext) lines.push(`潜台词：${direction.subtext}`);
-	if (direction.rhythm) lines.push(`节奏：${direction.rhythm}`);
-	if (direction.dialogueRatio !== undefined) lines.push(`对白比例：${direction.dialogueRatio}`);
-	if (direction.sensoryFocus?.length) lines.push(`感官焦点：${direction.sensoryFocus.join("；")}`);
-	if (direction.avoid?.length) lines.push(`反八股约束：${direction.avoid.join("；")}`);
 	return lines.length ? `[拍前导演]\n${lines.join("\n")}` : "";
 }

@@ -209,7 +209,7 @@ test("system prompt：字节稳定、宏替换；扮演话语零残留（P1—�
 	const b = buildStageSystemPrompt(opts);
 	assert.equal(a, b, "同素材两次装配必须逐字节一致");
 	assert.ok(a.includes("沈舟的同门师姐"), "{{user}} 宏应替换");
-	assert.ok(a.includes("一场长篇沉浸式角色扮演"), "舞台声明在场（数据）");
+	assert.ok(a.includes("当前角色卡：云澜；用户角色：沈舟"), "舞台只声明角色数据，不预先冻结用户角色言行");
 	// D1/D2/D3：harness 扮演文案全数退场
 	assert.ok(!a.includes("# 叙事与文风"), "D1：叙事与文风段已删");
 	assert.ok(!a.includes("# 输出结构"), "D2：输出结构段已删");
@@ -222,9 +222,9 @@ test("system prompt：字节稳定、宏替换；扮演话语零残留（P1—�
 test("system prompt：# 工作方式 = 纯协议（§2.1-5 逐字）；tools=false 时不出现", () => {
 	const p = buildStageSystemPrompt({ card, config, constantLore: [], allowAsk: true });
 	assert.ok(p.includes("# 工作方式"), "工作方式节在场");
-	assert.ok(p.includes("用户主权未定且此刻不定就无法继续时可调用 `ask`"), "ask 模式与运行时工具能力一致");
+	assert.ok(!p.includes("`ask`") && !p.includes("关键未决") && !p.includes("代写边界"), "工作方式只声明稿纸运行协议");
 	const silent = buildStageSystemPrompt({ card, config, constantLore: [], allowAsk: false });
-	assert.ok(silent.includes("不在中途调用 `ask`"), "未暴露 ask 时明确禁止虚构选择卡");
+	assert.equal(silent, p, "旧 ask 参数不再改变正文提示词");
 	const noTools = buildStageSystemPrompt({ card, config, constantLore: [], tools: false });
 	assert.ok(!noTools.includes("# 工作方式"), "无工具形态不声明工作方式");
 	assert.ok(noTools.includes("纯文本主演模式"), "无工具 API 得到明确的纯文本交付协议");
@@ -346,7 +346,8 @@ test("末端注入：文学导演只作为画像之后、预设之前的拍前�
 		presetTail: ["末端规则"],
 	});
 	assert.ok(inj.includes("不是正文、事实、事件清单或 beat_plan"));
-	assert.ok(inj.includes("具体事件、顺序、动作、对白、镜头与段落由随后 beat_plan 决定"));
+	assert.ok(!inj.includes("关键未决") && !inj.includes("代写边界"));
+	assert.ok(!inj.includes("它只约束角色主动性、个人线、幕后线和玩家停点"));
 	assert.ok(inj.indexOf("【角色校准参考】") < inj.indexOf("【本拍文学导演候选】"));
 	assert.ok(inj.indexOf("【本拍文学导演候选】") < inj.indexOf("【预设末端指令】"));
 });

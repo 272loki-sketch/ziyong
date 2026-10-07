@@ -1569,7 +1569,7 @@ test("五注入日程：进度行每轮替换、判定注入路标演完时一�
 		assert.ok(ctxs[2].includes("【进度】路标 2/2「见人」；已演 1 段"), "进度行更新到当前路标");
 		assert.equal((ctxs[2].match(/【进度】/g) ?? []).length, 1, "替换语义：上下文里只有一条进度行");
 		assert.ok(ctxs[3].includes("【判定】继续写"), "判定注入在路标演完且稿非空时出现");
-		assert.ok(ctxs[3].includes("不要中途询问用户"), "未注入 askUser 时判定不虚构选择卡");
+		assert.ok(!ctxs[3].includes("必要时 `ask`"), "判定不再引入剧情询问");
 		assert.ok(ctxs[4].includes("【记账】已封笔。"), "seal 之后第一件事是记账注入");
 	} finally {
 		reg.unregister();
@@ -1609,7 +1609,7 @@ test("抢跑 seal 时序保证（PLAN-ASK §2.2）：路标演完同轮直接封
 		await engine.performTurn("你先进去。");
 
 		assert.ok(ctxs[2].includes("【判定】继续写"), "首次 seal 不受理——回执即判定文案（同一席位提前送达）");
-		assert.ok(ctxs[2].includes("不要中途询问用户"), "未注入 askUser 时判定不提供 ask");
+		assert.ok(!ctxs[2].includes("询问用户") && !ctxs[2].includes("`ask`"), "判定只保留稿纸协议");
 		assert.ok(!ctxs[2].includes("已封笔"), "首次 seal 未被受理");
 		assert.ok(ctxs[3].includes("已封笔"), "二次 seal 照常受理（一次性保证，不成循环）");
 		assert.ok(ctxs[3].includes("【记账】已封笔。"), "受理后日程继续：记账注入");
@@ -1681,7 +1681,7 @@ test("判定送达不依赖路标勾选（8/12 放宽）：没勾完路标就封
 		await engine.performTurn("你先进去。");
 
 		assert.ok(ctxs[2].includes("【判定】继续写"), "没勾完路标直接封笔也被拦——回执即判定文案");
-		assert.ok(ctxs[2].includes("不要中途询问用户"), "未注入 askUser 时判定不提供 ask");
+		assert.ok(!ctxs[2].includes("询问用户") && !ctxs[2].includes("`ask`"), "判定只保留稿纸协议");
 		assert.ok(!ctxs[2].includes("已封笔"), "首次 seal 未被受理（判定优先于封笔）");
 		assert.ok(ctxs[3].includes("已封笔"), "二次 seal 照常受理（一次性保证，不成循环）");
 	} finally {
@@ -1721,7 +1721,7 @@ test("判定送达不依赖工具轮（8/12 补洞）：勾不齐路标就停手
 
 		assert.ok(ctxs[3].includes("已续写 1 个路标未封笔"), "停手1：催封笔");
 		assert.ok(ctxs[4].includes("【判定】继续写"), "停手2：兜底封笔前补判定");
-		assert.ok(ctxs[4].includes("不要中途询问用户"), "补的判定不虚构 ask 能力");
+		assert.ok(!ctxs[4].includes("询问用户") && !ctxs[4].includes("`ask`"), "补的判定只保留稿纸协议");
 		assert.equal((ctxs[4].match(/【判定】/g) ?? []).length, 1, "判定只补一次，不成循环");
 		const branch = sm.getBranch() as Array<{ type: string; message?: { role?: string; content?: unknown } }>;
 		assert.ok(JSON.stringify(branch).includes("她推门进院"), "正文在树上（兜底封笔正常收束）");
@@ -1982,7 +1982,7 @@ test("直出代收回执（§2.4）：事实+可用动作，格式块归属声�
 
 // ---------------- P7：ask 工具（剧情共创决策） ----------------
 
-test("ask：注入 askUser 才上清单；未注入则剔除（依赖缺失不上清单）", async () => {
+test("台上清单：未注入询问接口时不含 ask", async () => {
 	const { cwd, sm } = makeStage();
 	const reg = registerFauxProvider({ models: [{ id: "faux-rp" }] });
 	try {
@@ -2004,7 +2004,7 @@ test("ask：注入 askUser 才上清单；未注入则剔除（依赖缺失不�
 	}
 });
 
-test("ask：注入 askUser 时 ask 上清单", async () => {
+test("台上清单：即使配置 ask 并注入询问接口，仍不含 ask", async () => {
 	const { cwd, sm } = makeStage();
 	const reg = registerFauxProvider({ models: [{ id: "faux-rp" }] });
 	try {
@@ -2026,93 +2026,42 @@ test("ask：注入 askUser 时 ask 上清单", async () => {
 		});
 		await engine.performTurn("开演。");
 		const names = (ctxs[0].tools ?? []).map((t) => t.name);
-		assert.ok(names.includes("ask"), "注入 askUser 后 ask 在清单");
+		assert.ok(!names.includes("ask"), "注入宿主询问接口也不向正文暴露 ask");
 	} finally {
 		reg.unregister();
 		rmSync(cwd, { recursive: true, force: true });
 	}
 });
 
-test("ask：作答回喂模型，计划据此重拟（P7 决策闭环；时机门禁已删，首轮直问即弹）", async () => {
+test("台上不执行模型误发的 ask，未知工具不阻塞续写或丢失现稿", async () => {
 	const { cwd, sm } = makeStage();
 	const reg = registerFauxProvider({ models: [{ id: "faux-rp" }] });
 	try {
-		const asked: Array<{ q: string; opts: string[] }> = [];
-		const responses: unknown[] = [];
-		// 第 1 轮 ask（无稿）：D13 门禁已删——用户在求方向，模型直问，harness 不拦
-		responses.push(
-			fauxAssistantMessage([fauxToolCall("ask", { question: "你打算怎么处置这件事？", options: ["报官", "私了", "先按兵不动"] })], {
-				stopReason: "toolUse",
-			}),
-		);
-		responses.push(
-			fauxAssistantMessage([fauxToolCall("beat_plan", { steps: ["先按兵不动", "暗中观察"] })], { stopReason: "toolUse" }),
-		);
-		responses.push(
-			fauxAssistantMessage([fauxToolCall("draft_append", { segment: "我按住剑柄，退后半步。" })], { stopReason: "toolUse" }),
-		);
-		responses.push(fauxAssistantMessage([fauxToolCall("draft_seal", {})], { stopReason: "toolUse" }));
-		responses.push(fauxAssistantMessage("")); // 记账注入轮
-		responses.push(fauxScribeEmpty());
-		reg.setResponses(responses as never);
-
+		let asked = 0;
+		const contexts: string[] = [];
+		const capture = (response: unknown) => (ctx: unknown) => { contexts.push(JSON.stringify(ctx)); return response; };
+		reg.setResponses([
+			capture(fauxAssistantMessage([fauxToolCall("ask", { question: "要如何继续？", options: ["甲", "乙"] })], { stopReason: "toolUse" })),
+			fauxAssistantMessage([fauxToolCall("beat_plan", { steps: ["翻开账本", "补记账目"] })], { stopReason: "toolUse" }),
+			fauxAssistantMessage([fauxToolCall("draft_append", { segment: "沈舟翻开账本，圈出两处漏记。" }), fauxToolCall("beat_step_done", { step: 1 })], { stopReason: "toolUse" }),
+			capture(fauxAssistantMessage([fauxToolCall("ask", { question: "还要继续吗？", options: ["继续", "停止"] })], { stopReason: "toolUse" })),
+			capture(fauxAssistantMessage([fauxToolCall("draft_append", { segment: "云澜拿起笔，将欠缺的数字补进页边。" }), fauxToolCall("beat_step_done", { step: 2 })], { stopReason: "toolUse" })),
+			fauxAssistantMessage([fauxToolCall("draft_seal", {})], { stopReason: "toolUse" }),
+			fauxAssistantMessage(""), fauxScribeEmpty(),
+		] as never);
 		const engine = new StageEngine({
-			cwd,
-			getSessionManager: () => sm as never,
-			getModel: () => reg.getModel("faux-rp"),
-			getAuth: async () => ({}),
-			streamFn: streamSimple as unknown as StageStreamFn,
-			askUser: async (q, opts) => {
-				asked.push({ q, opts });
-				return "先按兵不动";
-			},
+			cwd, getSessionManager: () => sm as never, getModel: () => reg.getModel("faux-rp"),
+			getAuth: async () => ({}), streamFn: streamSimple as unknown as StageStreamFn,
+			askUser: async () => { asked++; throw new Error("正文不应调用宿主询问接口"); },
 		});
-		await engine.performTurn("她递来一封信。");
-
-		assert.equal(asked.length, 1, "ask 首轮直达用户（无暂缓拦截）");
-		assert.equal(asked[0]?.q, "你打算怎么处置这件事？");
-		assert.deepEqual(asked[0]?.opts, ["报官", "私了", "先按兵不动"]);
-		const { history } = rebuildHistory(sm.getBranch() as BranchEntryLike[]);
-		assert.equal(history[history.length - 1].text, "我按住剑柄，退后半步。", "作答后按计划演出的正文定稿");
+		await engine.performTurn("继续。");
+		assert.equal(asked, 0, "未装配工具不能调用宿主询问通道");
+		assert.ok(contexts.some(ctx => ctx.includes("未知写侧工具 ask")), "误发 ask 按未知工具返回，不假装执行");
+		const branch = JSON.stringify(sm.getBranch());
+		assert.ok(branch.includes("沈舟翻开账本，圈出两处漏记。"));
+		assert.ok(branch.includes("云澜拿起笔，将欠缺的数字补进页边。"));
 	} finally {
-		reg.unregister();
-		rmSync(cwd, { recursive: true, force: true });
-	}
-});
-
-test("ask：用户停止 → 本拍收束，已写正文不丢（引擎兜底封笔）", async () => {
-	const { cwd, sm } = makeStage();
-	const reg = registerFauxProvider({ models: [{ id: "faux-rp" }] });
-	try {
-		const responses: unknown[] = [];
-		responses.push(
-			fauxAssistantMessage([fauxToolCall("draft_append", { segment: "第一段已经写好了。" })], { stopReason: "toolUse" }),
-		);
-		responses.push(
-			fauxAssistantMessage([fauxToolCall("ask", { question: "接下来怎么办？", options: ["继续", "算了"] })], {
-				stopReason: "toolUse",
-			}),
-		);
-		reg.setResponses(responses as never);
-
-		let ended: { aborted: boolean; entryId?: string; error?: string } | null = null;
-		const engine = new StageEngine({
-			cwd,
-			getSessionManager: () => sm as never,
-			getModel: () => reg.getModel("faux-rp"),
-			getAuth: async () => ({}),
-			streamFn: streamSimple as unknown as StageStreamFn,
-			askUser: async () => undefined,
-			events: { onTurnEnd: (info) => (ended = info) },
-		});
-		await engine.performTurn("你说话啊。");
-
-		assert.ok(ended && !ended.aborted && ended.entryId, "有稿时仍落树定稿");
-		const flat = JSON.stringify(sm.getBranch());
-		assert.ok(flat.includes("第一段已经写好了"), "停止后已写的正文仍保留");
-	} finally {
-		reg.unregister();
-		rmSync(cwd, { recursive: true, force: true });
+		reg.unregister(); rmSync(cwd, { recursive: true, force: true });
 	}
 });
 
@@ -2582,6 +2531,57 @@ test("引擎：regex-only 状态栏直接由作者正则格式计划驱动，不
 		assert.ok(curtainCtx.includes("comprehensive_now_status"), "作者正则 findRegex 进入有界格式计划");
 		assert.ok(!curtainCtx.includes("很大的 HTML replacement"), "不送料巨大 replacement");
 		assert.equal(readFileSync(join(cwd, ".liyuan", "output-contract.json"), "utf8"), '{"modules":[]}', "旧合约文件不再被引擎读取或改写");
+	} finally {
+		reg.unregister();
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+
+test("主演请求：预设与工作流分开署名，主角可自然行动且正文不被结尾黑名单改写", async () => {
+	const { cwd, sm } = makeStage();
+	const reg = registerFauxProvider({ models: [{ id: "faux-rp" }] });
+	try {
+		mkdirSync(join(cwd, "skills", "主演分段演出"), { recursive: true });
+		writeFileSync(join(cwd, "skills", "主演分段演出", "SKILL.md"), readFileSync(new URL("../skills/主演分段演出/SKILL.md", import.meta.url), "utf8"));
+		const presetText = "按小说自然发展，沈舟可以依据既有人设做出日常决定，不要每次停下来等用户回应。";
+		writeFileSync(join(cwd, "preset.json"), JSON.stringify({ name: "合成小说预设", blocks: [{ id: "narrative", name: "叙事边界", role: "system", channel: "resident", enabled: true, content: presetText }] }));
+		writeFileSync(join(cwd, "liyuan.config.json"), JSON.stringify({ card: "card.json", preset: "preset.json", userName: "沈舟", creationMode: "ask" }));
+		const contexts: string[] = [];
+		const capture = (response: unknown) => (ctx: unknown) => {
+			contexts.push(JSON.stringify(ctx));
+			return response;
+		};
+		const first = "沈舟把折好的信收进外套内袋，答应先核对账目。\n\n云澜将桌上的账本推了过去。";
+		const second = "他翻到末页，把两处数字圈出来。\n\n云澜看向你，接过笔，在页边补下漏记的一笔。";
+		reg.setResponses([
+			capture(fauxAssistantMessage([fauxToolCall("beat_plan", { steps: ["收好信件并核对账目", "找出漏记的一笔"] })], { stopReason: "toolUse" })),
+			capture(fauxAssistantMessage([fauxToolCall("draft_append", { segment: first }), fauxToolCall("beat_step_done", { step: 1 })], { stopReason: "toolUse" })),
+			capture(fauxAssistantMessage([fauxToolCall("draft_append", { segment: second }), fauxToolCall("beat_step_done", { step: 2 })], { stopReason: "toolUse" })),
+			capture(fauxAssistantMessage([fauxToolCall("draft_seal", {})], { stopReason: "toolUse" })),
+			capture(fauxAssistantMessage("")),
+			fauxScribeEmpty(),
+		] as never);
+		let asked = 0;
+		const engine = new StageEngine({
+			cwd, getSessionManager: () => sm as never, getModel: () => reg.getModel("faux-rp") as never,
+			getAuth: async () => ({}), streamFn: streamSimple as unknown as StageStreamFn,
+			askUser: async () => { asked++; return undefined; },
+		});
+		await engine.performTurn("继续当前场景，主角可以作出符合人设的日常决定。");
+		assert.equal(asked, 0);
+		assert.ok(contexts[0].includes(presetText), "预设原文不被系统重写");
+		assert.ok(contexts[0].includes("【主演工作流】"), "真实 writer 请求装入独立署名的系统工作流");
+		assert.ok(!contexts[0].includes("代写边界") && !contexts[0].includes("重大未决"), "不再添加相反的叙事许可/确认规则");
+		assert.ok(contexts.some(ctx => ctx.includes("【分段回看】")), "分段回看仍执行");
+		for (const ctx of contexts) {
+			assert.ok(!ctx.includes("到了玩家接话处用 draft_seal"));
+			assert.ok(!ctx.includes("续写的自然下文涉及用户的行动或选择"));
+			assert.ok(!ctx.includes("不得替用户决定未表达的思想或行动"));
+		}
+		const reply = sm.getBranch().find(entry => entry.type === "message" && entry.message.role === "assistant");
+		assert.ok(reply && reply.type === "message");
+		assert.equal((reply.message.details as Record<string, unknown>).rpNarrative, `${first}\n\n${second}`, "正常主角言行和有剧情依据的看向你原样落树，修正不删改正文");
 	} finally {
 		reg.unregister();
 		rmSync(cwd, { recursive: true, force: true });

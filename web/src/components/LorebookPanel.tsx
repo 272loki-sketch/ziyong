@@ -6,7 +6,7 @@
  * - 导入/导出标准世界书 JSON（与酒馆互通的公开格式，产品文案不写 ST）
  */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
 	apiDelete,
 	apiGet,
@@ -18,6 +18,7 @@ import {
 	type LorebooksResponse,
 	type LoreEntryPatchBody,
 	type LoreEntryView,
+	type LoreTargetBody,
 	type LoreSearchHit,
 } from "../api.ts";
 import { bumpWatchPanels, ConfirmButton, Field, PanelStatus, SearchInput, Toggle, useAction, usePanelData } from "./kit.tsx";
@@ -79,18 +80,21 @@ function EntryRow({
 	onToggle,
 	onPatch,
 	onDelete,
+	scope,
 }: {
 	e: LoreEntryView;
 	busy: boolean;
 	expandTick: number;
 	expanded: boolean;
-	onToggle: (fingerprint: string, enabled: boolean) => void;
-	onPatch: (body: LoreEntryPatchBody, doneText?: string) => void;
-	onDelete: (fingerprint: string) => void;
+	onToggle: (fingerprint: string, enabled: boolean, entryKey?: string) => void;
+	onPatch: (body: LoreEntryPatchBody, doneText?: string) => Promise<boolean>;
+	scope: LoreTargetBody;
+	onDelete: (fingerprint: string, entryKey?: string) => void;
 }) {
 	const [open, setOpen] = useState(false);
 	const [editing, setEditing] = useState(false);
-	const [full, setFull] = useState<string | null>(null);
+	const [full, setFull] = useState<string | null>(e.content ?? null);
+	const [loadError, setLoadError] = useState<string | null>(null);
 	const [draftComment, setDraftComment] = useState(e.comment);
 	const [draftOrder, setDraftOrder] = useState(String(e.order));
 	const [draftConstant, setDraftConstant] = useState(e.constant);
@@ -115,22 +119,24 @@ function EntryRow({
 	const loadFull = async () => {
 		if (full !== null) return full;
 		try {
-			const r = await apiGet<{ content: string }>(`/api/lorebook/entry?fp=${encodeURIComponent(e.fingerprint)}`);
+			const r = await apiGet<{ content: string }>(`/api/lorebook/entry?${targetQuery(scope)}&fp=${encodeURIComponent(e.fingerprint)}${e.entryKey !== undefined ? `&entryKey=${encodeURIComponent(e.entryKey)}` : ""}`);
 			setFull(r.content);
 			return r.content;
-		} catch {
-			setFull(e.preview);
-			return e.preview;
+		} catch (error) {
+			setLoadError(error instanceof Error ? error.message : String(error));
+			throw error; // 不以截断预览冒充全文，避免失败后保存覆盖原文。
 		}
 	};
 
 	useEffect(() => {
-		if (open) void loadFull();
+		if (open) void loadFull().catch(() => undefined);
 		// eslint-disable-next-line react-hooks/exhaustive-deps -- 展开时惰性取全文
 	}, [open]);
 
 	const startEdit = async () => {
-		const content = await loadFull();
+		let content: string;
+		try { content = await loadFull(); } catch { return; }
+		setLoadError(null);
 		setDraftContent(content);
 		setDraftComment(e.comment);
 		setDraftOrder(String(e.order));
@@ -142,16 +148,17 @@ function EntryRow({
 		setOpen(true);
 	};
 
-	const saveEdit = () => {
+	const saveEdit = async () => {
 		const order = Number.parseInt(draftOrder, 10);
 		const keys = parseKeyLine(draftKeys);
 		const secondaryKeys = parseKeyLine(draftSec);
 		if (!draftConstant && keys.length === 0) {
 			// 蓝灯无关键词会永远不触发，仍允许保存（用户可能稍后补）
 		}
-		onPatch(
+		const saved = await onPatch(
 			{
 				fingerprint: e.fingerprint,
+				entryKey: e.entryKey,
 				comment: draftComment,
 				order: Number.isFinite(order) ? order : e.order,
 				constant: draftConstant,
@@ -162,14 +169,17 @@ function EntryRow({
 			},
 			"条目已保存",
 		);
-		setEditing(false);
-		setFull(draftContent);
+		if (saved) {
+			setEditing(false);
+			setFull(draftContent);
+		}
 	};
 
 	const flipLight = () => {
 		if (!e.enabled) return;
 		onPatch(
-			{ fingerprint: e.fingerprint, constant: !e.constant },
+			{ fingerprint: e.fingerprint,
+				entryKey: e.entryKey, constant: !e.constant },
 			e.constant ? "已改为蓝灯（关键词触发）" : "已改为绿灯（常驻）",
 		);
 	};
@@ -200,11 +210,12 @@ function EntryRow({
 							{e.constant && <div className="lore-keys">类型：绿灯常驻（不扫关键词）</div>}
 							{!e.constant && <div className="lore-keys">类型：蓝灯关键词{e.keys.length === 0 ? "（无 key，不会触发）" : ""}</div>}
 							<div className="longtext">{full ?? e.preview}</div>
+							{loadError && <div role="alert" className="sp-empty">{loadError}</div>}
 							<div className="panel-row" style={{ marginTop: 6 }}>
 								<button type="button" className="drawer-btn" disabled={busy} onClick={() => void startEdit()}>
 									编辑
 								</button>
-								<ConfirmButton disabled={busy} confirmText="确认删除" onConfirm={() => onDelete(e.fingerprint)}>
+								<ConfirmButton disabled={busy} confirmText="确认删除" onConfirm={() => onDelete(e.fingerprint, e.entryKey)}>
 									删除
 								</ConfirmButton>
 							</div>
@@ -290,7 +301,7 @@ function EntryRow({
 					checked={e.enabled}
 					disabled={busy}
 					title={e.enabled ? "停用该条目" : "启用该条目"}
-					onChange={(v) => onToggle(e.fingerprint, v)}
+					onChange={(v) => onToggle(e.fingerprint, v, e.entryKey)}
 				/>
 			</div>
 		</div>
@@ -298,7 +309,19 @@ function EntryRow({
 }
 
 /** 浏览目标：某一本文件，或 agent 补充设定 */
-type ViewTarget = { kind: "file"; path: string } | { kind: "agent" };
+type ViewTarget = { kind: "file"; path: string } | { kind: "card" | "agent"; cardIdentity: string; cardPath: string };
+function targetBody(view: ViewTarget): LoreTargetBody {
+	return view.kind === "file" ? { source: "file", path: view.path } : { source: view.kind, cardIdentity: view.cardIdentity };
+}
+function targetQuery(scope: LoreTargetBody): string {
+	const query = new URLSearchParams({ source: scope.source });
+	if (scope.path) query.set("path", scope.path);
+	if (scope.cardIdentity) query.set("cardIdentity", scope.cardIdentity);
+	return query.toString();
+}
+function targetKey(view: ViewTarget | null): string {
+	return !view ? "none" : view.kind === "file" ? `file:${view.path}` : `${view.kind}:${view.cardIdentity}`;
+}
 
 /** 书管理区：勾选=挂载进会话；点书名=下方只显示该本条目（不合并）。 */
 function BooksSection({
@@ -323,9 +346,21 @@ function BooksSection({
 	const active = useMemo(() => normalizeActiveLorebooks(data?.active ?? null), [data?.active]);
 	const activeSet = useMemo(() => new Set(active), [active]);
 
-	// 配套导入后 focus 到新书；否则无选中时默认第一本
+	const previousCardPath = useRef<string | null>(null);
+	// 当前卡内书优先；换卡/修订刷新身份并重建条目行，旧请求不能延用。
 	useEffect(() => {
-		if (!data?.books.length) return;
+		if (!data) return;
+		const card = data.embeddedCard;
+		const switched = previousCardPath.current !== null && previousCardPath.current !== card.path;
+		previousCardPath.current = card.path;
+		if (switched || !view) {
+			onView({ kind: "card", cardIdentity: card.cardIdentity, cardPath: card.path });
+			return;
+		}
+		if (view.kind !== "file" && view.cardIdentity !== card.cardIdentity) {
+			onView({ kind: view.kind, cardIdentity: card.cardIdentity, cardPath: card.path });
+			return;
+		}
 		let focus: string | null = null;
 		try {
 			focus = sessionStorage.getItem("liyuan.lore.focus");
@@ -337,8 +372,9 @@ function BooksSection({
 			onView({ kind: "file", path: focus });
 			return;
 		}
-		if (view) return;
-		onView({ kind: "file", path: data.books[0].path });
+		if (view.kind === "file" && !data.books.some((book) => book.path === view.path)) {
+			onView({ kind: "card", cardIdentity: card.cardIdentity, cardPath: card.path });
+		}
 	}, [data, view, onView]);
 
 	const toggleMount = (path: string, e: React.MouseEvent) => {
@@ -355,7 +391,7 @@ function BooksSection({
 			await apiPost("/api/lorebooks/select", { paths: [] });
 			reload();
 			onMountChanged();
-		}, "已卸下全部世界书");
+		}, "已卸下全部独立世界书（卡内书仍随卡加载）");
 
 	const remove = (path: string) =>
 		run(async () => {
@@ -365,6 +401,7 @@ function BooksSection({
 			if (view?.kind === "file" && view.path === path && data) {
 				const rest = data.books.filter((b) => b.path !== path);
 				if (rest[0]) onView({ kind: "file", path: rest[0].path });
+				else onView({ kind: "card", cardIdentity: data.embeddedCard.cardIdentity, cardPath: data.embeddedCard.path });
 			}
 		}, "已删除");
 
@@ -382,7 +419,7 @@ function BooksSection({
 		try {
 			const r = await apiGet<{ name: string; json: unknown }>("/api/lorebook/export");
 			downloadJson(`${r.name}.json`, r.json);
-			toast("info", "已导出会话合并世界书（全部挂载书 + agent 补充）");
+			toast("info", "已导出会话合并世界书（当前卡内书 + 全部挂载书 + agent 补充）");
 		} catch (e) {
 			toast("error", e instanceof Error ? e.message : String(e));
 		}
@@ -410,24 +447,41 @@ function BooksSection({
 
 	const viewingFile = view?.kind === "file" ? view.path : null;
 	const viewingAgent = view?.kind === "agent";
+	const exportCard = async () => {
+		if (!data) return;
+		try {
+			const r = await apiGet<{ name: string; json: unknown }>(`/api/lorebook/export?${targetQuery({ source: "card", cardIdentity: data.embeddedCard.cardIdentity })}`);
+			downloadJson(`${r.name}-内嵌世界书.json`, r.json);
+			toast("info", "已导出当前角色卡内嵌世界书（包括停用条目）");
+		} catch (error) { toast("error", error instanceof Error ? error.message : String(error)); }
+	};
 
 	return (
 		<section className="sp-section">
 			<h4>世界书</h4>
 			<div className="field-hint">
-				<strong>勾选</strong>＝挂进会话（可多本）· <strong>点书名</strong>＝下方只显示该本条目（不合并其它书）。
+				独立书<strong>勾选</strong>＝挂进会话（可多本）· <strong>点书名</strong>＝下方只显示该本条目（不合并其它书）。
 			</div>
 			<PanelStatus loading={loading} error={error} hasData={!!data} />
 			{data && (
 				<>
 					<div className="book-row book-toolbar">
-						<span className="lore-meta">会话已挂 {active.length} 本</span>
+						<span className="lore-meta">独立书已挂 {active.length} 本</span>
 						{active.length > 0 && (
 							<button type="button" className="act" disabled={busy} onClick={() => clearAll()}>
 								全部卸下
 							</button>
 						)}
 					</div>
+					<div className={`book-row book-embedded ${view?.kind === "card" ? "current" : ""}`}>
+						<button type="button" className="book-pick book-pick-full" onClick={() => onView({ kind: "card", cardIdentity: data.embeddedCard.cardIdentity, cardPath: data.embeddedCard.path })}>
+							<span className="book-name">当前角色卡内嵌世界书 · {data.embeddedCard.name}</span>
+							<span className="lore-meta">{data.embeddedCard.entryCount} 条 · 启用 {data.embeddedCard.enabledCount} 条</span>
+							<span className="lore-meta book-mounted-tag">自动随卡加载</span>
+						</button>
+						<span className="book-acts"><button type="button" className="act" onClick={() => void exportCard()}>导出</button></span>
+					</div>
+					<div className="field-hint">卡内条目无需另存或挂载。下方可浏览全部启用和停用条目；启停、编辑会写回当前卡，原本关闭的模块不会自动开启。</div>
 					{data.books.map((b) => {
 						const mounted = activeSet.has(b.path);
 						const viewing = viewingFile === b.path;
@@ -466,12 +520,12 @@ function BooksSection({
 						);
 					})}
 					<div className={`book-row ${viewingAgent ? "current" : ""}`}>
-						<button type="button" className="book-pick book-pick-full" onClick={() => onView({ kind: "agent" })}>
+						<button type="button" className="book-pick book-pick-full" onClick={() => onView({ kind: "agent", cardIdentity: data.embeddedCard.cardIdentity, cardPath: data.embeddedCard.path })}>
 							<span className="book-name">agent 补充设定</span>
 							<span className="lore-meta">按卡自动</span>
 						</button>
 					</div>
-					{data.books.length === 0 && <div className="sp-empty">还没有世界书，可导入 JSON</div>}
+					{data.books.length === 0 && <div className="sp-empty">没有独立世界书，可导入 JSON；卡内书见上方</div>}
 					<div className="panel-row book-io">
 						<label className="drawer-btn book-import">
 							{importing ? "导入中…" : "导入世界书 JSON"}
@@ -486,7 +540,7 @@ function BooksSection({
 								}}
 							/>
 						</label>
-						<button type="button" className="drawer-btn" title="导出会话里全部挂载书+补充" onClick={() => void exportMerged()}>
+						<button type="button" className="drawer-btn" title="导出会话里卡内书+全部挂载书+补充" onClick={() => void exportMerged()}>
 							导出合并
 						</button>
 					</div>
@@ -496,38 +550,25 @@ function BooksSection({
 	);
 }
 
-export function LorebookPanel({ toast }: { toast: (level: "info" | "warning" | "error", text: string) => void }) {
-	const [view, setView] = useState<ViewTarget | null>(null);
-	const viewKey = view?.kind === "file" ? `file:${view.path}` : view?.kind === "agent" ? "agent" : "none";
+function LoreEntries({ toast, view }: {
+	toast: (level: "info" | "warning" | "error", text: string) => void;
+	view: ViewTarget | null;
+}) {
+	const viewKey = targetKey(view);
+	const currentViewKey = useRef(viewKey);
+	currentViewKey.current = viewKey;
+	const searchRequest = useRef(0);
+	useEffect(() => () => { searchRequest.current += 1; }, []);
 
 	const loadEntries = useCallback((): Promise<LorebookResponse> => {
-		if (view?.kind === "file") {
-			return apiGet<LorebookResponse>(`/api/lorebook?path=${encodeURIComponent(view.path)}`);
-		}
-		if (view?.kind === "agent") {
-			return apiGet<LorebookResponse>("/api/lorebook?source=agent");
-		}
-		return Promise.resolve({
-			lorebookPath: null,
-			lorebookPaths: [],
-			viewPath: null,
-			viewSource: null,
-			viewName: null,
-			total: 0,
-			entries: [],
-		});
+		if (view) return apiGet<LorebookResponse>(`/api/lorebook?${targetQuery(targetBody(view))}`);
+		return Promise.resolve({ lorebookPath: null, total: 0, entries: [] });
 	}, [view]);
 
-	const { data, error, loading, reload } = usePanelData(loadEntries, { watchAgent: true });
-	useEffect(() => {
-		reload();
-		setLimit(40);
-		setQuery("");
-		setHits(null);
-		// 换书必须关掉新增表单：它按当前书投递，留着会写错本
-		setAdding(false);
-		// eslint-disable-next-line react-hooks/exhaustive-deps -- 仅随 viewKey 切换
-	}, [viewKey]);
+	const { data: loaded, error, loading, reload } = usePanelData(loadEntries, { watchAgent: true });
+	const data = loaded && view && loaded.viewSource === view.kind &&
+		(view.kind === "file" ? loaded.viewPath === view.path : loaded.cardIdentity === view.cardIdentity) ? loaded : null;
+	useEffect(() => { searchRequest.current += 1; reload(); setHits(null); setSearching(false); }, [viewKey, reload]);
 
 	const { busy, run } = useAction(toast);
 	const [query, setQuery] = useState("");
@@ -546,6 +587,8 @@ export function LorebookPanel({ toast }: { toast: (level: "info" | "warning" | "
 	const [newOrder, setNewOrder] = useState("100");
 
 	const doSearch = async () => {
+		const requestId = ++searchRequest.current;
+		const requestView = viewKey;
 		const q = query.trim();
 		if (!q) {
 			setHits(null);
@@ -554,35 +597,40 @@ export function LorebookPanel({ toast }: { toast: (level: "info" | "warning" | "
 		setSearching(true);
 		try {
 			const r = await apiGet<{ hits: LoreSearchHit[] }>(`/api/lorebook/search?q=${encodeURIComponent(q)}`);
-			setHits(r.hits);
+			if (requestId === searchRequest.current && requestView === currentViewKey.current) setHits(r.hits);
 		} catch (e) {
-			toast("error", e instanceof Error ? e.message : String(e));
+			if (requestId === searchRequest.current && requestView === currentViewKey.current) toast("error", e instanceof Error ? e.message : String(e));
 		} finally {
-			setSearching(false);
+			if (requestId === searchRequest.current && requestView === currentViewKey.current) setSearching(false);
 		}
 	};
 
-	const toggle = (fingerprint: string, enabled: boolean) =>
-		run(async () => {
-			await apiPost("/api/lorebook/toggle", { fingerprint, enabled });
-			reload();
-		});
-
-	const patch = (body: LoreEntryPatchBody, doneText?: string) =>
-		run(async () => {
-			await apiPut("/api/lorebook/entry", body);
-			reload();
+	const scope = view ? targetBody(view) : null;
+	const toggle = (fingerprint: string, enabled: boolean, entryKey?: string) => run(async () => {
+		if (!scope) return;
+		await apiPost("/api/lorebook/toggle", { ...scope, fingerprint, entryKey, enabled });
+		reload(); bumpWatchPanels();
+	});
+	const toggleFiltered = (enabled: boolean) => run(async () => {
+		if (!scope) return;
+		await apiPost("/api/lorebook/toggle", { ...scope, entries: filtered.map((entry) => ({ fingerprint: entry.fingerprint, entryKey: entry.entryKey })), enabled });
+		reload(); bumpWatchPanels();
+	}, enabled ? "已启用筛选条目" : "已停用筛选条目");
+	const patch = async (body: LoreEntryPatchBody, doneText?: string): Promise<boolean> => {
+		let saved = false;
+		await run(async () => {
+			if (!scope) return;
+			await apiPut("/api/lorebook/entry", { ...scope, ...body });
+			saved = true;
+			reload(); bumpWatchPanels();
 		}, doneText);
-
-	/** 当前浏览的书（写操作都限定在它身上；agent = 本卡补充设定） */
-	const scopePath = view?.kind === "file" ? view.path : "agent";
-
-	// 删除限定当前浏览的书，防多本书同指纹时误删别本
-	const removeEntry = (fingerprint: string) =>
-		run(async () => {
-			await apiDelete(`/api/lorebook/entry?fp=${encodeURIComponent(fingerprint)}&path=${encodeURIComponent(scopePath)}`);
-			reload();
-		}, "条目已删除");
+		return saved;
+	};
+	const removeEntry = (fingerprint: string, entryKey?: string) => run(async () => {
+		if (!scope) return;
+		await apiDelete(`/api/lorebook/entry?${targetQuery(scope)}&fp=${encodeURIComponent(fingerprint)}${entryKey !== undefined ? `&entryKey=${encodeURIComponent(entryKey)}` : ""}`);
+		reload(); bumpWatchPanels();
+	}, "条目已删除");
 
 	const resetAddForm = () => {
 		setAdding(false);
@@ -597,7 +645,7 @@ export function LorebookPanel({ toast }: { toast: (level: "info" | "warning" | "
 		run(async () => {
 			const order = Number.parseInt(newOrder, 10);
 			const r = await apiPost<{ duplicate?: boolean }>("/api/lorebook/entry", {
-				path: scopePath,
+				...scope,
 				comment: newComment.trim(),
 				content: newContent,
 				keys: parseKeyLine(newKeys),
@@ -605,7 +653,7 @@ export function LorebookPanel({ toast }: { toast: (level: "info" | "warning" | "
 				order: Number.isFinite(order) ? order : 100,
 			});
 			resetAddForm();
-			reload();
+			reload(); bumpWatchPanels();
 			if (r.duplicate) toast("warning", "正文与本书已有条目重复，未重复写入");
 		}, "条目已添加");
 
@@ -617,7 +665,8 @@ export function LorebookPanel({ toast }: { toast: (level: "info" | "warning" | "
 				!q ||
 				e.comment.toLowerCase().includes(q) ||
 				e.keys.some((k) => k.toLowerCase().includes(q)) ||
-				e.preview.toLowerCase().includes(q),
+				(e.content ?? e.preview).toLowerCase().includes(q) ||
+				e.secondaryKeys.some((k) => k.toLowerCase().includes(q)),
 		);
 		if (sort === "name") out.sort((a, b) => (a.comment || a.keys[0] || "").localeCompare(b.comment || b.keys[0] || ""));
 		else if (sort === "chars") out.sort((a, b) => b.chars - a.chars);
@@ -629,20 +678,20 @@ export function LorebookPanel({ toast }: { toast: (level: "info" | "warning" | "
 		data?.viewName ?? (view?.kind === "agent" ? "agent 补充设定" : view?.kind === "file" ? "…" : "未选择");
 
 	return (
-		<div className="panel-body">
-			<BooksSection toast={toast} view={view} onView={setView} onMountChanged={reload} />
-			<PanelStatus loading={loading} error={error} hasData={!!data && !!view} />
+		<div>
+			<PanelStatus loading={loading || (!!view && !data && !error)} error={error} hasData={!!data && !!view} />
 			{!view && <div className="sp-empty">点上方书名查看该本条目</div>}
 			{view && data && (
 				<>
 					<section className="sp-section">
 						<h4>检索测试</h4>
-						<div className="field-hint">回车测的是会话已挂载书的合并检索；下方列表始终只显示当前点开的书。</div>
+						<div className="field-hint">下方过滤当前书全部条目的标题、关键词和全文（包括停用项）；回车测当前卡内书 + 已挂载书 + 补充设定的有效检索，停用项不命中。</div>
 						<SearchInput
 							value={query}
 							onChange={(v) => {
+								searchRequest.current += 1;
 								setQuery(v);
-								if (!v.trim()) setHits(null);
+								setHits(null); setSearching(false);
 							}}
 							placeholder="过滤当前书条目 / 回车测会话检索…"
 							onEnter={() => void doSearch()}
@@ -693,7 +742,11 @@ export function LorebookPanel({ toast }: { toast: (level: "info" | "warning" | "
 								{expanded ? "全部收起" : "全部展开"}
 							</button>
 						</div>
-						{!adding ? (
+						<div className="panel-row list-toolbar">
+							<ConfirmButton disabled={busy || filtered.length === 0} confirmText="确认启用筛选项" onConfirm={() => void toggleFiltered(true)}>启用筛选项</ConfirmButton>
+							<ConfirmButton disabled={busy || filtered.length === 0} confirmText="确认停用筛选项" onConfirm={() => void toggleFiltered(false)}>停用筛选项</ConfirmButton>
+						</div>
+						{view.kind === "card" ? <div className="field-hint">当前卡内条目直接写回卡文件。新增设定可选上方 agent 补充设定，不必复制或另挂内嵌书。</div> : !adding ? (
 							<button className="drawer-btn" disabled={busy} onClick={() => setAdding(true)}>
 								＋ 新增条目
 							</button>
@@ -761,8 +814,9 @@ export function LorebookPanel({ toast }: { toast: (level: "info" | "warning" | "
 						{filtered.length === 0 && <div className="sp-empty">此书无匹配条目。</div>}
 						{filtered.slice(0, limit).map((e) => (
 							<EntryRow
-								key={e.fingerprint}
+								key={`${viewKey}:${e.fingerprint}:${e.entryKey ?? e.uid ?? ""}`}
 								e={e}
+								scope={scope!}
 								busy={busy}
 								expandTick={expandTick}
 								expanded={expanded}
@@ -781,4 +835,13 @@ export function LorebookPanel({ toast }: { toast: (level: "info" | "warning" | "
 			)}
 		</div>
 	);
+}
+
+/** 条目编辑态按明确来源/卡修订隔离，换卡不沿用旧全文、搜索结果或编辑表单。 */
+export function LorebookPanel({ toast }: { toast: (level: "info" | "warning" | "error", text: string) => void }) {
+	const [view, setView] = useState<ViewTarget | null>(null);
+	return <div className="panel-body">
+		<BooksSection toast={toast} view={view} onView={setView} onMountChanged={bumpWatchPanels} />
+		<LoreEntries key={!view ? "none" : view.kind === "file" ? `file:${view.path}` : `${view.kind}:${view.cardPath}`} toast={toast} view={view} />
+	</div>;
 }

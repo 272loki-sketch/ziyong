@@ -1,3 +1,5 @@
+import type { GenerationMode } from "./generation-mode.ts";
+
 /**
  * REST 客户端（server/rest.ts 的前端镜像）：面板 CRUD 走 /api/*，流内容走 WS。
  *
@@ -10,8 +12,11 @@ const getCache = new Map<string, { at: number; data: unknown }>();
 /** 同一 path 并发合并 */
 const getInflight = new Map<string, Promise<unknown>>();
 const GET_TTL_MS = 180_000;
+let getCacheEpoch = 0;
 
 export function apiGetCacheClear(prefix?: string): void {
+	getCacheEpoch += 1;
+	for (const k of [...getInflight.keys()]) if (!prefix || k.startsWith(prefix)) getInflight.delete(k);
 	if (!prefix) {
 		getCache.clear();
 		return;
@@ -41,9 +46,9 @@ function invalidateAfterWrite(writePath: string): void {
 		},
 		// 换卡 / 卡详情写：必须连带清 cardfront，否则 180s 内仍吃上一张卡的皮肤缓存
 		{ test: /^\/api\/cardfront/, prefixes: ["/api/cardfront"] },
-		{ test: /^\/api\/cards?/, prefixes: ["/api/card", "/api/cards", "/api/cardfront"] },
+		{ test: /^\/api\/cards?/, prefixes: ["/api/card", "/api/cards", "/api/cardfront", "/api/lorebook", "/api/lorebooks"] },
 		{ test: /^\/api\/persona/, prefixes: ["/api/personas", "/api/config"] },
-		{ test: /^\/api\/lorebook/, prefixes: ["/api/lorebook", "/api/lorebooks", "/api/config"] },
+		{ test: /^\/api\/lorebook/, prefixes: ["/api/lorebook", "/api/lorebooks", "/api/config", "/api/card", "/api/cards", "/api/cardfront"] },
 		{ test: /^\/api\/codex/, prefixes: ["/api/codex"] },
 		{ test: /^\/api\/preset/, prefixes: ["/api/preset", "/api/presets"] },
 		{ test: /^\/api\/mcp/, prefixes: ["/api/mcp"] },
@@ -52,7 +57,7 @@ function invalidateAfterWrite(writePath: string): void {
 		{ test: /^\/api\/agent-/, prefixes: ["/api/agent-config", "/api/agent-profiles", "/api/models", "/api/models/catalog"] },
 		{ test: /^\/api\/models/, prefixes: ["/api/models", "/api/models/catalog", "/api/agent-config"] },
 		{ test: /^\/api\/channels/, prefixes: ["/api/models", "/api/models/catalog", "/api/agent-config", "/api/agent-profiles"] },
-		{ test: /^\/api\/config/, prefixes: ["/api/config"] },
+		{ test: /^\/api\/config/, prefixes: ["/api/config", "/api/lorebook", "/api/lorebooks", "/api/cardfront"] },
 		{ test: /^\/api\/world-profile/, prefixes: ["/api/world-profile"] },
 		{ test: /^\/api\/world-state/, prefixes: ["/api/world-state"] },
 		{ test: /^\/api\/outline/, prefixes: ["/api/outline"] },
@@ -111,16 +116,18 @@ export async function apiGet<T>(path: string, opts?: { bypassCache?: boolean }):
 		const inflight = getInflight.get(path);
 		if (inflight) return inflight as Promise<T>;
 	}
+	const epoch = getCacheEpoch;
 	const p = api<T>(path).then((d) => {
-		getCache.set(path, { at: Date.now(), data: d });
-		getInflight.delete(path);
+		// 写入/切卡之前发出的慢 GET 不能回填新世代缓存，也不能删掉新请求。
+		if (epoch === getCacheEpoch) getCache.set(path, { at: Date.now(), data: d });
+		if (getInflight.get(path) === p) getInflight.delete(path);
 		return d;
 	});
 	if (!bypass) getInflight.set(path, p);
 	try {
 		return await p;
 	} catch (e) {
-		getInflight.delete(path);
+		if (getInflight.get(path) === p) getInflight.delete(path);
 		throw e;
 	}
 }
@@ -128,7 +135,7 @@ export async function apiGet<T>(path: string, opts?: { bypassCache?: boolean }):
 /** 按面板 id 清相关 GET 缓存（手动刷新按钮用，避免 remount 后 peek 仍是旧数据） */
 export function apiGetCacheClearForPanel(panelId: string): void {
 	const map: Record<string, string[]> = {
-		card: ["/api/card", "/api/cards", "/api/cardfront"],
+		card: ["/api/card", "/api/cards", "/api/cardfront", "/api/lorebook", "/api/lorebooks"],
 		lorebook: ["/api/lorebook", "/api/lorebooks", "/api/config"],
 		codex: ["/api/codex"],
 		persona: ["/api/personas", "/api/config"],
@@ -215,7 +222,7 @@ export interface ModelsResponse {
 }
 
 export interface ModelRef { provider: string; id: string }
-export type SideModelStep = "writer" | "literaryContinuity" | "literaryDirector" | "literaryCharacter" | "literaryPersona" | "literaryWorld" | "worldProfile" | "literaryWorldFacts" | "literaryWorldAudit" | "ecologySearch" | "ecologyGlobal" | "ecologyCard" | "ecologyRuntime" | "outlineBootstrap" | "outlineChat" | "outlineReconcile" | "outlineResearch" | "outlineCorpusResearch" | "novelDigest" | "outlineAudit" | "contractDeclare" | "scribe" | "compaction" | "presetSort";
+export type SideModelStep = "writer" | "literaryContinuity" | "literaryDirector" | "literaryCharacter" | "literaryPersona" | "literaryWorld" | "worldProfile" | "literaryWorldFacts" | "literaryWorldAudit" | "ecologySearch" | "ecologyGlobal" | "ecologyCard" | "ecologyRuntime" | "directorSetting" | "directorIdeas" | "directorReviewFacts" | "directorReviewStyle" | "outlineBootstrap" | "outlineChat" | "outlineReconcile" | "outlineResearch" | "outlineCorpusResearch" | "novelDigest" | "outlineAudit" | "contractDeclare" | "scribe" | "compaction" | "presetSort";
 export type StepModelOverrides = Partial<Record<SideModelStep, ModelRef>>;
 
 export interface AuthProviderInfo {
@@ -306,7 +313,11 @@ export interface RpConfigView {
 	preset?: string;
 	disabledLore?: string[];
 	backendControl?: boolean;
-	creationMode?: "ask" | "silent";
+	generationMode?: GenerationMode;
+	generationTimeoutMinutes?: number;
+	analysisTimeoutMinutes?: number;
+	analysisRecoveryModel?: ModelRef;
+	allowDegradedGeneration?: boolean;
 	/** 固定楼层压缩：每 N 个叙事轮主动压缩早期正文；0=仅被动压缩 */
 	compactEveryNTurns?: number;
 	literaryQuality?: "off" | "profile" | "guided";
@@ -345,12 +356,24 @@ export interface LoreEntryView {
 	order: number;
 	chars: number;
 	source: "card" | "file" | "agent";
+	/** 全文供启用/停用条目过滤与展开，不能只搜索前160字预览。 */
+	content?: string;
+	uid?: number;
+	entryKey?: string;
 	preview: string;
 }
 
-/** 写回世界书源文件的条目补丁 */
+export interface LoreTargetBody {
+	source: "card" | "file" | "agent";
+	path?: string;
+	cardIdentity?: string;
+}
+
+/** 写回世界书源文件的条目补丁；调用方必须附明确来源。 */
 export interface LoreEntryPatchBody {
 	fingerprint: string;
+	entryKey?: string;
+	enabled?: boolean;
 	constant?: boolean;
 	order?: number;
 	keys?: string[];
@@ -367,7 +390,8 @@ export interface LorebookResponse {
 	lorebookPaths?: string[];
 	/** 当前条目列表对应的书（点选浏览，非合并） */
 	viewPath?: string | null;
-	viewSource?: "file" | "agent" | null;
+	viewSource?: "card" | "file" | "agent" | null;
+	cardIdentity?: string;
 	viewName?: string | null;
 	total: number;
 	entries: LoreEntryView[];
@@ -544,6 +568,7 @@ export interface LorebooksResponse {
 	/** @deprecated 旧单本字段 */
 	activeOne?: string | null;
 	books: LorebookFileInfo[];
+	embeddedCard: { path: string; name: string; cardIdentity: string; entryCount: number; enabledCount: number };
 }
 
 /** 规范化挂载列表（兼容旧 API 返回 string / null） */

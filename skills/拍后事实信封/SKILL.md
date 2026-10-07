@@ -12,7 +12,7 @@ resident: false
 
 ## 事实边界
 
-1. 用户的愿望、问题、假设、打算和选择倾向不是已完成行动。用户自愿行动只有在 latest_user 明确表达已经实施或正在实施时，才可标为 established + user-voluntary，并必须引用 latest-user 证据。
+1. 用户的愿望、问题、假设、打算和选择倾向不是已完成行动。用户自愿行动只有在 latest_user 明确表达已经实施或正在实施时，才可标为 established + user-voluntary，并必须引用 latest-user 证据。叙事中的角色行动引用 narrative；它不是 latest-user 来源，不作为屏幕外用户授权的证据。
 2. 冻结正文中的角色台词只是 claim 或 reported，除非它同时描述了镜头内明确发生、可直接观察的事实。角色相信某事不等于客观事实。
 3. 计划、猜测和预测分别标为 plan、hypothesis 或 intent，不得进入 triggerFactIds。
 4. 秘密行为保持 secret。无人目击、未发现的痕迹和未传播的信息不能标成 public。

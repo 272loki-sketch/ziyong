@@ -1,3 +1,4 @@
+import { RealTestRecords } from "./RealTestRecords.tsx";
 /**
  * 欢迎区 / 主页（学 ST welcome-screen，嵌在聊天流内，非独立页）。
  * 顶栏 / 侧栏 / 输入框照常可用。
@@ -128,6 +129,7 @@ export function WelcomePanel({
 					)}
 				</div>
 				<div className="welcome-hero-actions">
+					<RealTestRecords compact />
 					<button
 						type="button"
 						className="welcome-cta welcome-cta-primary"

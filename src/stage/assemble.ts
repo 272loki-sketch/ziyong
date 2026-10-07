@@ -286,7 +286,8 @@ export interface StageSystemOptions {
 	skills?: Array<{ name: string; description: string; resident: boolean; body: string }>;
 	/** false = 不声明工具协议（M1 前过渡形态；M3 起默认开） */
 	tools?: boolean;
-	/** 当前主演是否真的可调用 ask。 */
+	generationMode?: "direct" | "director";
+	/** 旧调用参数兼容；当前台上不装配 ask。 */
 	allowAsk?: boolean;
 	/**
 	 * MCP 外设工具（8/06 重接）：本会话已连接的 mcp__ 工具，空/省略＝只字不提。
@@ -303,7 +304,7 @@ export function buildStageSystemPrompt({
 	declaredMarkers,
 	skills,
 	tools,
-	allowAsk,
+	generationMode,
 	mcpTools,
 }: StageSystemOptions): string {
 	const macro: MacroContext = { charName: card.name, userName: config.userName };
@@ -314,12 +315,15 @@ export function buildStageSystemPrompt({
 	// 0) 梨园架构段：讲清脚下的机器怎么转（轮次、思考/扮演/写作三活动的位置、注入帧），供预设自行适配。
 	//    只写架构，不写角色（碰破限）、不教写作（那是预设的教导权）、不举写作细节（工具描述里已有）。
 	//    先于预设装配段：模型最先读到梨园怎么运转，再读预设教它演什么。
-	sections.push(tools === false
+	sections.push(generationMode
+		? `# 梨园 Agent 运行架构
+当前模式：${generationMode === "direct" ? "直出（正常文学导演）" : "固定导演团队"}。正文采用普通文本通道，阶段和工具回执不属于正文。`
+		: tools === false
 		? `# 梨园运行架构
 当前 API 不支持原生工具调用。本拍使用纯文本主演模式：依据角色卡、当前分支事实和末端材料，直接输出完整的本拍剧情正文。不要输出工具名、JSON、函数调用、计划说明、状态栏或系统解释。`
 		: `# 梨园运行架构
 每拍按轮次推进，你会有多次输出，思考、扮演、写作在轮次中分开进行。
-- 首轮只规划：读题、探索、请用户定夺、列路标。路标是这一步的剧情走向，只到这一步为止。
+- 首轮只规划：读题、按需探索、列路标。路标是这一步的剧情走向，只到这一步为止。
 - 扮演轮逐路标推进：思考本路标剧情 → 构思怎么落笔 → 产出正文段落 → 推进路标。
 - 每轮出现的【进度】【判定】【记账】是当前状态，以它为准。`);
 
@@ -334,13 +338,13 @@ export function buildStageSystemPrompt({
 	if (!declared.has("dialogueExamples") && card.mesExample) {
 		charParts.push(`## 对白示例（仅供文风与语气参考，不是已发生的剧情）\n${m(card.mesExample)}`);
 	}
-	if (charParts.length > 0) sections.push([`# 你扮演的角色：${card.name}`, ...charParts].join("\n\n"));
+	if (charParts.length > 0) sections.push([generationMode ? `# 角色卡资料：${card.name}` : `# 你扮演的角色：${card.name}`, ...charParts].join("\n\n"));
 
 	if (!declared.has("personaDescription")) {
 		sections.push(
 			[
-				`# 用户扮演：${config.userName}`,
-				config.userPersona ? m(config.userPersona) : `（${config.userName} 的具体形象由用户在剧情中自行呈现）`,
+				generationMode ? `# 用户提供的人设：${config.userName}` : `# 用户扮演：${config.userName}`,
+				config.userPersona ? m(config.userPersona) : `（尚未提供 ${config.userName} 的额外身份设定）`,
 			].join("\n"),
 		);
 	}
@@ -353,17 +357,14 @@ export function buildStageSystemPrompt({
 	// 3) harness 骨架殿后：梨园自己的协议面，与预设作者的字分开。
 	sections.push(
 		`# 舞台
-你在进行一场长篇沉浸式角色扮演：扮演 ${card.name}，以及剧情需要的一切配角、路人与世界本身。用户扮演 ${config.userName}。`,
+当前角色卡：${card.name}；用户角色：${config.userName}。`,
 	);
 
 	// M-R1（PLAN-RECTIFY §2.1-5）：纯协议，零扮演词。扮演的每个字都有署名主人（P1）。
-	if (tools !== false) {
-		const askRule = allowAsk
-			? "用户主权未定且此刻不定就无法继续时可调用 `ask`；其余剧情走向由主演依据人物动机和已有事实自行决定。"
-			: "剧情走向由主演依据人物动机和已有事实自行决定，不在中途调用 `ask`，不弹出选择卡。";
+	if (!generationMode && tools !== false) {
 		sections.push(
 			`# 工作方式
-每拍第 1 轮用 \`beat_plan\` 列路标（没有戏的拍可 \`draft_write\` 一次交完）；正文用 \`draft_append\` 逐路标写在稿纸上，写完 \`draft_seal\` 收笔。${askRule}每轮注入的【进度】【判定】【记账】【谢幕】是当前状态，以它为准。`,
+每拍第 1 轮用 \`beat_plan\` 列路标（没有戏的拍可 \`draft_write\` 一次交完）；正文用 \`draft_append\` 逐路标写在稿纸上，写完 \`draft_seal\` 收笔。每轮注入的【进度】【判定】【记账】【谢幕】是当前状态，以它为准。`,
 		);
 	}
 
@@ -386,8 +387,8 @@ ${index}`,
 	sections.push(
 		`# 消息流约定
 - 权威优先级：用户本拍明确输入 ＞ 当前分支已提交正文 ＞【世界状态】/【活跃面板】等已确认动态状态 ＞ 角色卡稳定事实 ＞【前情提要】。这些内容发生冲突时，不得用建议类材料覆盖。
-- 建议类材料：文学画像、用户历史偏好画像、文学导演、生态候选、研究材料和【剧情记忆】中的事件/归档；它们只帮助写得更自然，不能制造事实、覆盖权威或替用户决定。
-- 标注【开场】的消息是 ${card.name} 的既定开场白，剧情从那一刻继续。
+- 建议类材料：${generationMode ? "文学导演、生态候选、研究材料和【剧情记忆】中的事件/归档" : "文学画像、用户历史偏好画像、文学导演、生态候选、研究材料和【剧情记忆】中的事件/归档"}；它们是参考，不是本拍已发生的事实，不能改写已提交历史或覆盖权威。
+- 标注【开场】的消息是 ${card.name} 的既定开场资料；已有后续正文时不把它当作当前时刻。
 - 标注【前情提要】的消息是更早剧情的接力摘要，是既定事实。
 - 标注【世界状态】的消息是当前事实基准：剧情记忆与它冲突时，以状态为准并在叙事内自然圆回，绝不跳出剧情解释。
 - 标注【登场名录】的消息是登场过但已不在当前状态的条目索引（离场/失去/了结）${tools !== false ? "，细节可用 `memory_search` 查" : ""}；名录之外的名字才是新登场。
@@ -451,7 +452,7 @@ export interface StageInjectionOptions {
 	literaryCharacterProfile?: string;
 	/** 周期用户画像：只用于调整写法，不得覆盖本拍明确要求 */
 	literaryPersonaProfile?: string;
-	/** 拍前 Director 的瞬时候选，只定义叙事压力和玩家停点 */
+	/** 拍前 Director 的可空软参考，不定义强制文风或每拍交接停点。 */
 	literaryDirection?: string;
 	/** 生态原型按当前剧情卡变形后的本拍事件候选，不是事实。 */
 	plotAdaptation?: string;
@@ -461,8 +462,11 @@ export interface StageInjectionOptions {
 	literaryWorld?: string;
 	/** 人物、地点、日程与可错过事件的拍前可见投影；秘密只露边界。 */
 	literaryEcology?: string;
+	existingEcology?: string;
 	/** 预设拆出的 D/E 方法论，直接作为本拍写作指导，不触发工具轮。 */
 	writerGuidance?: Array<{ topic: string; text: string }>;
+	/** 系统工作流单独署名，不混入用户预设写作指导。 */
+	writerWorkflow?: string;
 	/**
 	 * PLAN-RP-MEMORY：拍前自动召回的历史纪要与证据（两阶段召回产物）。
 	 * 由装配侧确定性注入；未命中/超时 = 缺省（主演按摘要+状态照常演）。
@@ -501,7 +505,9 @@ export function buildStageInjection({
 	sceneConductor,
 	literaryWorld,
 	literaryEcology,
+	existingEcology,
 	writerGuidance,
+	writerWorkflow,
 	memoryRecall,
 	novelPlayContext,
 	novelSceneRecall,
@@ -521,9 +527,9 @@ export function buildStageInjection({
 			? `【小说开演原文终点】\n章节/定位：${novelPlayContext.chapter}\n阶段：${novelPlayContext.stage}\n原著后续：未提供，不存在可调用的原著未来候选\n以上是导入文本的确定性终点，不是必须照演的剧本；当前分支事实与用户选择优先。`
 			: `【小说开演当前节点】\n章节/定位：${novelPlayContext.chapter}\n阶段：${novelPlayContext.stage}\n公开事件：${novelPlayContext.nodeTitle}\n公开摘要：${novelPlayContext.nodeSummary}\n开演位置：${novelPlayContext.position === "before" ? "事件发生前" : "事件发生后"}\n以上是作品包已校验的公开节点资料，不是必须照演的剧本；当前分支事实与用户选择优先。`);
 	}
-	if (novelSceneRecall) blocks.push(`【原著当前场景事件组】\n以下是同一原著场景中的相关事件和原文证据，全部只是候选，不是当前分支事实。用户本拍明确输入和已提交正文优先；不得把候选自动写进账本，也不得替用户决定发现、反应或身份揭示。\n${novelSceneRecall}`);
+	if (novelSceneRecall) blocks.push(`【原著当前场景事件组】\n以下是同一原著场景中的相关事件和原文证据，全部只是候选，不是当前分支事实。用户本拍明确输入和已提交正文优先；不得把候选自动写进账本。\n${novelSceneRecall}`);
 	if (rosterIndex) blocks.push("【人物身份约束】\n当前账本和角色卡中已有的人物身份优先。不得把已确认的贵族、朋友、家族成员等身份改写成女仆、陌生人或其他未有证据的职业；生态候选只能补充行动，不能重写人物身份。");
-	if (characterIdentityIndex) blocks.push(`【人物身份资料】\n以下是当前账本中已出现人物的角色卡身份参考。它用于防止身份漂移，不表示这些人物此刻一定在场；本拍人物行动仍须有正文、用户输入或原著场景候选依据。\n${characterIdentityIndex}`);
+	if (characterIdentityIndex) blocks.push(`【人物身份资料】\n以下是当前账本中已出现人物的角色卡身份参考。它用于核对已有身份，不表示这些人物此刻一定在场；原著候选不等于当前分支已发生事件。\n${characterIdentityIndex}`);
 
 	if (panelIndex) {
 		blocks.push(`【活跃面板】\n${panelIndex}`);
@@ -548,13 +554,13 @@ export function buildStageInjection({
 
 	if (literaryPersonaProfile) {
 		blocks.push(
-			`【用户偏好参考】\n以下内容仅用于调整写法与候选方向；用户本拍明确要求永远优先，不能据此替用户作决定。\n${literaryPersonaProfile}`,
+			`【用户偏好参考】\n以下内容仅用于调整写法与候选方向；用户本拍明确要求永远优先。\n${literaryPersonaProfile}`,
 		);
 	}
 
 	if (literaryDirection) {
 		blocks.push(
-			`【本拍文学导演候选】\n这是建议层的拍前方向，不是正文、事实、事件清单或 beat_plan。它只约束角色主动性、个人线、幕后线和玩家停点；具体事件、顺序、动作、对白、镜头与段落由随后 beat_plan 决定，不得照抄本块为正文。\n${literaryDirection}`,
+			`【本拍文学导演候选】\n这是建议层的拍前方向，不是正文、事实、事件清单或 beat_plan。\n${literaryDirection}`,
 		);
 	}
 
@@ -569,9 +575,11 @@ export function buildStageInjection({
 
 	if (literaryEcology) {
 		blocks.push(
-			`【鲜活世界生态】\n这是当前时间与地点周围独立运行的人物生活、场所活动和事件机会。用户是世界中的探索者，不是世界的主宰；世界条件可以改变场景，但不得强迫用户接任务或泄露其尚未发现的秘密。\n${literaryEcology}`,
+			`【鲜活世界生态】\n这是当前分支已提交的人物生活、场所状态和事件机会；人物各自的知情渠道与世界信息边界仍需区分。\n${literaryEcology}`,
 		);
 	}
+
+	if (existingEcology) blocks.push(`【已有生态素材（候选）】\n${existingEcology}`);
 
 	if (writerGuidance?.length) {
 		blocks.push(
@@ -586,8 +594,12 @@ export function buildStageInjection({
 		if (arcs.length) sections.push(`— 剧情脉络 —\n${arcs.map((item) => item.text).join("\n")}`);
 		if (points.length) sections.push(`— 相关片段 —\n${points.map((item) => `- 〔${item.tag}〕${item.text}`).join("\n")}`);
 		blocks.push(
-			`【剧情记忆】\n本拍可能触及以下历史（按需自然融入，勿逐字照抄；与当前已提交事实冲突时以当前事实为准）：\n${sections.join("\n\n")}`,
+			`【剧情记忆】\n以下是本拍可能相关的历史定位（按需自然融入，不机械复述；与当前已提交事实冲突时以当前事实为准）。剧情脉络、事件和纪要是概括，不承诺包含所有原句；相关片段也需核对人物、阶段与所问结果。历史状态改变不表示旧事没发生；作者读到秘密不等于角色知情。缺少必要证据且本拍有 memory_search 时围绕具体人物与事件查询，无命中不改写人物记忆：\n${sections.join("\n\n")}`,
 		);
+	}
+
+	if (writerWorkflow) {
+		blocks.push(`【主演工作流】\n${writerWorkflow}`);
 	}
 
 	// 预设末端内容：原文直通，零归拢零引导语（M-R1）

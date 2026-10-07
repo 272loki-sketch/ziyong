@@ -93,7 +93,9 @@ test("memory_search：命中带来源标签；无命中禁止臆造", async () =
 
 	const miss = await runStageTool(makeDeps(), "memory_search", { query: "陈年旧事" });
 	assert.ok(miss.text.includes("不要臆造"), "无命中必须挡住臆造");
-	assert.ok(miss.text.includes("记不太清"), "给出可用的叙事出路");
+	assert.ok(miss.text.includes("模糊化处理"), "只对缺失细节给出保守叙事出路");
+	assert.ok(miss.text.includes("无命中不表示事情没发生、角色失忆"), "检索缺口不能变成角色失忆");
+	assert.ok(!miss.text.includes("角色可以「记不太清」"), "不为修补检索失败改写角色记忆");
 });
 
 test("world_state_get：给人读的格式 + RAW JSON（模型两种都能用）", async () => {

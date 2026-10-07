@@ -26,8 +26,28 @@ export function applyDisabledLore(entries: LorebookEntry[], disabled: string[] |
 	return entries.map((e) => (off.has(loreFingerprint(e.content)) ? { ...e, enabled: false } : e));
 }
 
+/** 来源键只用于隔离旧的全局 disabledLore，不改卡/书原生 enabled 的权威。 */
+export function loreSourceKey(source: "card" | "file" | "agent", path: string, fingerprint: string, entryKey?: string): string {
+	return JSON.stringify(entryKey === undefined ? [source, path.replace(/\\/g, "/"), fingerprint] : [source, path.replace(/\\/g, "/"), fingerprint, entryKey]);
+}
+
+/** 先按来源应用旧全局停用覆盖，再合并；显式启用只豁免被选中的来源。 */
+export function applyLoreSourceState(
+	entries: LorebookEntry[],
+	config: { disabledLore?: string[]; loreEntryOverrides?: Record<string, boolean> },
+	source: "card" | "file" | "agent",
+	path: string,
+): LorebookEntry[] {
+	const disabled = new Set(config.disabledLore ?? []);
+	return entries.map((entry) => {
+		const fp = loreFingerprint(entry.content);
+		const override = config.loreEntryOverrides?.[loreSourceKey(source, path, fp, entry.entryKey)] ?? config.loreEntryOverrides?.[loreSourceKey(source, path, fp)];
+		return disabled.has(fp) && override !== true ? { ...entry, enabled: false } : entry;
+	});
+}
+
 /**
- * 增删停用清单（`lorebook_toggle` 与 REST `/api/lorebook/toggle` 共用同一套语义）。
+ * 增删旧的全局停用清单（`lorebook_toggle` 工具语义；面板 REST 按明确来源写原生状态）。
  * 返回**去重后的新清单**；空清单由调用方决定是否从 config 里删键。
  *
  * ⚠ 这是 M-C2 协议禁用所用的同一条通道（TOOLING M-D2 明示不得另起一套）——
@@ -58,6 +78,7 @@ function asStringArray(v: unknown): string[] {
  */
 export function normalizeEntries(entries: unknown): LorebookEntry[] {
 	let list: Record<string, unknown>[] = [];
+	const rawRows = entries && typeof entries === "object" ? Object.entries(entries).filter(([, value]) => value && typeof value === "object") : [];
 	if (Array.isArray(entries)) {
 		list = entries.filter((e): e is Record<string, unknown> => !!e && typeof e === "object");
 	} else if (entries && typeof entries === "object") {
@@ -76,6 +97,7 @@ export function normalizeEntries(entries: unknown): LorebookEntry[] {
 		const comment = typeof e.comment === "string" && e.comment ? e.comment : typeof e.name === "string" ? e.name : "";
 		return {
 			uid,
+			entryKey: rawRows[i]?.[0],
 			keys,
 			secondaryKeys: secondary,
 			comment,
@@ -86,6 +108,12 @@ export function normalizeEntries(entries: unknown): LorebookEntry[] {
 			order,
 		};
 	});
+}
+
+/** 管理面板保留原始行键；不把可能重复的 uid/正文当成一本书内的唯一行身份。 */
+export function normalizeEntriesWithKeys(entries: unknown): Array<LorebookEntry & { entryKey: string }> {
+	const rows = entries && typeof entries === "object" ? Object.entries(entries).filter(([, value]) => value && typeof value === "object") : [];
+	return normalizeEntries(rows.map(([, value]) => value)).map((entry, index) => ({ ...entry, entryKey: rows[index][0] }));
 }
 
 /** 从 ST 世界书 JSON 文件加载（{ entries: { uid: {...} } }） */
@@ -135,7 +163,7 @@ export function setMountedLorebooks<T extends { lorebook?: string; lorebooks?: s
 	return next;
 }
 
-/** 可写回源文件的字段（enabled 仍优先走 config.disabledLore 用户覆盖） */
+/** 可写回源文件的字段（面板启停写 enabled/disable，兼容旧全局 disabledLore 覆盖） */
 export interface LoreEntryPatch {
 	constant?: boolean;
 	order?: number;
@@ -158,12 +186,25 @@ export function patchLorebookFileEntry(
 	patch: LoreEntryPatch,
 ): { entry: LorebookEntry; newFingerprint: string } | null {
 	const json = readJsonFile(path) as Record<string, unknown>;
+	const result = patchLorebookRawEntry(json, fingerprint, patch);
+	if (result) writeFileSync(path, `${JSON.stringify(json, null, "\t")}\n`, "utf8");
+	return result;
+}
+
+/** 对世界书原始对象打补丁；调用方负责写回独立书或卡内 character_book。 */
+export function patchLorebookRawEntry(
+	json: Record<string, unknown>,
+	fingerprint: string,
+	patch: LoreEntryPatch,
+	entryKey?: string,
+): { entry: LorebookEntry; newFingerprint: string } | null {
 	const raw = json.entries;
 	if (raw == null) return null;
 
-	const applyToRaw = (e: Record<string, unknown>): Record<string, unknown> | null => {
+	const applyToRaw = (e: Record<string, unknown>, key: string): Record<string, unknown> | null => {
+		if (entryKey !== undefined && entryKey !== key) return null;
 		const content = typeof e.content === "string" ? e.content : "";
-		if (loreFingerprint(content) !== fingerprint) return null;
+		if (loreFingerprint(content.replace(/\r\n/g, "\n")) !== fingerprint) return null;
 		const next = { ...e };
 		if (patch.constant !== undefined) next.constant = patch.constant;
 		if (patch.order !== undefined) {
@@ -203,9 +244,9 @@ export function patchLorebookFileEntry(
 	let newFp = fingerprint;
 
 	if (Array.isArray(raw)) {
-		const list = raw.map((item) => {
-			if (!item || typeof item !== "object") return item;
-			const patched = applyToRaw(item as Record<string, unknown>);
+		const list = raw.map((item, index) => {
+			if (found || !item || typeof item !== "object") return item;
+			const patched = applyToRaw(item as Record<string, unknown>, String(index));
 			if (!patched) return item;
 			const norm = normalizeEntries([patched])[0];
 			found = norm;
@@ -220,7 +261,7 @@ export function patchLorebookFileEntry(
 		for (const k of Object.keys(obj)) {
 			const item = obj[k];
 			if (!item || typeof item !== "object") continue;
-			const patched = applyToRaw(item as Record<string, unknown>);
+			const patched = applyToRaw(item as Record<string, unknown>, k);
 			if (!patched) continue;
 			obj[k] = patched;
 			const norm = normalizeEntries([patched])[0];
@@ -235,7 +276,6 @@ export function patchLorebookFileEntry(
 		return null;
 	}
 
-	writeFileSync(path, `${JSON.stringify(json, null, "\t")}\n`, "utf8");
 	return { entry: found, newFingerprint: newFp };
 }
 
@@ -289,25 +329,33 @@ export function setLorebookEntriesEnabledByUid(
  */
 export function deleteLorebookFileEntry(path: string, fingerprint: string): LorebookEntry | null {
 	const json = readJsonFile(path) as Record<string, unknown>;
+	const removed = deleteLorebookRawEntry(json, fingerprint);
+	if (removed) writeFileSync(path, `${JSON.stringify(json, null, "\t")}\n`, "utf8");
+	return removed;
+}
+
+/** 只变更原始 entries，保留书壳与未命中的未知字段。 */
+export function deleteLorebookRawEntry(json: Record<string, unknown>, fingerprint: string, entryKey?: string): LorebookEntry | null {
 	const raw = json.entries;
 	if (raw == null) return null;
 
-	const matches = (e: unknown): e is Record<string, unknown> =>
+	const matches = (e: unknown, key: string): e is Record<string, unknown> =>
+		(entryKey === undefined || entryKey === key) &&
 		!!e &&
 		typeof e === "object" &&
 		typeof (e as Record<string, unknown>).content === "string" &&
-		loreFingerprint((e as Record<string, unknown>).content as string) === fingerprint;
+		loreFingerprint(((e as Record<string, unknown>).content as string).replace(/\r\n/g, "\n")) === fingerprint;
 
 	let removed: LorebookEntry | null = null;
 
 	if (Array.isArray(raw)) {
-		const idx = raw.findIndex(matches);
+		const idx = raw.findIndex((item, index) => matches(item, String(index)));
 		if (idx < 0) return null;
 		removed = normalizeEntries([raw[idx]])[0];
 		json.entries = [...raw.slice(0, idx), ...raw.slice(idx + 1)];
 	} else if (raw && typeof raw === "object") {
 		const obj = { ...(raw as Record<string, unknown>) };
-		const key = Object.keys(obj).find((k) => matches(obj[k]));
+		const key = Object.keys(obj).find((k) => matches(obj[k], k));
 		if (key === undefined) return null;
 		removed = normalizeEntries([obj[key]])[0];
 		delete obj[key];
@@ -316,7 +364,6 @@ export function deleteLorebookFileEntry(path: string, fingerprint: string): Lore
 		return null;
 	}
 
-	writeFileSync(path, `${JSON.stringify(json, null, "\t")}\n`, "utf8");
 	return removed;
 }
 

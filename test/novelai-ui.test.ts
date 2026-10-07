@@ -7,5 +7,8 @@ test("NovelAI UI：图片槽挂载后自动生成，并以全局队列保证开�
 	assert.match(source, /NOVELAI_MIN_START_GAP_MS\s*=\s*10_000/);
 	assert.match(source, /let novelAiQueue/);
 	assert.match(source, /await enqueueNovelAi/);
-	assert.match(source, /useEffect\(\(\) => \{[\s\S]*?apiGet<\{ src: string \| null \}>[\s\S]*?else if \(alive\) void generate\(\)/);
+	assert.match(source, /useEffect\(\(\) => \{[\s\S]*?apiGet<\{ src: string \| null \}>[\s\S]*?else if \(alive && !readOnly\) void generate\(\)/);
+	assert.match(source, /createContext\(false\)/);
+	assert.match(source, /if \(readOnly \|\| running\.current\) return/);
+	assert.match(source, /nai-readonly-note/);
 });

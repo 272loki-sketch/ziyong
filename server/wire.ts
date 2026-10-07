@@ -1,3 +1,4 @@
+import { presentationDeliveryView, type PresentationDeliveryView } from "../src/stage/agent-presentation.ts";
 /**
  * wire 协议：Web 前端与 server 之间的自有消息格式（PLAN-PHASE3 §3/§4）。
  *
@@ -8,6 +9,7 @@
  * 结构块（thinking/toolCall）的丢弃，绝不改写正文字符。
  */
 
+import { modelDiagnosticsView, type ModelAttemptDiagnostic } from "../src/stage/model-failure.ts";
 import {
 	extractScaffoldThinking,
 	prepareDisplayText,
@@ -15,6 +17,7 @@ import {
 	type DisplaySkin,
 } from "../src/postprocess.ts";
 import { hasDepthLimits } from "../src/cardfront.ts";
+import { generationWorkflowView, isGenerationMode, type GenerationMode, type GenerationWorkflow } from "../src/stage/generation-mode.ts";
 import { projectTurnPerformance, type TurnPerformance } from "../src/stage/performance.ts";
 export type WireTurnPerformance = TurnPerformance;
 import { isBackstageText } from "../src/stance.ts";
@@ -112,6 +115,10 @@ export interface WireBeatWorkflow {
 }
 
 export interface WireMsg {
+	modelDiagnostics?: ModelAttemptDiagnostic[];
+	generationMode?: GenerationMode;
+	generationWorkflow?: GenerationWorkflow;
+	presentationDelivery?: PresentationDeliveryView;
 	/** 已 flush 的用户输入 ID，用于 ACK 丢失后的 hello 对账。 */
 	messageId?: string;
 	channel: WireChannel;
@@ -297,6 +304,7 @@ export type ServerFrame =
 			sessionId: string;
 			/** Reliable prompt ACK/history reconciliation capability; absent on legacy hosts. */
 			deliveryProtocol?: 1;
+			generationMode?: GenerationMode;
 			streaming?: boolean;
 			charName: string;
 			userName: string;
@@ -346,7 +354,7 @@ export type ServerFrame =
 	| { type: "stats"; stats: WireStats }
 	| { type: "notify"; level: "info" | "warning" | "error"; text: string }
 	| { type: "compaction"; state: "start" | "end"; ok?: boolean }
-	| { type: "sessions"; list: WireSessionInfo[] }
+	| { type: "sessions"; sessionId?: string; list: WireSessionInfo[] }
 	/** 剧情决策询问（ask_director 停笔）：前端渲染选择卡，等用户应答 */
 	| { type: "choice"; id: string; question: string; options: string[]; placeholder?: string }
 	/** 询问已决（本端应答成功 / 他端先答 / 超时/中止）：前端把未决卡收敛成留痕态 */
@@ -369,7 +377,7 @@ export type ServerFrame =
 			sessionPath?: string;
 	  }
 	/** 助手历史列表（已按当前角色卡过滤） */
-	| { type: "assistant_sessions"; list: AssistantSessionInfo[] }
+	| { type: "assistant_sessions"; sessionId?: string; list: AssistantSessionInfo[] }
 	| { type: "assistant_message"; message: AssistantMsg }
 	| { type: "assistant_delta"; kind: "text" | "thinking"; delta: string }
 	| { type: "assistant_state"; state: "start" | "end" }
@@ -395,7 +403,7 @@ export interface AssistantSessionInfo {
 /** Client → Server 帧 */
 export type ClientFrame =
 	/** 新前端必填目标和 ID；无二者仅留给 legacy。斜杠命令不自动重试。 */
-	| { type: "prompt"; text: string; sessionId?: string; messageId?: string }
+	| { type: "prompt"; text: string; sessionId?: string; messageId?: string; generationMode?: GenerationMode }
 	| { type: "abort" }
 	/**
 	 * 重新生成最后一轮。
@@ -690,6 +698,10 @@ export function toWireMsg(m: unknown, names: WireNames, opts?: ToWireOpts): Wire
 		return {
 			channel,
 			name: names.charName,
+			...(modelDiagnosticsView((msg.details as Record<string,unknown>|undefined)?.rpModelDiagnostics)?.length ? {modelDiagnostics:modelDiagnosticsView((msg.details as Record<string,unknown>).rpModelDiagnostics)} : {}),
+			...(isGenerationMode((msg.details as Record<string, unknown> | undefined)?.rpGenerationMode) ? { generationMode: (msg.details as Record<string, unknown>).rpGenerationMode as GenerationMode } : {}),
+			...(presentationDeliveryView((msg.details as Record<string, unknown> | undefined)?.rpPresentationDelivery) ? { presentationDelivery: presentationDeliveryView((msg.details as Record<string, unknown>).rpPresentationDelivery) } : {}),
+			...(generationWorkflowView((msg.details as Record<string, unknown> | undefined)?.rpGenerationWorkflow) ? { generationWorkflow: generationWorkflowView((msg.details as Record<string, unknown>).rpGenerationWorkflow) } : {}),
 			text: body,
 			...(thinking ? { thinking } : {}),
 			...(timeline ? { timeline } : {}),

@@ -26,7 +26,7 @@ test("卡前端变量桥：rp-state 投影为学生证、班级终端和学生�
 	}, "测试玩家");
 	assert.equal(variables.stat_data.学生证.姓名, "测试玩家");
 	assert.equal(variables.stat_data.学生证.当前地点, "公交车内");
-	assert.equal(variables.stat_data.班级终端.班级排名.D班.班级点数, 1000);
+	assert.equal(variables.stat_data.班级终端.班级排名.D班.班级点数, null, "未记录的点数不由平台伪造1000");
 	assert.equal(variables.stat_data.学生系统.女.堀北铃音.好感度, 3);
 });
 
@@ -86,4 +86,9 @@ test("梨园原生日历：投影同时保留相邻月，使跨月事件可导�
 	const may = calendar.months?.find((month) => month.month === 5)!;
 	assert.equal(may.days[0]?.events[0]?.title, "连续假期");
 	assert.equal(may.days[2]?.events[0]?.dayIndex, 5);
+});
+
+
+test("只读变量不编造年龄/一年级/点数和班级排名，真实零值不被默认值覆盖",()=>{
+ const state={time:"",location:"",characters:{},inventory:[],flags:{个人点数:"0"},plot_threads:[]};const v=projectTavernVariables(state,"学生");assert.equal(v.stat_data.学生证.个人点数,0);assert.equal(v.stat_data.学生证.年龄,null);assert.equal(v.stat_data.学生证.所属年级,"未记录");assert.equal(v.stat_data.班级终端.班级排名.A班.班级点数,null);assert.equal(v.stat_data.班级终端.班级排名.A班.排名,"未记录");
 });

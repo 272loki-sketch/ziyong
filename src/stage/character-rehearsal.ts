@@ -48,7 +48,7 @@ export function buildCharacterRehearsalPrompt(input: {
 	plotAdaptation?: string;
 }): { systemPrompt: string; userText: string } {
 	return {
-		systemPrompt: `你是梨园正文生成前的“单角色排演 agent”。你只负责一个角色在当前拍的行为逻辑预演，不能写完整正文，不能替用户决定行动，不能修改世界状态，也不能替其他角色拍板。必须严格贴合角色卡和世界书；如果设定没有证据，明确写不确定，不要脑补成事实。\n\n请分析这个角色此刻的目标、情绪、主动动作、说话意图、可能说出的短句、知情边界、误读和绝不会做的事。possibleLines 只能是少量对白意图示例，不是要直接复制进正文的台词。只返回 JSON，不要 Markdown：{"objective":"","currentEmotion":"","likelyActions":[],"dialogueIntent":"","possibleLines":[],"knowledgeBoundary":[],"misreadings":[],"wontDo":[]}`, 
+		systemPrompt: `你是梨园正文生成前的“单角色排演 agent”。你只负责一个角色在当前拍的行为逻辑预演，不能写完整正文，不能修改世界状态，也不能替其他角色拍板。必须严格贴合角色卡和世界书；如果设定没有证据，明确写不确定，不要脑补成事实。\n\n请分析这个角色此刻的目标、情绪、主动动作、说话意图、可能说出的短句、知情边界、误读和绝不会做的事。possibleLines 只能是少量对白意图示例，不是要直接复制进正文的台词。只返回 JSON，不要 Markdown：{"objective":"","currentEmotion":"","likelyActions":[],"dialogueIntent":"","possibleLines":[],"knowledgeBoundary":[],"misreadings":[],"wontDo":[]}`,
 		userText: JSON.stringify({
 			target_character: { name: input.character.name, role: input.role, description: clipPromptText(input.character.description, 7000), personality: clipPromptText(input.character.personality, 6000), scenario: clipPromptText(input.character.scenario, 4000), dialogue_examples: clipPromptText(input.character.mesExample, 3000) },
 			current_character_state: input.characterState ?? null,
@@ -83,7 +83,7 @@ export function parseCharacterRehearsal(value: unknown, name: string, role: Char
 
 export function formatCharacterRehearsals(items: CharacterRehearsal[]): string {
 	if (!items.length) return "";
-	return `【逐角色排演参考】\n以下是每个相关角色独立排演出的候选行为，不是事实、不是隐藏剧情，也不是必须照抄的正文。角色卡、当前正文和世界状态优先；不要替用户决定行动。\n${items.map((item) => [
+	return `【逐角色排演参考】\n以下是每个相关角色独立排演出的候选行为，不是事实、不是隐藏剧情，也不是必须照抄的正文。角色卡、当前正文和世界状态优先；\n${items.map((item) => [
 		`## ${item.name}`,
 		item.objective && `目标：${item.objective}`,
 		item.currentEmotion && `情绪：${item.currentEmotion}`,

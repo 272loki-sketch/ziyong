@@ -2574,6 +2574,30 @@ input.panel-search.num {
 	color: var(--accent);
 	font-weight: 600;
 }
+.generation-mode-control {
+	width: fit-content;
+	max-width: 100%;
+}
+.generation-mode-option {
+	white-space: nowrap;
+}
+.composer-mode-row {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+	margin-bottom: 4px;
+}
+.composer-mode-row .field-hint {
+	margin: 0;
+}
+.composer-mode-row .generation-mode-control {
+	margin: 0;
+}
+.generation-mode-compact .seg {
+	padding: 4px 10px;
+	font-size: 11.5px;
+}
 .seg:disabled {
 	opacity: 0.6;
 	cursor: default;
@@ -7721,3 +7745,35 @@ body.planning-open { overflow: hidden; }
 .planning-memory-diff-arc { color: var(--accent); font-size: 10px; }
 .planning-memory-diff-reason { color: var(--text-faint); font-size: 9px; }
 .planning-memory-diff-time { color: var(--text-faint); font-size: 10px; white-space: nowrap; }
+
+/* generationMode 与安全阶段回执：降级/失败/跳过显式区分，绝不折算为通过。 */
+.generation-mode-badge { letter-spacing: 0; }
+.generation-mode-badge.direct { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, var(--hairline-strong)); }
+.generation-mode-badge.director { color: var(--text-soft); }
+.generation-mode-stage-badge { margin: 6px 0; font-size: 11px; color: var(--text-faint); }
+.generation-workflow-card { border-color: color-mix(in srgb, var(--accent) 20%, var(--hairline)); }
+.generation-workflow-card > summary:before { background: var(--text-faint); box-shadow: 0 0 0 3px var(--surface-dim); }
+.generation-workflow-overall { font-size: 10.5px; border: 1px solid var(--hairline); border-radius: 999px; padding: 1px 6px; white-space: nowrap; }
+.generation-workflow-overall.success { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, var(--hairline)); }
+.generation-workflow-overall.degraded,
+.generation-workflow-overall.failed { color: #a65d43; border-color: color-mix(in srgb, #a65d43 50%, var(--hairline)); }
+.generation-workflow-overall.partial { color: var(--text-faint); }
+.generation-workflow-stages { display: grid; gap: 2px; padding-top: 8px; }
+.generation-workflow-stage { display: grid; grid-template-columns: minmax(7em, auto) auto minmax(0, 1fr); gap: 8px; align-items: baseline; padding: 6px 0; border-bottom: 1px dashed var(--hairline); font-size: 12px; }
+.generation-workflow-stage > strong { color: var(--text-strong); }
+.generation-workflow-stage > span:last-child { color: var(--text-faint); text-align: right; }
+.generation-workflow-status.success { color: var(--accent); }
+.generation-workflow-status.degraded,
+.generation-workflow-status.failed { color: #a65d43; font-weight: 700; }
+.generation-workflow-status.skipped { color: var(--text-faint); }
+.generation-workflow-fallback { margin-top: 8px; font-size: 11.5px; font-weight: 650; }
+.generation-workflow-fallback.degraded { color: #a65d43; }
+.generation-workflow-fallback.clear { color: var(--text-faint); }
+@media (max-width: 620px) {
+	.generation-workflow-stage { grid-template-columns: minmax(0, 1fr) auto; }
+	.generation-workflow-stage > span:last-child { grid-column: 1 / -1; text-align: left; }
+}
+
+/* 卡内书是独立来源入口：窄屏不把卡名/自动加载状态压成不可见的一行。 */
+.book-embedded .book-pick { flex-wrap: wrap; }
+.book-embedded .book-name { flex-basis: 100%; white-space: normal; overflow-wrap: anywhere; }

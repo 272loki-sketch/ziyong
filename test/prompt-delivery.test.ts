@@ -9,7 +9,7 @@ class Storage implements OutboxStorage {
 	getItem(key: string): string | null { return this.values.get(key) ?? null; }
 	setItem(key: string, value: string): void { if (this.fail) throw new Error("QuotaExceededError"); this.values.set(key, value); }
 }
-const prompt = (id = "m1", sessionId = "story-a", text = "走进庭院"): ReliablePrompt => ({ type: "prompt", text, messageId: id, sessionId });
+const prompt = (id = "m1", sessionId = "story-a", text = "走进庭院"): ReliablePrompt => ({ type: "prompt", text, messageId: id, sessionId, ...(!text.trimStart().startsWith("/") ? { generationMode: "director" as const } : {}) });
 
 test("WS 改密：旧 token / 设置前匿名连接同时移除，广播及逐帧校验均拒绝", () => {
 	let tokens: Set<string> | undefined;

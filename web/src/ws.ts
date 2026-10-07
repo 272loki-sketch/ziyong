@@ -1,8 +1,8 @@
 /** 同源 WS；连接重试与投递确认分离。命令不自动重放，普通输入先写本机 outbox 再发。 */
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-	buildWireUrl, canOpenWire, nextRetryMs, shouldWakeFromOnline, shouldWakeFromVisibility, WS_RETRY_INITIAL_MS,
-	PromptOutbox, DeliverySessionGate, isCommandPrompt, legacyDeliveryWarning, shouldRetryUnacknowledged, newMessageId, type OutboxItem, type OutboxStorage, type ReliablePrompt, type SendResult,
+	buildWireUrl, canOpenWire, controlDeliveryType, isSafeReadRequest, isWireHandshakeStalled, nextRetryMs, safeReadRequestLane, shouldWakeFromOnline, shouldWakeFromVisibility, WS_HELLO_TIMEOUT_MS, WS_RETRY_INITIAL_MS, WS_SESSIONS_MIN_INTERVAL_MS,
+	PromptOutbox, DeliverySessionGate, SafeReadRequestQueue, isCommandPrompt, legacyDeliveryWarning, shouldRetryUnacknowledged, newMessageId, type OutboxItem, type OutboxStorage, type ReliablePrompt, type SafeReadRequestLane, type SafeReadRequestType, type SendResult,
 } from "./ws-lifecycle.ts";
 import type { ClientFrame, ServerFrame } from "./wire.ts";
 export type ConnState = "connecting" | "open" | "closed";
@@ -20,12 +20,44 @@ export function useWire(onFrame: (frame: ServerFrame) => void, onState: (s: Conn
 	const [outbox, setOutbox] = useState<OutboxItem[]>(() => boxRef.current!.items);
 	const [storageError, setStorageError] = useState<string | null>(() => boxRef.current!.error);
 	const gateRef = useRef(new DeliverySessionGate());
+	const safeReadsRef = useRef(new SafeReadRequestQueue());
+	const helloLanesRef = useRef(new Set<SafeReadRequestLane>());
+	const lastReadSentAtRef = useRef(new Map<SafeReadRequestType, number>());
+	const safeReadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const flushSafeReadsRef = useRef<((lane: SafeReadRequestLane) => void) | null>(null);
 	const targetsRef = { current: gateRef.current.targets };
 	const readyRef = { current: gateRef.current.ready };
 	const sentRef = { current: gateRef.current.sent };
 	const onFrameRef = useRef(onFrame), onStateRef = useRef(onState);
 	onFrameRef.current = onFrame; onStateRef.current = onState;
 	const refresh = useCallback(() => { setOutbox(boxRef.current!.items); setStorageError(boxRef.current!.error); }, []);
+	const flushSafeReads = useCallback((lane: SafeReadRequestLane) => {
+		const ws = wsRef.current;
+		if (!ws || ws.readyState !== WebSocket.OPEN) return;
+		if (!helloLanesRef.current.has(lane)) return;
+		for (const type of safeReadsRef.current.pendingFor(lane)) {
+			const lastSent = lastReadSentAtRef.current.get(type) ?? 0;
+			const delay = type === "sessions" ? Math.max(0, WS_SESSIONS_MIN_INTERVAL_MS - (Date.now() - lastSent)) : 0;
+			if (delay > 0) {
+				if (!safeReadTimerRef.current) safeReadTimerRef.current = setTimeout(() => {
+					safeReadTimerRef.current = null;
+					flushSafeReadsRef.current?.("story");
+					flushSafeReadsRef.current?.("assistant");
+				}, delay);
+				continue;
+			}
+			if (!safeReadsRef.current.dispatch(type)) continue;
+			try {
+				ws.send(JSON.stringify({ type }));
+				lastReadSentAtRef.current.set(type, Date.now());
+			} catch {
+				safeReadsRef.current.fail(type);
+				ws.close();
+				break;
+			}
+		}
+	}, []);
+	flushSafeReadsRef.current = flushSafeReads;
 	const flush = useCallback((type: ReliablePrompt["type"]) => {
 		const ws = wsRef.current, target = targetsRef.current[type];
 		if (!ws || ws.readyState !== WebSocket.OPEN || !target || !readyRef.current.has(type)) return;
@@ -46,26 +78,63 @@ export function useWire(onFrame: (frame: ServerFrame) => void, onState: (s: Conn
 	useEffect(() => {
 		let closed = false, retryMs = WS_RETRY_INITIAL_MS;
 		let timer: ReturnType<typeof setTimeout> | undefined;
+		let handshakeTimer: ReturnType<typeof setTimeout> | undefined;
 		const warnedLegacy = new Set<string>();
 		const clearRetryTimer = () => { if (timer) clearTimeout(timer); timer = undefined; };
+		const clearHandshakeTimer = () => { if (handshakeTimer) clearTimeout(handshakeTimer); handshakeTimer = undefined; };
 		const connect = () => {
 			clearRetryTimer();
 			if (closed || !canOpenWire(wsRef.current?.readyState)) return;
-			onStateRef.current("connecting"); readyRef.current.clear(); sentRef.current.clear();
+			onStateRef.current("connecting");
+			gateRef.current.ready.clear(); gateRef.current.reliable.clear(); gateRef.current.sent.clear();
+			helloLanesRef.current.clear(); safeReadsRef.current.disconnect(); lastReadSentAtRef.current.clear();
+			if (safeReadTimerRef.current) clearTimeout(safeReadTimerRef.current);
+			safeReadTimerRef.current = null;
 			const ws = new WebSocket(buildWireUrl(location.protocol, location.host)); wsRef.current = ws;
+			let receivedStoryHello = false;
+			const watchdog = setTimeout(() => {
+				if (closed || wsRef.current !== ws || !isWireHandshakeStalled(ws.readyState, receivedStoryHello)) return;
+				// Retire even a stuck CLOSING socket so the normal bounded-backoff loop can reconnect.
+				clearThisHandshakeTimer();
+				wsRef.current = null;
+				gateRef.current.ready.clear(); gateRef.current.reliable.clear(); gateRef.current.sent.clear();
+				helloLanesRef.current.clear(); safeReadsRef.current.disconnect();
+				lastReadSentAtRef.current.clear();
+				boxRef.current!.disconnect(); refresh();
+				ws.close(); onStateRef.current("closed");
+				timer = setTimeout(connect, retryMs); retryMs = nextRetryMs(retryMs);
+			}, WS_HELLO_TIMEOUT_MS);
+			handshakeTimer = watchdog;
+			const clearThisHandshakeTimer = () => {
+				clearTimeout(watchdog);
+				if (handshakeTimer === watchdog) handshakeTimer = undefined;
+			};
 			ws.onopen = () => {
 				if (closed || wsRef.current !== ws) return;
-				retryMs = WS_RETRY_INITIAL_MS; onStateRef.current("open"); // 必须等 hello，不能此处冲刷
+				// Remain connecting until the primary hello supplies a session.
 			};
 			ws.onmessage = (ev) => {
 				if (closed || wsRef.current !== ws) return;
 				let frame: ServerFrame;
 				try { frame = JSON.parse(String(ev.data)) as ServerFrame; } catch { return; }
 				if (frame.type === "hello" || frame.type === "assistant_hello") {
+					if (frame.type === "hello" && frame.sessionId) onStateRef.current("open");
 					const type = frame.type === "hello" ? "prompt" : "assistant_prompt";
+					const lane: SafeReadRequestLane = frame.type === "hello" ? "story" : "assistant";
 					const reliableProtocol = frame.deliveryProtocol === 1;
+					helloLanesRef.current.add(lane);
 					gateRef.current.hello(type, frame.sessionId, frame.deliveryProtocol);
-					if (!frame.sessionId) { onFrameRef.current(frame); return; }
+					if (frame.type === "hello" && frame.sessionId) {
+						receivedStoryHello = true;
+						retryMs = WS_RETRY_INITIAL_MS;
+						clearThisHandshakeTimer();
+					}
+					if (frame.type === "assistant_hello") safeReadsRef.current.response("assistant_sync");
+					if (!frame.sessionId) {
+						onFrameRef.current(frame);
+						flushSafeReads(lane);
+						return;
+					}
 					const legacyKey = `${type}:${frame.sessionId ?? ""}`;
 					if (!reliableProtocol && !warnedLegacy.has(legacyKey)) {
 						warnedLegacy.add(legacyKey);
@@ -78,14 +147,34 @@ export function useWire(onFrame: (frame: ServerFrame) => void, onState: (s: Conn
 						sentRef.current.delete(m.messageId);
 						onFrameRef.current({ type: "prompt_ack", messageId: m.messageId, sessionId: frame.sessionId, status: "accepted" });
 					}
-					refresh(); flush(type); return;
+					refresh();
+					flush(type);
+					if (frame.sessionId) flushSafeReads(lane);
+					return;
 				}
 				if (frame.type === "prompt_ack") { sentRef.current.delete(frame.messageId); boxRef.current!.ack(frame.messageId, frame.sessionId, frame.status, frame.reason); refresh(); }
-				onFrameRef.current(frame);
+				const boundReadTarget = (frame as {sessionId?:string}).sessionId;
+				const foreignRead = frame.type === "sessions" && !!boundReadTarget && boundReadTarget !== targetsRef.current.prompt;
+				const foreignAssistantRead = frame.type === "assistant_sessions" && !!boundReadTarget && boundReadTarget !== targetsRef.current.assistant_prompt;
+				const staleReadResult = frame.type === "sessions"
+					? safeReadsRef.current.response("sessions", true) === "stale"
+					: frame.type === "assistant_sessions"
+						? safeReadsRef.current.response("assistant_sessions", true) === "stale"
+						: false;
+				if (!staleReadResult && !foreignRead && !foreignAssistantRead) onFrameRef.current(frame);
+				if (frame.type === "sessions") flushSafeReads("story");
+				if (frame.type === "assistant_sessions") flushSafeReads("assistant");
 			};
 			ws.onclose = (ev) => {
+				clearThisHandshakeTimer();
 				const current = wsRef.current === ws;
-				if (current) { wsRef.current = null; readyRef.current.clear(); sentRef.current.clear(); boxRef.current!.disconnect(); refresh(); }
+				if (current) {
+					wsRef.current = null; gateRef.current.ready.clear(); gateRef.current.reliable.clear(); gateRef.current.sent.clear();
+					helloLanesRef.current.clear(); safeReadsRef.current.disconnect(); lastReadSentAtRef.current.clear();
+					if (safeReadTimerRef.current) clearTimeout(safeReadTimerRef.current);
+					safeReadTimerRef.current = null;
+					boxRef.current!.disconnect(); refresh();
+				}
 				if (closed || !current) return;
 				if (ev.code === 4401) { location.reload(); return; } // outbox 跨 reload 保留
 				onStateRef.current("closed"); timer = setTimeout(connect, retryMs); retryMs = nextRetryMs(retryMs);
@@ -97,11 +186,13 @@ export function useWire(onFrame: (frame: ServerFrame) => void, onState: (s: Conn
 		const online = () => { if (shouldWakeFromOnline(closed, wsRef.current?.readyState)) wake(); };
 		connect(); window.addEventListener("online", online); document.addEventListener("visibilitychange", visibility);
 		const ackRetry = window.setInterval(() => {
+			const stalledRead = (["sessions","assistant_sessions","assistant_sync"] as SafeReadRequestType[]).some(type=>safeReadsRef.current.isInFlight(type)&&Date.now()-(lastReadSentAtRef.current.get(type)??Date.now())>20000);
+			if(stalledRead){wsRef.current?.close();return;}
 			for (const item of boxRef.current!.items) if (item.state === "pending" && shouldRetryUnacknowledged(item.frame.type) && !isCommandPrompt(item.frame.text)) sentRef.current.delete(item.frame.messageId);
 			flush("prompt");
 		}, 15_000);
-		return () => { closed = true; clearRetryTimer(); window.clearInterval(ackRetry); window.removeEventListener("online", online); document.removeEventListener("visibilitychange", visibility); const ws = wsRef.current; wsRef.current = null; ws?.close(); };
-	}, [flush, refresh]);
+		return () => { closed = true; clearRetryTimer(); clearHandshakeTimer(); safeReadsRef.current.disconnect(); if (safeReadTimerRef.current) clearTimeout(safeReadTimerRef.current); safeReadTimerRef.current = null; window.clearInterval(ackRetry); window.removeEventListener("online", online); document.removeEventListener("visibilitychange", visibility); const ws = wsRef.current; wsRef.current = null; ws?.close(); };
+	}, [flush, flushSafeReads, refresh]);
 	const send = useCallback((frame: ClientFrame): SendResult => {
 		const refuse = (reason: string, messageId?: string): SendResult => { onFrameRef.current({ type: "notify", level: "warning", text: reason }); return { accepted: false, reason, ...(messageId ? { messageId } : {}) }; };
 		const ws = wsRef.current;
@@ -133,10 +224,16 @@ export function useWire(onFrame: (frame: ServerFrame) => void, onState: (s: Conn
 			} else if (gateRef.current.canDeliverReliably(frame.type)) flush(frame.type);
 			return { ...result, sessionId: target };
 		}
-		if (ws?.readyState !== WebSocket.OPEN || !readyRef.current.has("prompt")) return refuse("当前未连接/尚未对齐会话，此操作未发送，请连接后重试");
+		if (isSafeReadRequest(frame.type)) {
+			const lane = safeReadRequestLane(frame.type);
+			const queued = safeReadsRef.current.enqueue(frame.type);
+			flushSafeReads(lane);
+			return { accepted: true, ...(queued || safeReadsRef.current.hasPending(frame.type) || safeReadsRef.current.isInFlight(frame.type) ? { queued: true } : {}) };
+		}
+		if (ws?.readyState !== WebSocket.OPEN || !readyRef.current.has(controlDeliveryType(frame.type))) return refuse("当前未连接/尚未对齐会话，此操作未发送，请连接后重试");
 		try { ws.send(JSON.stringify(frame)); return { accepted: true }; }
 		catch { return refuse("发送失败，此操作未确认，请连接后检查并重试"); }
-	}, [flush, refresh]);
+	}, [flush, flushSafeReads, refresh]);
 	const discard = useCallback((messageId: string) => { boxRef.current!.discard(messageId); refresh(); }, [refresh]);
 	return { send, outbox, storageError, discard };
 }

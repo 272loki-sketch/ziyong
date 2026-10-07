@@ -1,5 +1,72 @@
+import { isGenerationMode, resolveGenerationMode, type GenerationMode } from "./generation-mode.ts";
+
 export const WS_RETRY_INITIAL_MS = 1_500;
 export const WS_RETRY_MAX_MS = 10_000;
+export const WS_HELLO_TIMEOUT_MS = 10_000;
+export const WS_SESSIONS_MIN_INTERVAL_MS = 1_000;
+
+export type SafeReadRequestType = "sessions" | "assistant_sessions" | "assistant_sync";
+export type SafeReadRequestLane = "story" | "assistant";
+const SAFE_READ_LANES: Record<SafeReadRequestType, SafeReadRequestLane> = {
+	sessions: "story",
+	assistant_sessions: "assistant",
+	assistant_sync: "assistant",
+};
+
+/** Exact allowlist: all other client frames remain immediate-only controls/writes. */
+export function isSafeReadRequest(type: string): type is SafeReadRequestType {
+	return Object.hasOwn(SAFE_READ_LANES, type);
+}
+
+export function safeReadRequestLane(type: SafeReadRequestType): SafeReadRequestLane {
+	return SAFE_READ_LANES[type];
+}
+
+/** Non-read assistant frames require assistant alignment; all other controls require story alignment. */
+export function controlDeliveryType(type: string): "prompt" | "assistant_prompt" {
+	return type.startsWith("assistant_") ? "assistant_prompt" : "prompt";
+}
+
+/** Dedupe safe reads until a response; only these frames survive a disconnect for retry. */
+export class SafeReadRequestQueue {
+	#pending = new Set<SafeReadRequestType>();
+	#inFlight = new Set<SafeReadRequestType>();
+	enqueue(type: string): boolean {
+		if (!isSafeReadRequest(type) || this.#pending.has(type)) return false;
+		// At most one follow-up refresh is retained while the same read is in flight.
+		this.#pending.add(type);
+		return true;
+	}
+	pendingFor(lane: SafeReadRequestLane): SafeReadRequestType[] {
+		return [...this.#pending].filter((type) => safeReadRequestLane(type) === lane);
+	}
+	dispatch(type: SafeReadRequestType): boolean {
+		if (this.#inFlight.has(type)) return false;
+		if (!this.#pending.delete(type)) return false;
+		this.#inFlight.add(type);
+		return true;
+	}
+	response(type: SafeReadRequestType, allowStaleResult = false): "stale" | "current" | "unsolicited" {
+		if (!this.#inFlight.delete(type)) return "unsolicited";
+		return allowStaleResult && this.#pending.has(type) ? "stale" : "current";
+	}
+	fail(type: SafeReadRequestType): void {
+		if (this.#inFlight.delete(type)) this.#pending.add(type);
+	}
+	disconnect(): void {
+		for (const type of this.#inFlight) this.#pending.add(type);
+		this.#inFlight.clear();
+	}
+	hasPending(type: SafeReadRequestType): boolean { return this.#pending.has(type); }
+	isInFlight(type: SafeReadRequestType): boolean { return this.#inFlight.has(type); }
+	get size(): number { return this.#pending.size + this.#inFlight.size; }
+}
+
+/** Called only when the watchdog expires; CONNECTING and OPEN-without-hello are recoverable. */
+export function isWireHandshakeStalled(readyState: number, receivedStoryHello: boolean): boolean {
+	// The story hello is the primary app session. Assistant hello may be absent on prompt-only hosts.
+	return readyState === WS_CONNECTING || readyState === WS_CLOSING || (readyState === WS_OPEN && !receivedStoryHello);
+}
 
 export const WS_CONNECTING = 0;
 export const WS_OPEN = 1;
@@ -34,7 +101,10 @@ export function shouldQueueFrame(type: string): boolean {
 	return type === "prompt" || type === "assistant_prompt";
 }
 
-export type ReliablePrompt = { type: "prompt" | "assistant_prompt"; text: string; sessionId: string; messageId: string };
+type ReliablePromptBase = { text: string; sessionId: string; messageId: string };
+export type ReliablePrompt =
+	| ({ type: "prompt"; generationMode?: GenerationMode } & ReliablePromptBase)
+	| ({ type: "assistant_prompt" } & ReliablePromptBase);
 export type OutboxItem = { frame: ReliablePrompt; createdAt: number; state: "pending" | "rejected"; dispatched?: boolean; reason?: string };
 export type SendResult = { accepted: true; messageId?: string; sessionId?: string; queued?: boolean } | { accepted: false; reason: string; messageId?: string };
 export const legacyDeliveryWarning = (type: ReliablePrompt["type"]): string =>
@@ -46,6 +116,16 @@ export const OUTBOX_MAX_CHARS = 512_000;
 export const isCommandPrompt = (text: string): boolean => text.trimStart().startsWith("/");
 /** Story submissions have a persisted client ID receipt; assistant submissions do not. */
 export const shouldRetryUnacknowledged = (type: ReliablePrompt["type"]): boolean => type === "prompt";
+
+function normalizeReliablePrompt(frame: ReliablePrompt): ReliablePrompt {
+	if (frame.type === "assistant_prompt") return { type: frame.type, text: frame.text, sessionId: frame.sessionId, messageId: frame.messageId };
+	const { generationMode, ...base } = frame;
+	return isCommandPrompt(frame.text) ? base : { ...base, generationMode: resolveGenerationMode(generationMode) };
+}
+
+function reliablePromptMode(frame: ReliablePrompt): GenerationMode | undefined {
+	return frame.type === "prompt" && !isCommandPrompt(frame.text) ? resolveGenerationMode(frame.generationMode) : undefined;
+}
 
 /** 投递恢复日志，不是第二份正文/Session；只有 accepted ACK 或显式移除才删。 */
 export class PromptOutbox {
@@ -68,11 +148,17 @@ export class PromptOutbox {
 				if (!f || !shouldQueueFrame(f.type) || typeof f.text !== "string" || !f.text.trim() || f.text.length > 256_000 ||
 					typeof f.sessionId !== "string" || !f.sessionId || f.sessionId.length > 256 ||
 					typeof f.messageId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(f.messageId) || ids.has(f.messageId) ||
+					(f.generationMode !== undefined && (f.type !== "prompt" || isCommandPrompt(f.text) || !isGenerationMode(f.generationMode))) ||
 					!Number.isFinite(item.createdAt) || !["pending", "rejected"].includes(item.state) || (item.dispatched !== undefined && typeof item.dispatched !== "boolean")) throw new Error("invalid item");
 				ids.add(f.messageId);
 				const legacyUncertainAssistant = f.type === "assistant_prompt" && item.state === "pending" && item.dispatched === undefined;
 				const dispatchedAssistant = f.type === "assistant_prompt" && item.state === "pending" && item.dispatched === true;
-				this.#items.push({ frame: { type: f.type, text: f.text, sessionId: f.sessionId, messageId: f.messageId }, createdAt: item.createdAt,
+				const decodedFrame: ReliablePrompt = f.type === "prompt"
+					? { type: f.type, text: f.text, sessionId: f.sessionId, messageId: f.messageId, ...(isGenerationMode(f.generationMode) ? { generationMode: f.generationMode } : {}) }
+					: { type: f.type, text: f.text, sessionId: f.sessionId, messageId: f.messageId };
+				// Legacy prose drafts predate the field; use the documented director default.
+				const restoredFrame = normalizeReliablePrompt(decodedFrame);
+				this.#items.push({ frame: restoredFrame, createdAt: item.createdAt,
 					state: isCommandPrompt(f.text) || legacyUncertainAssistant || dispatchedAssistant ? "rejected" : item.state,
 					...(f.type === "assistant_prompt" && item.dispatched !== undefined ? { dispatched: item.dispatched } : {}),
 					...(isCommandPrompt(f.text) ? { reason: "命令不会自动重放；请检查会话后手动重试" } : legacyUncertainAssistant || dispatchedAssistant ? { reason: "助手输入已发送或状态不明但未确认；为避免重复，不会自动重放。请先检查助手历史，再手动重试" } : typeof item.reason === "string" ? { reason: item.reason.slice(0, 300) } : {}) });
@@ -91,29 +177,31 @@ export class PromptOutbox {
 	enqueue(frame: ReliablePrompt, online: boolean): SendResult {
 		if (this.#unreadable) return { accepted: false, reason: this.error! };
 		if (!frame.sessionId || frame.sessionId.length > 256 || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(frame.messageId)) return { accepted: false, reason: "会话目标或消息 ID 无效，输入未发送" };
-		const sameId = this.#items.find((item) => item.frame.messageId === frame.messageId);
-		if (sameId && (sameId.frame.type !== frame.type || sameId.frame.sessionId !== frame.sessionId || sameId.frame.text !== frame.text)) return { accepted: false, reason: "消息 ID 已绑定其他输入，草稿未发送" };
+		const savedFrame = normalizeReliablePrompt(frame);
+		const sameId = this.#items.find((item) => item.frame.messageId === savedFrame.messageId);
+		if (sameId && (sameId.frame.type !== savedFrame.type || sameId.frame.sessionId !== savedFrame.sessionId || sameId.frame.text !== savedFrame.text || reliablePromptMode(sameId.frame) !== reliablePromptMode(savedFrame))) return { accepted: false, reason: "消息 ID 已绑定其他输入，草稿未发送" };
 		if (sameId?.state === "rejected") return { accepted: false, reason: sameId.reason || "该草稿已被拒绝，请确认目标后另行提交", messageId: sameId.frame.messageId };
-		const command = isCommandPrompt(frame.text);
+		const command = isCommandPrompt(savedFrame.text);
 		if (command && !online) {
-			const draft = this.#items.find((item) => item.state === "rejected" && item.frame.type === frame.type && item.frame.sessionId === frame.sessionId && item.frame.text === frame.text);
+			const draft = this.#items.find((item) => item.state === "rejected" && item.frame.type === savedFrame.type && item.frame.sessionId === savedFrame.sessionId && item.frame.text === savedFrame.text);
 			if (draft) return { accepted: false, reason: draft.reason!, messageId: draft.frame.messageId };
 		}
-		const existing = this.#items.find((item) => item.state === "pending" && item.frame.type === frame.type && item.frame.sessionId === frame.sessionId && item.frame.text === frame.text);
+		const existing = this.#items.find((item) => item.state === "pending" && item.frame.type === savedFrame.type && item.frame.sessionId === savedFrame.sessionId && item.frame.text === savedFrame.text && reliablePromptMode(item.frame) === reliablePromptMode(savedFrame));
 		if (existing) return { accepted: true, messageId: existing.frame.messageId, queued: !online };
-		if (frame.text.length > 256_000) return { accepted: false, reason: "输入过长，草稿未发送，请分段发送" };
-		const item: OutboxItem = { frame, createdAt: this.now(), state: command && !online ? "rejected" : "pending",
-			...(frame.type === "assistant_prompt" ? { dispatched: false } : {}),
+		if (savedFrame.text.length > 256_000) return { accepted: false, reason: "输入过长，草稿未发送，请分段发送" };
+		const item: OutboxItem = { frame: savedFrame, createdAt: this.now(), state: command && !online ? "rejected" : "pending",
+			...(savedFrame.type === "assistant_prompt" ? { dispatched: false } : {}),
 			...(command ? { reason: online ? "命令待回执；断线后不会自动重放" : "离线命令未执行；请检查会话后手动重试" } : {}) };
 		if (!this.#commit([...this.#items, item])) return { accepted: false, reason: this.error! };
 		if (command && !online) return { accepted: false, reason: item.reason!, messageId: frame.messageId };
-		return { accepted: true, messageId: frame.messageId, queued: !online };
+		return { accepted: true, messageId: savedFrame.messageId, queued: !online };
 	}
 	recover(frame: ReliablePrompt, reason: string): Extract<SendResult, { accepted: false }> {
 		if (this.#unreadable || frame.text.length > 256_000) return { accepted: false, reason: this.error || reason };
-		if (this.#items.some((item) => item.state === "rejected" && item.frame.type === frame.type && item.frame.sessionId === frame.sessionId && item.frame.text === frame.text)) return { accepted: false, reason };
-		const saved = this.#commit([...this.#items, { frame, createdAt: this.now(), state: "rejected", reason }]);
-		return { accepted: false, reason: saved ? reason : this.error!, ...(saved ? { messageId: frame.messageId } : {}) };
+		const savedFrame = normalizeReliablePrompt(frame);
+		if (this.#items.some((item) => item.state === "rejected" && item.frame.type === savedFrame.type && item.frame.sessionId === savedFrame.sessionId && item.frame.text === savedFrame.text && reliablePromptMode(item.frame) === reliablePromptMode(savedFrame))) return { accepted: false, reason };
+		const saved = this.#commit([...this.#items, { frame: savedFrame, createdAt: this.now(), state: "rejected", reason }]);
+		return { accepted: false, reason: saved ? reason : this.error!, ...(saved ? { messageId: savedFrame.messageId } : {}) };
 	}
 	ack(messageId: string, sessionId: string, status: "accepted" | "rejected", reason?: string): boolean {
 		if (!this.#items.some((item) => item.frame.messageId === messageId && item.frame.sessionId === sessionId)) return false;

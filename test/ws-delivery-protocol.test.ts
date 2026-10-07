@@ -9,7 +9,7 @@ class MemoryStorage implements OutboxStorage {
 	setItem(key: string, value: string): void { assert.equal(key, OUTBOX_KEY); if (this.fail) throw new Error("storage denied"); this.data = value; }
 }
 
-const prompt = (type: "prompt" | "assistant_prompt" = "prompt") => ({ type, sessionId: "session-1", messageId: "msg-1", text: "继续这一幕" });
+const prompt = (type: "prompt" | "assistant_prompt" = "prompt") => ({ type, sessionId: "session-1", messageId: "msg-1", text: "继续这一幕", ...(type === "prompt" ? { generationMode: "director" as const } : {}) });
 
 test("legacy hello with sessionId is not ACK capability: no auto-send/retry, draft remains", () => {
 	const storage = new MemoryStorage(), box = new PromptOutbox(storage), gate = new DeliverySessionGate();

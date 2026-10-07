@@ -411,7 +411,7 @@ export function runWriteTool(
 		const crossScene = !deps.transitionAuthorized && texts.find((t) => CROSS_SCENE_RE.test(t));
 		if (crossScene) {
 			return {
-				text: `未记计划：本拍只能处理用户最新输入所在的当前场景，不能提前跳到「${crossScene}」。删掉跨时间或跨地点的后续，只保留眼前互动与玩家停点。`,
+				text: `未记计划：本拍只能处理用户最新输入所在的当前场景，不能提前跳到「${crossScene}」。删掉跨时间或跨地点的后续，只保留当前场景内有依据的发展。`,
 				activity: "跨场景计划被拦下",
 				ok: false,
 			};
@@ -472,7 +472,7 @@ export function runWriteTool(
 		}
 		if (!deps.transitionAuthorized && CROSS_SCENE_RE.test(content)) {
 			return {
-				text: "正文未收：本拍越过了用户输入所在的当前场景。删掉放学、回教室、体育馆、夜晚或次日等后续，只演眼前互动并把行动权交还用户。",
+				text: "正文未收：本拍越过了用户输入所在的当前场景。删掉放学、回教室、体育馆、夜晚或次日等后续，只演当前场景内有依据的发展。",
 				activity: "正文跨场景被拦下",
 				ok: false,
 			};
@@ -523,7 +523,7 @@ export function runWriteTool(
 		}
 		if (!deps.transitionAuthorized && CROSS_SCENE_RE.test(seg)) {
 			return {
-				text: "本段未受理：本拍只能停留在用户最新输入所在的当前场景。删掉放学、回教室、体育馆、夜晚或次日等后续，改写为眼前人物的即时反应与玩家停点。",
+				text: "本段未受理：本拍只能停留在用户最新输入所在的当前场景。删掉放学、回教室、体育馆、夜晚或次日等后续，改写为当前场景内有依据的发展。",
 				activity: "正文跨场景被拦下",
 				ok: false,
 			};
@@ -552,7 +552,7 @@ export function runWriteTool(
 		if (target && chars < target.min && ws.shortSealRejects < 2) {
 			ws.shortSealRejects++;
 			return {
-				text: `封笔暂缓：当前正文约 ${chars} 字，明确目标约 ${target.min}–${target.max} 字。继续当前场景的既有互动、人物主动性、环境变化或信息交换；不要跳时空、不要替用户行动、不要为凑字数新增无因果事件。`,
+				text: `封笔暂缓：当前正文约 ${chars} 字，明确目标约 ${target.min}–${target.max} 字。继续当前场景的既有互动、人物主动性、环境变化或信息交换；不要跳时空，不为凑字数新增无因果事件。`,
 				activity: `正文篇幅不足，继续展开（${chars}/${target.min} 字）`,
 				ok: false,
 			};

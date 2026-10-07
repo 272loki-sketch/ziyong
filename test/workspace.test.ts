@@ -27,7 +27,7 @@ const deps = (): WorkspaceDeps => ({
 	baseState: defaultState(),
 });
 
-test("writeTools：写侧十件在清单里，beat_plan 列首为落笔前构思、draft_edit 声明批量原子", () => {
+test("writeTools：稿纸九件在清单里，不含共创询问，draft_edit 声明批量原子", () => {
 	const names = writeTools("中文").map((t) => t.name);
 	// 顺序本身就是导流：先构思成清单（beat_plan），再一段一段演（append 在 write 之前）
 	assert.deepEqual(names, [
@@ -40,7 +40,6 @@ test("writeTools：写侧十件在清单里，beat_plan 列首为落笔前构思
 		"draft_read",
 		"draft_search",
 		"world_state_update",
-		"ask",
 	]);
 	const byName = new Map(writeTools("中文").map((t) => [t.name, t.description]));
 	assert.match(byName.get("draft_write") ?? "", /全量/);

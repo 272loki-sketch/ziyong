@@ -13,6 +13,7 @@
 
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, unlinkSync, watch, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { presentationFactText } from "../src/stage/agent-presentation.ts";
 import { createHash, randomBytes } from "node:crypto";
 import { networkInterfaces } from "node:os";
 import { dirname, extname, isAbsolute, join, normalize } from "node:path";
@@ -43,6 +44,9 @@ import { loadAgentConfig, normalizeAgentConfig, syncAgentConfigToRuntime } from 
 import { streamSimple } from "@liyuan/ai/compat";
 import { loadCardFile, readCardRawJson } from "../src/card.ts";
 import { buildGreeting } from "../src/greeting.ts";
+import { effectiveGenerationMode, isGenerationMode } from "../src/stage/generation-mode.ts";
+import { loadStageConfig } from "../src/stage/materials.ts";
+import { configuredModels } from "../src/configured-models.ts";
 import { StageEngine, type AssistantMsgLike, type StageModelLike, type StageRerollPrep, type StageStreamFn, type StageSubmission } from "../src/stage/engine.ts";
 import { stateFromBranch, type BranchEntryLike } from "../src/stage/assemble.ts";
 import { worldAuditFromBranch } from "../src/stage/literary-world-transition.ts";
@@ -114,6 +118,8 @@ import {
 	memoryScopeId,
 	saveMemoryConfig,
 	onNarrativeTurnEnd,
+	narrativeMemoryWindow,
+	committedNarrativeText,
 } from "../src/memory/index.ts";
 import { handleApiRequest, loadCardFrontSnapshot, type CurrentModelInfo, type RestHost } from "./rest.ts";
 import { diagnosticsFromBranch } from "../src/stage/diagnostics.ts";
@@ -559,11 +565,25 @@ const branchMessages = (): unknown[] => {
 		const out: unknown[] = [];
 		const branch = session.sessionManager.getBranch() as Array<Record<string, unknown>>;
 		const performances = performanceByNarrative(branch);
+		const diagnostics = new Map<string,unknown>();
+		for (const e of branch) if (e.customType === "rp-model-diagnostics" && e.data && typeof e.data === "object") {
+			const d=e.data as {narrativeEntryId?:string;calls?:unknown}; if (d.narrativeEntryId) diagnostics.set(d.narrativeEntryId,d.calls);
+		}
+		const presentationPending = new Set<string>();
+		for (const entry of branch) if(entry.customType==="rp-turn-settlement" && entry.data && typeof entry.data==="object"){const data=entry.data as {narrativeEntryId?:string;presentationDone?:boolean};if(data.narrativeEntryId){if(data.presentationDone===false)presentationPending.add(data.narrativeEntryId);else if(data.presentationDone===true)presentationPending.delete(data.narrativeEntryId);}}
 		const performanceMessage = (entry: Record<string, unknown>) => {
-			const message = entry.message as Record<string, unknown>;
+			const message = { ...(entry.message as Record<string, unknown>) };
 			const performance = performances.get(String(entry.id));
+			const calls = diagnostics.get(String(entry.id));
+			if(presentationPending.has(String(entry.id)))message.details={...(message.details as Record<string,unknown>??{}),rpPresentationDelivery:{status:"pending"}};
+			if (calls) message.details = { ...(message.details as Record<string,unknown> ?? {}),rpModelDiagnostics:calls };
 			return performance ? { ...message, details: { ...(message.details as Record<string, unknown> ?? {}), rpPerformance: performance, rpPerformanceOwner: String(entry.id) } } : message;
 		};
+		const deliveries = new Map<string, {body:string;formats:string;display:string;requirements:unknown;inputSourceCount?:number;inputChars?:number;retryCount?:number}>();
+		for (const entry of branch) if (entry.customType === "rp-presentation-delivery" && entry.data && typeof entry.data === "object") {
+			const data = entry.data as {version?:number;targetEntryId?:string;body?:string;formats?:string;requirements?:unknown;display?:string;inputSourceCount?:number;inputChars?:number;retryCount?:number};
+			if(data.version===1 && typeof data.targetEntryId==="string" && typeof data.body==="string" && typeof data.formats==="string") deliveries.set(data.targetEntryId,{body:data.body,formats:data.formats,display:typeof data.display==="string"?data.display:[data.body,data.formats].join("\n\n"),requirements:data.requirements,inputSourceCount:data.inputSourceCount,inputChars:data.inputChars,retryCount:data.retryCount});
+		}
 		const overrides = new Map<string, string>();
 		const usableCurtain = (text: string): boolean => {
 			const value = text.trim();
@@ -585,6 +605,17 @@ const branchMessages = (): unknown[] => {
 		}
 		for (const e of branch) {
 			if (e.type === "message" && e.message) {
+				const delivery = deliveries.get(String(e.id));
+				if (delivery) {
+					const message = performanceMessage(e), details = message.details as Record<string,unknown> | undefined;
+					const canonical = typeof details?.rpNarrative === "string" ? details.rpNarrative : "";
+					if (canonical && presentationFactText(delivery.body) === presentationFactText(canonical)) {
+						const thinking = Array.isArray(message.content) ? message.content.filter(part => part?.type === "thinking") : [];
+						const display = delivery.display;
+						out.push({...message,content:[...thinking,{type:"text",text:display}],details:{...details,rpCurtain:delivery.formats,rpPresentationBody:delivery.body,rpPresentationRequirements:delivery.requirements,rpPresentationDelivery:{status:"complete",inputSourceCount:delivery.inputSourceCount,inputChars:delivery.inputChars,retryCount:delivery.retryCount,formatNames:Array.isArray(delivery.requirements)?delivery.requirements.map(x=>x.name):[]},rpTimeline:[{kind:"text",text:display}]}});
+						continue;
+					}
+				}
 				const override = overrides.get(String(e.id));
 				if (!override || typeof e.message !== "object") {
 					out.push(performanceMessage(e));
@@ -646,6 +677,7 @@ const helloFrame = (): ServerFrame => {
 		appVersion: APP_VERSION,
 		sessionId: session.sessionId,
 		deliveryProtocol: 1,
+		generationMode: effectiveGenerationMode(loadStageConfig(cwd).generationMode),
 		streaming: readStoryStreaming(),
 		charName: names.charName,
 		userName: names.userName,
@@ -677,6 +709,8 @@ const helloFrame = (): ServerFrame => {
 					// 新回复一律使用 rp-state + 世界/生态的权威日历。仅无原生日期可投影的旧历史回退 rpCurtain。
 					const legacyCalendar = presentation.calendar ? undefined : parseLegacyCalendarSource(rawCurtain);
 					if (legacyCalendar) presentation.calendar = legacyCalendar;
+					// Adaptive delivery already contains the card-authored calendar; native data was reference only.
+					if (typeof details.rpPresentationBody === "string") delete presentation.calendar;
 					const optionMatch = rawCurtain.match(/<options>\s*([\s\S]*?)\s*<\/options>/i);
 					// 当前卡若已有 options 美化正则，HTML 会在正文中展示；不要再叠加
 					// 原生 presentation 卡，避免同一组选项出现一份美化、一份裸卡。
@@ -880,6 +914,7 @@ const regenerateSwipe = async (): Promise<void> => {
 		if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
 		const source = raw as Record<string, unknown>;
 		prep = {
+			...(isGenerationMode((details as Record<string, unknown>).rpGenerationMode) ? { generationMode: (details as Record<string, unknown>).rpGenerationMode as "direct" | "director" } : {}),
 			...(source.literaryContinuity && typeof source.literaryContinuity === "object"
 				? { literaryContinuity: source.literaryContinuity as NonNullable<StageRerollPrep["literaryContinuity"]> }
 				: {}),
@@ -897,10 +932,10 @@ const regenerateSwipe = async (): Promise<void> => {
 				? { sceneConductor: source.sceneConductor as NonNullable<StageRerollPrep["sceneConductor"]> }
 				: {}),
 		};
-		if (!prep.literaryContinuity && !prep.literaryDirection && !prep.literaryDirectionData && !prep.literaryEcology && !prep.plotAdaptation && !prep.sceneConductor) prep = undefined;
+		if (!prep.generationMode && !prep.literaryContinuity && !prep.literaryDirection && !prep.literaryDirectionData && !prep.literaryEcology && !prep.plotAdaptation && !prep.sceneConductor) prep = undefined;
 		break;
 	}
-	broadcast({ type: "notify", level: "info", text: prep ? "正文重Roll：复用上一版拍前分析，从 writer 阶段重新生成" : "正文重Roll：旧回复没有可复用工件，将重新执行完整一拍" });
+	broadcast({ type: "notify", level: "info", text: prep?.generationMode ? `正文重Roll：沿用${prep.generationMode === "direct" ? "直出" : "导演"}模式重新生成` : prep ? "正文重Roll：复用上一版拍前分析，从 writer 阶段重新生成" : "正文重Roll：旧回复没有可复用工件，将重新执行完整一拍" });
 	// 记录 reroll 前的叶：生成失败/停止无产出时回退到旧回复（8/05：reroll 链上停止，前版本全消失）
 	rerollFallbackLeaf = sm.getLeafId();
 	// 叶钉回 user：引擎在 user 下挂新的 assistant sibling（swipe 语义）。
@@ -1230,12 +1265,15 @@ const currentModelInfo = (): CurrentModelInfo | null => {
 	};
 };
 
+const currentlyConfiguredModels = () => configuredModels(session.modelRegistry.getAvailable(), loadAgentConfig(cwd).config);
+
 const restHost: RestHost = {
 	cwd,
 	isStreaming: () => session.isStreaming || stage.isStreaming,
+	retrySettlement: async () => { const result=await stage.retryPendingSettlement(); resyncAll(); return result; },
 	listModels: () => ({
 		current: currentModelInfo(),
-		models: session.modelRegistry.getAvailable().map((m) => ({
+		models: currentlyConfiguredModels().map((m) => ({
 			provider: m.provider,
 			providerName: session.modelRegistry.getProviderDisplayName(m.provider),
 			id: m.id,
@@ -1247,8 +1285,8 @@ const restHost: RestHost = {
 		})),
 	}),
 	async selectModel(provider, id) {
-		const m = session.modelRegistry.find(provider, id);
-		if (!m) throw new Error(`模型不存在：${provider}/${id}`);
+		const m = currentlyConfiguredModels().find(m => m.provider === provider && m.id === id);
+		if (!m) throw new Error(`模型不在当前启用API配置：${provider}/${id}。请先在连接设置中明确启用，旧仓库配置不会自动恢复。`);
 		await session.setModel(m);
 		const current = currentModelInfo();
 		if (!current) throw new Error("模型切换后状态异常");
@@ -1683,7 +1721,7 @@ const restHost: RestHost = {
 	// 预设 AI 分拣等旁路声明：调当前会话模型做一次性判断（复用 streamSimple，同 StageEngine.#sideText）
 	runSideText: async (step, systemPrompt, userText, opts) => {
 		const config = loadStageMaterials(cwd).config;
-		const availableModels = await session.modelRegistry.getAvailable();
+		const availableModels = currentlyConfiguredModels();
 		const resolved = resolveStepModel(
 			step,
 			config.stepModels,
@@ -2540,9 +2578,9 @@ const stage = new StageEngine({
 	cwd,
 	getSessionManager: () => session.sessionManager as never,
 	getModel: () => session.model as never,
-	findModel: (provider, id) => session.modelRegistry.getAvailable().find((item) => item.provider === provider && item.id === id) as never,
+	findModel: (provider, id) => currentlyConfiguredModels().find((item) => item.provider === provider && item.id === id) as never,
 	findModelById: (id) => {
-		const available = session.modelRegistry.getAvailable().filter((item) => item.id === id);
+		const available = currentlyConfiguredModels().filter((item) => item.id === id);
 		// 同 id 多渠道时优先当前剧情渠道；否则只有唯一候选才可自动迁移。
 		const currentProvider = session.model?.provider;
 		return (available.find((item) => item.provider === currentProvider) ?? (available.length === 1 ? available[0] : undefined)) as never;
@@ -2551,6 +2589,7 @@ const stage = new StageEngine({
 		// 部分中转/网关会拦截 openai SDK 的默认 User-Agent（返回 403「request was blocked」），
 		// 导致旁路模型（生态/导演等）静默失败。默认补一个普通浏览器 UA，已显式配置的 UA 优先。
 		const a = await session.modelRegistry.getApiKeyAndHeaders(m as never);
+		if (a.ok === false) throw new Error(a.error ?? "当前模型鉴权配置不可用");
 		const headers = { ...(a.headers ?? {}) };
 		if (!headers["user-agent"] && !headers["User-Agent"]) headers["user-agent"] = "Mozilla/5.0";
 		return { apiKey: a.apiKey, headers };
@@ -2610,7 +2649,8 @@ const stage = new StageEngine({
 		if (event?.sourceRefs?.length) {
 			const branchEntries = session.sessionManager.getBranch() as unknown as Array<{
 				id: string;
-				message?: { content?: unknown };
+				type?: string;
+				message?: { role?: string; content?: unknown; details?: unknown; stopReason?: string };
 			}>;
 			const byId = new Map(branchEntries.map((entry) => [entry.id, entry]));
 			const sourceTexts = event.sourceRefs
@@ -2618,11 +2658,8 @@ const stage = new StageEngine({
 				.map((ref) => ({ ref, entry: byId.get(ref.entryId) }))
 				.map(({ ref, entry }) => {
 					const content = entry?.message?.content;
-					const text = typeof content === "string"
-						? content
-						: Array.isArray(content)
-							? content.map((part) => part && typeof part === "object" && (part as { type?: string }).type === "text" ? String((part as { text?: unknown }).text ?? "") : "").join("")
-							: "";
+					const canonical = entry?.message?.role === "assistant" && (ref.textBasis === "rpNarrative" || (ref.charFrom === undefined && ref.charTo === undefined));
+					const text = canonical ? committedNarrativeText(entry!) : extractEntryText(content);
 					if (!text) return "";
 					return typeof ref.charFrom === "number" || typeof ref.charTo === "number"
 						? text.slice(Math.max(0, ref.charFrom ?? 0), Math.max(0, ref.charTo ?? text.length))
@@ -2665,7 +2702,7 @@ const stage = new StageEngine({
 			session.sessionManager.getBranch().map((entry) => entry.id).filter((id): id is string => typeof id === "string"),
 		);
 		return {
-			everyNTurns: () => loadMemoryConfig(cwd).stores.find((store) => store.id === "narrative" && store.enabled)?.everyNTurns ?? 0,
+			everyNTurns: () => { const cfg = loadMemoryConfig(cwd); return cfg.enabled ? cfg.stores.find((store) => store.id === "narrative" && store.enabled)?.everyNTurns ?? 0 : 0; },
 			getCursor: () => loadMemoryConfig(cwd).eventCursors?.[scopeId],
 			setCursor: (entryId: string) => {
 				// 游标与配置同锁：避免并发 overwrite eventCursors/turnCounters。
@@ -2782,6 +2819,14 @@ const stage = new StageEngine({
 			? disk.disabledLore.filter((f): f is string => typeof f === "string")
 			: [];
 		const next = toggleDisabledLore(prev, fingerprints, enabled);
+		if (disk.loreEntryOverrides && typeof disk.loreEntryOverrides === "object") {
+			const overrides = { ...disk.loreEntryOverrides as Record<string, boolean> };
+			for (const key of Object.keys(overrides)) {
+				try { if (fingerprints.includes(JSON.parse(key)[2])) delete overrides[key]; } catch { /* unknown legacy key: preserve */ }
+			}
+			if (Object.keys(overrides).length) disk.loreEntryOverrides = overrides;
+			else delete disk.loreEntryOverrides;
+		}
 		if (next.length > 0) disk.disabledLore = next;
 		else delete disk.disabledLore;
 		writeFileSync(path, `${JSON.stringify(disk, null, "\t")}\n`, "utf8");
@@ -2841,31 +2886,19 @@ const stage = new StageEngine({
 					console.warn("[outline] asynchronous reconcile failed", error);
 				});
 			}
+			// Capture the source session/card/branch synchronously. An embedding await may overlap navigation.
+			const memoryScope = { sessionId: session.sessionId, card: cardPath || undefined };
+			const memoryBranch = session.sessionManager.getBranch();
+			const memoryLeaf = session.sessionManager.getLeafId() ?? undefined;
+			const memoryEvery = loadMemoryConfig(cwd).stores.find((store) => store.id === "narrative")?.everyNTurns ?? 3;
+			const memoryWindow = narrativeMemoryWindow(memoryBranch, info.entryId, memoryEvery);
+			if (!memoryWindow) return;
 			void (async () => {
 				try {
-					const msgs = branchMessages() as Array<{ role?: string; content?: unknown }>;
-					let lastText = "";
-					for (let i = msgs.length - 1; i >= 0; i--) {
-						const m = msgs[i];
-						if (m?.role !== "assistant") continue;
-						const c = m.content;
-						if (typeof c === "string") lastText = c;
-						else if (Array.isArray(c)) {
-							lastText = c
-								.map((p) =>
-									p && typeof p === "object" && (p as { type?: string }).type === "text"
-										? String((p as { text?: string }).text ?? "")
-										: "",
-								)
-								.join("");
-						}
-						if (lastText.trim()) break;
-					}
-					const mem = await onNarrativeTurnEnd(
-						cwd,
-						{ sessionId: session.sessionId, card: cardPath || undefined },
-						lastText,
-					);
+					const mem = await onNarrativeTurnEnd(cwd, memoryScope, memoryWindow.narrativeText, {
+						entries: memoryWindow.entries, branchLeafId: memoryLeaf,
+					});
+					if (session.sessionId !== memoryScope.sessionId || cardPath !== memoryScope.card) return;
 					if (mem.error) {
 						broadcast({ type: "notify", level: "warning", text: `向量记忆：入库失败 · ${mem.error}` });
 					} else if (mem.stored) {
@@ -2915,6 +2948,7 @@ const hostCompact = async (): Promise<void> => {
 
 /** 发送用户输入（含斜杠命令；命令后全量对齐所有端） */
 const handlePrompt = async (text: string, submission?: StageSubmission) => {
+	submission = { ...submission, generationMode: effectiveGenerationMode(submission?.generationMode ?? loadStageConfig(cwd).generationMode) };
 	const trimmed = text.trim();
 	// ST 式变体：无参 /reroll 与 /swipe 由宿主处理（需重开一拍，扩展命令上下文无此能力）
 	if (/^\/reroll\s*$/i.test(trimmed)) {
@@ -3285,6 +3319,7 @@ const assertListedSession = async (path: string) => {
 
 const deliveryWaiters = new Map<string, Set<WebSocket>>();
 const receivePrompt = async (ws: WebSocket, frame: Extract<ClientFrame, { type: "prompt" | "assistant_prompt" }>): Promise<void> => {
+	if (frame.type === "prompt" && frame.generationMode !== undefined && !isGenerationMode(frame.generationMode)) { sendFrame(ws, { type: "prompt_ack", messageId: String(frame.messageId ?? ""), sessionId: String(frame.sessionId ?? ""), status: "rejected", reason: "生成模式无效，草稿保留" }); return; }
 	const text = String(frame.text ?? "").trim();
 	const identity = readSubmissionIdentity(frame);
 	if (identity === "legacy") { if (text) await (frame.type === "prompt" ? handlePrompt(text) : promptAssistant(text)); return; }
@@ -3329,7 +3364,7 @@ const receivePrompt = async (ws: WebSocket, frame: Extract<ClientFrame, { type: 
 			await handlePrompt(text);
 			finish("accepted", "命令已处理；这是执行返回确认，不是持久用户消息 ACK");
 		} else {
-			await handlePrompt(text, { clientMessageId: identity.messageId, expectedSessionId: identity.sessionId, onAccepted: () => finish("accepted") });
+			await handlePrompt(text, { clientMessageId: identity.messageId, expectedSessionId: identity.sessionId, generationMode: isGenerationMode(frame.generationMode) ? frame.generationMode : effectiveGenerationMode(loadStageConfig(cwd).generationMode), onAccepted: () => finish("accepted") });
 			if (!accepted) finish("rejected", "输入尚未落树，草稿保留，请重试");
 		}
 	} catch (error) {
@@ -3419,7 +3454,7 @@ wss.on("connection", (ws, req) => {
 					case "sessions":
 						if (Date.now() - (sessionsRequestAt.get(ws) ?? 0) < 1000) break;
 						sessionsRequestAt.set(ws, Date.now());
-						sendFrame(ws, await listSessionsCoalesced());
+						{ const target = session.sessionId; const list = await listSessionsCoalesced(); sendFrame(ws, { ...list, sessionId:target } as ServerFrame); }
 						break;
 					case "open": {
 						if (deliveryLedger.hasPendingSessionPrefix("assistant:")) { sendFrame(ws, { type: "notify", level: "warning", text: "助手输入尚在处理，请结束/停止后切换会话" }); return; }
@@ -3490,8 +3525,9 @@ wss.on("connection", (ws, req) => {
 							sendFrame(ws, { type: "assistant_sessions", list: [] } satisfies ServerFrame);
 							return;
 						}
+						const target = assistantDeliveryTarget();
 						const list = await assistantHost.listSessions();
-						sendFrame(ws, { type: "assistant_sessions", list } satisfies ServerFrame);
+						sendFrame(ws, { type: "assistant_sessions", list, sessionId:target } as ServerFrame);
 						break;
 					}
 					case "assistant_open": {

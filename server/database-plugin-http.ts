@@ -1,3 +1,4 @@
+import { selectDatabasePluginWorldbookEntries, type DatabasePluginPreparedPrompt, type DatabasePluginWorldbookEntry } from '../src/stage/database-plugin-prompt.ts';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -8,6 +9,8 @@ import { DatabasePluginStore, type DatabasePluginScope, type DatabasePluginHostS
 import { DatabasePluginSourceStore } from "./database-plugin-source.ts";
 import { loadMemoryConfig } from "../src/memory/config.ts";
 import { embedTextsCloud } from "../src/memory/embed.ts";
+import { publicDatabasePluginFetch, managedDatabasePluginPresets, databasePluginModelRevision, probeDatabasePluginModels, requestDatabasePluginCompletion, databasePluginChatSse, type DatabasePluginModelRoles, type DatabasePluginGenerationOptions, type DatabasePluginChatReply } from "./database-plugin-models.ts";
+import { loadAgentConfig } from "../src/agent-config.ts";
 import { checkDatabasePluginUpdate } from "./database-plugin-update.ts";
 
 const secretField = /(?:api[_-]?key|password|secret|authorization|access[_-]?token|refresh[_-]?token|^token)$/i;
@@ -15,16 +18,50 @@ export function publicDatabasePluginSettings(value:any):any {
  if(Array.isArray(value))return value.map(publicDatabasePluginSettings);
  if(value&&typeof value==='object')return Object.fromEntries(Object.entries(value).map(([key,v])=>[key,secretField.test(key)?(v?'host-managed':''):publicDatabasePluginSettings(v)]));
  if(typeof value==='string'&&/^[\s]*[\[{]/.test(value)){try{return JSON.stringify(publicDatabasePluginSettings(JSON.parse(value)))}catch{}}
+ if(typeof value==='string'&&/^[ \t]*(?:authorization|proxy-authorization|x-api-key|api-key|x-goog-api-key|cookie|[\w-]*token)\s*:/im.test(value))return value.replace(/^([ \t]*(?:authorization|proxy-authorization|x-api-key|api-key|x-goog-api-key|cookie|[\w-]*token)\s*:)[^\r\n]*/gim,'$1 host-managed');
  if(typeof value==='string'&&/^https?:\/\//i.test(value)){try{const url=new URL(value);let changed=!!(url.username||url.password);url.username='';url.password='';for(const key of url.searchParams.keys())if(secretField.test(key)||key.toLowerCase()==='key'){url.searchParams.set(key,'host-managed');changed=true;}if(changed)return url.toString();}catch{}}
  return value;
 }
-function preserveDatabasePluginSecrets(value:any,previous:any):any {
- if(Array.isArray(value))return value.map((v,i)=>preserveDatabasePluginSecrets(v,previous?.[i]));
- if(value&&typeof value==='object')return Object.fromEntries(Object.entries(value).map(([key,v])=>[key,secretField.test(key)&&(v==='host-managed'||v===''||v==null)&&previous?.[key]?previous[key]:preserveDatabasePluginSecrets(v,previous?.[key])]));
+function samePluginEndpoint(value:any,previous:any,key="url"):boolean {
+ if(!previous||typeof value?.[key]!=="string"||typeof previous?.[key]!=="string")return false;
+ return value[key]===publicDatabasePluginSettings(previous[key]);
+}
+function presetIdentity(value:any):string|undefined {
+ if(!value||typeof value!=="object")return undefined;
+ if(typeof value.id==="string")return "id:"+value.id;
+ if(typeof value.name==="string")return "name:"+value.name;
+ return undefined;
+}
+export function preserveDatabasePluginSecrets(value:any,previous:any):any {
+ if(Array.isArray(value))return value.map((v,i)=>{
+  if(v&&typeof v==="object"&&!Array.isArray(v)&&(v.apiConfig||v.apiKey||v.url||v.requestHeaders)){
+   const candidates=Array.isArray(previous)?previous:[];
+   const identity=presetIdentity(v);let matches=identity?candidates.filter(old=>presetIdentity(old)===identity):[];
+   if(matches.length!==1){const cfg=v.apiConfig??v;matches=candidates.filter(old=>{const prior=old?.apiConfig??old;return samePluginEndpoint(cfg,prior)&&String(cfg.model??"")===String(prior?.model??"");});}
+   return preserveDatabasePluginSecrets(v,matches.length===1?matches[0]:undefined);
+  }
+  return preserveDatabasePluginSecrets(v,previous?.[i]);
+ });
+ if(value&&typeof value==='object')return Object.fromEntries(Object.entries(value).map(([key,v])=>{
+  let old=previous?.[key];
+  if(secretField.test(key)){
+   if(typeof value.url==='string'&&!samePluginEndpoint(value,previous))old=undefined;
+   if(/^embeddingApiKey$/i.test(key)&&(Object.prototype.hasOwnProperty.call(value,'embeddingEndpoint')||Object.prototype.hasOwnProperty.call(previous??{},'embeddingEndpoint'))&&!samePluginEndpoint(value,previous,'embeddingEndpoint'))old=undefined;
+   if(/^rerankApiKey$/i.test(key)&&(Object.prototype.hasOwnProperty.call(value,'rerankEndpoint')||Object.prototype.hasOwnProperty.call(previous??{},'rerankEndpoint'))&&!samePluginEndpoint(value,previous,'rerankEndpoint'))old=undefined;
+   if(v==='host-managed'||v===''||v==null)return [key,old||''];
+  }
+  if(/requestHeaders|custom_include_headers/i.test(key)&&typeof value.url==='string'&&!samePluginEndpoint(value,previous))old=undefined;
+  return [key,preserveDatabasePluginSecrets(v,old)];
+ }));
  if(typeof value==='string'&&/^[\s]*[\[{]/.test(value)){try{const old=typeof previous==='string'?JSON.parse(previous):previous;return JSON.stringify(preserveDatabasePluginSecrets(JSON.parse(value),old))}catch{}}
+ if(typeof value==='string'&&/^[ \t]*(?:authorization|proxy-authorization|x-api-key|api-key|x-goog-api-key|cookie|[\w-]*token)\s*:/im.test(value)){
+  const prior=new Map((typeof previous==='string'?previous:'').split(/\r?\n/).filter(line=>line.includes(':')).map(line=>[line.slice(0,line.indexOf(':')).trim().toLowerCase(),line]));
+  return value.split(/\r?\n/).map(line=>{const colon=line.indexOf(':');const name=line.slice(0,colon).trim().toLowerCase();return colon>0&&/^host-managed$/.test(line.slice(colon+1).trim())?(prior.get(name)||''):line;}).filter(Boolean).join('\n');
+ }
  if(typeof value==='string'&&typeof previous==='string'&&value===publicDatabasePluginSettings(previous))return previous;
  return value;
 }
+
 function pluginObjectName(name:unknown):string{if(typeof name!=='string'||name.length>2048)throw new Error('无效插件对象名');let clean=name.replace(/^\/?user\/files\//,'').replace(/^files\//,'');if(!clean||clean.startsWith('/')||clean.split('/').some(part=>!part||part==='.'||part==='..'||!/^[A-Za-z0-9_-][A-Za-z0-9._-]*$/.test(part)))throw new Error('无效插件对象路径');return clean;}
 export interface DatabasePluginContext {
  scope: DatabasePluginScope; sourceEntryId: string; visibleEntryIds: string[];
@@ -32,11 +69,14 @@ export interface DatabasePluginContext {
 }
 export interface DatabasePluginHost {
  context(): DatabasePluginContext;
- generate(prompts: Array<{role:string;content:string}>, signal?: AbortSignal): Promise<string>;
+ binding?(): Pick<DatabasePluginContext,"scope"|"sourceEntryId">;
+ generate(prompts: Array<{role:string;content:string}>, signal?: AbortSignal, options?: DatabasePluginGenerationOptions): Promise<string>;
+ complete?(payload:Record<string,any>,options:DatabasePluginGenerationOptions,signal?:AbortSignal):Promise<DatabasePluginChatReply>;
+ modelAuth?(provider:string):Promise<{apiKey?:string;headers?:Record<string,string>}>;
  embed?(texts:string[]):Promise<number[][]>;
  isStreaming(): boolean;
 }
-export interface DatabasePluginConfig { version:1; enabled:boolean; recentHistoryMessages:number; injectionMaxChars:number }
+export interface DatabasePluginConfig extends DatabasePluginModelRoles { version:1; enabled:boolean; recentHistoryMessages:number; injectionMaxChars:number }
 export class DatabasePluginHttp {
  readonly store: DatabasePluginStore; readonly sources: DatabasePluginSourceStore;
  readonly root: string; readonly internalToken=randomUUID();
@@ -47,10 +87,14 @@ export class DatabasePluginHttp {
  config():DatabasePluginConfig {try{const r=JSON.parse(readFileSync(join(this.root,"config.json"),"utf8"));return {...this.defaults,...r,enabled:r.enabled===true};}catch{return {...this.defaults};}}
  sourceStatus(){try{const active=JSON.parse(readFileSync(this.sources.activePointerPath,"utf8")).current;return {ref:active.ref,sha256:active.sha256,bytes:active.bytes};}catch{return {ref:this.sources.config.ref,sha256:this.sources.config.expectedSha256,bytes:0};}}
  onSourceChanged:(()=>Promise<void>)|undefined;
- setConfig(p:Partial<DatabasePluginConfig>):DatabasePluginConfig {if(this.host.isStreaming())throw new Error("生成中不能切换记忆后端");const c=this.config();const next={...c,enabled:typeof p.enabled==="boolean"?p.enabled:c.enabled,recentHistoryMessages:Math.max(6,Math.min(40,Number(p.recentHistoryMessages)||c.recentHistoryMessages)),injectionMaxChars:Math.max(2000,Math.min(60000,Number(p.injectionMaxChars)||c.injectionMaxChars))};if(next.enabled)this.sources.readCurrentPinnedJS();mkdirSync(this.root,{recursive:true,mode:0o700});const f=join(this.root,"config.json"),tmp=f+"."+randomUUID()+".tmp";writeFileSync(tmp,JSON.stringify(next),{mode:0o600});renameSync(tmp,f);chmodSync(f,0o600);return next;}
+ onConfigChanged:(()=>Promise<void>)|undefined;
+ setConfig(p:Partial<DatabasePluginConfig>):DatabasePluginConfig {if(this.host.isStreaming())throw new Error("生成中不能切换记忆后端");const c=this.config();const next={...c,enabled:typeof p.enabled==="boolean"?p.enabled:c.enabled,recentHistoryMessages:Math.max(6,Math.min(40,Number(p.recentHistoryMessages)||c.recentHistoryMessages)),injectionMaxChars:Math.max(2000,Math.min(60000,Number(p.injectionMaxChars)||c.injectionMaxChars))};for(const role of ["fillModel","recallModel"] as const)if(Object.prototype.hasOwnProperty.call(p,role)){
+ const value=p[role];if(!value)delete next[role];else{const provider=loadAgentConfig(this.cwd).config.providers[value.provider];if(!provider?.models?.some(m=>m.id===value.id))throw new Error("数据库模型必须来自梨园当前已启用连接");next[role]={provider:value.provider,id:value.id};}
+ }if(next.enabled)this.sources.readCurrentPinnedJS();mkdirSync(this.root,{recursive:true,mode:0o700});const f=join(this.root,"config.json"),tmp=f+"."+randomUUID()+".tmp";writeFileSync(tmp,JSON.stringify(next),{mode:0o600});renameSync(tmp,f);chmodSync(f,0o600);void this.onConfigChanged?.();return next;}
  currentContext():DatabasePluginContext {const c=this.host.context();if(!this.boundSourceEntryId)return c;const at=c.chat.findIndex(m=>m.__liyuanEntryId===this.boundSourceEntryId);if(at<0)throw new Error("待恢复的记忆来源已不在当前分支");const end=c.visibleEntryIds.indexOf(this.boundSourceEntryId);return {...c,sourceEntryId:this.boundSourceEntryId,chat:c.chat.slice(0,at+1),visibleEntryIds:c.visibleEntryIds.slice(0,end+1)};}
- scopeKey(c:DatabasePluginContext):string{return createHash("sha256").update(JSON.stringify(c.scope)).digest("hex").slice(0,24);}
- async context(){const c=this.currentContext();const state=await this.store.readState(c.scope,new Set(c.visibleEntryIds));const s=state.snapshot?.state;const book=`Liyuan-ACU-${this.scopeKey(c)}`;return {...c,scopeKey:this.scopeKey(c),revision:state.globalRevision,chat:c.chat.map(m=>({...m,...(s?.messages[String(m.__liyuanEntryId)]??{})})),chatMetadata:s?.chatMetadata??{},extensionSettings:publicDatabasePluginSettings(s?.extensionSettings??{}),worldbooks:s?.worldbooks??{[book]:{entries:[]}},readonlyBooks:c.readonlyBooks??{},primaryBook:book,embeddingModel:loadMemoryConfig(this.cwd).cloudEmbed.model,embeddingConfigured:!!this.host.embed||loadMemoryConfig(this.cwd).embedMode==="cloud"&&[loadMemoryConfig(this.cwd).cloudEmbed.model,loadMemoryConfig(this.cwd).cloudEmbed.baseUrl,loadMemoryConfig(this.cwd).cloudEmbed.apiKey].every(Boolean)};}
+ scopeKey(c:Pick<DatabasePluginContext,"scope">):string{return createHash("sha256").update(JSON.stringify(c.scope)).digest("hex").slice(0,24);}
+ managedPresets(){return managedDatabasePluginPresets(this.cwd,this.config());}
+ async context(){const c=this.currentContext();const state=await this.store.readState(c.scope,new Set(c.visibleEntryIds));const s=state.snapshot?.state;const book=`Liyuan-ACU-${this.scopeKey(c)}`;return {...c,managedModels:{presets:this.managedPresets(),revision:databasePluginModelRevision(this.managedPresets())},scopeKey:this.scopeKey(c),revision:state.globalRevision,chat:c.chat.map(m=>({...m,...(s?.messages[String(m.__liyuanEntryId)]??{})})),chatMetadata:s?.chatMetadata??{},extensionSettings:publicDatabasePluginSettings(s?.extensionSettings??{}),worldbooks:s?.worldbooks??{[book]:{entries:[]}},readonlyBooks:c.readonlyBooks??{},primaryBook:book,embeddingModel:loadMemoryConfig(this.cwd).cloudEmbed.model,embeddingConfigured:!!this.host.embed||loadMemoryConfig(this.cwd).embedMode==="cloud"&&[loadMemoryConfig(this.cwd).cloudEmbed.model,loadMemoryConfig(this.cwd).cloudEmbed.baseUrl,loadMemoryConfig(this.cwd).cloudEmbed.apiKey].every(Boolean)};}
  assertBinding(body:any){const c=this.currentContext();if(body?.scopeKey!==this.scopeKey(c)||body?.sourceEntryId!==c.sourceEntryId)throw Object.assign(new Error("会话/卡/分支已变化，拒绝迟到的插件写入"),{status:409});return c;}
  private fileRef(source:string,name:string):string{return 'host-ref-'+createHash('sha256').update(source+'\0'+name).digest('hex')+'.json';}
  async putObject(body:any){const c=this.assertBinding(body),name=pluginObjectName(body.name);const bytes=Buffer.from(body.data??'','base64');const sha=createHash('sha256').update(bytes).digest('hex'),object='immutable-'+sha+'.json';await this.store.putFile(c.scope,object,body.data);this.assertBinding(body);await this.store.putFile(c.scope,this.fileRef(c.sourceEntryId,name),Buffer.from(JSON.stringify({sourceEntryId:c.sourceEntryId,name,object,sha256:sha})).toString('base64'));return {name,path:'user/files/'+name,sha256:sha,size:bytes.length};}
@@ -59,14 +103,25 @@ export class DatabasePluginHttp {
  async listMemory(){const c=this.currentContext(),r=await this.store.readState(c.scope,new Set(c.visibleEntryIds));return Object.values(r.snapshot?.state.worldbooks??{}).flatMap(b=>b.entries).map((e:any)=>({id:String(e.uid),text:String(e.content??""),textLen:String(e.content??"").length,meta:{title:String(e.comment??"数据库条目"),source:"database-plugin"},createdAt:r.snapshot?.createdAt??""}));}
  async addMemory(text:string,title?:string){if(text.trim().length<8)throw new Error("记忆文字过短");const c=await this.context(),worldbooks=JSON.parse(JSON.stringify(c.worldbooks));const entries=worldbooks[c.primaryBook].entries as any[];const uid=entries.reduce((n,e)=>Math.max(n,Number(e.uid)||0),0)+1;entries.push({uid,comment:`Liyuan-Manual-${title||uid}`,content:text,enabled:true,type:"constant",constant:true,keys:[],source:"manual"});await this.save({scopeKey:c.scopeKey,sourceEntryId:c.sourceEntryId,revision:c.revision,state:{messages:Object.fromEntries(c.chat.map(m=>[String(m.__liyuanEntryId),Object.fromEntries(Object.entries(m).filter(([k])=>/^TavernDB_/.test(k)))])),chatMetadata:c.chatMetadata,extensionSettings:c.extensionSettings,worldbooks}});return {added:1,total:entries.length,chunks:1};}
  async deleteMemory(id:string){const c=await this.context(),worldbooks=JSON.parse(JSON.stringify(c.worldbooks));let deleted=false;for(const book of Object.values(worldbooks) as any[])book.entries=book.entries.filter((e:any)=>{if(String(e.uid)!==id)return true;if(!String(e.comment??"").startsWith("Liyuan-Manual-"))throw new Error("数据库生成条目请在原管理台删除对应表行，避免被索引重新生成");deleted=true;return false});if(deleted)await this.save({scopeKey:c.scopeKey,sourceEntryId:c.sourceEntryId,revision:c.revision,state:{messages:Object.fromEntries(c.chat.map(m=>[String(m.__liyuanEntryId),Object.fromEntries(Object.entries(m).filter(([k])=>/^TavernDB_/.test(k)))])),chatMetadata:c.chatMetadata,extensionSettings:c.extensionSettings,worldbooks}});return deleted;}
- async save(body:any){const c=this.assertBinding(body);const visible=new Set(c.visibleEntryIds);for(const id of Object.keys(body?.state?.messages??{}))if(!visible.has(id))throw Object.assign(new Error("插件消息扩展来源不在当前祖先链"),{status:409});const previous=await this.store.readState(c.scope,new Set(c.visibleEntryIds));body.state.extensionSettings=preserveDatabasePluginSecrets(body.state.extensionSettings,previous.snapshot?.state.extensionSettings);return this.store.saveState(c.scope,c.sourceEntryId,body.revision,body.state);}
- async injection(userText:string){const c=this.currentContext(),r=await this.store.readState(c.scope,new Set(c.visibleEntryIds));const books=r.snapshot?.state.worldbooks??{};const rows=Object.values(books).flatMap(b=>b.entries) as Array<any>;const indexes=rows.filter(e=>String(e.comment??'').endsWith('纪要索引'));const selectedCodes=new Set(indexes.flatMap(e=>String(e.content??'').match(/\bAM\d{4,}\b/g)??[]));const scanText=userText+'\n'+c.chat.slice(-12).map(m=>String(m.mes??'')).join('\n');const enabled=rows.filter(e=>!/(?:WrapperStart|WrapperEnd|MemoryStart|MemoryEnd)$/.test(String(e.comment??''))&&e.enabled!==false&&(e.type==='constant'||e.constant===true||(e.keys??e.key??[]).some((k:string)=>scanText.includes(k)||selectedCodes.has(k))));let used=0;const limit=this.config().injectionMaxChars;return enabled.sort((a,b)=>(Number(a.order)||0)-(Number(b.order)||0)).flatMap(e=>{const text=String(e.content??'');if(!text||used>=limit)return[];const available=limit-used;const shown=text.length>available?text.slice(0,available)+'\n（本拍投送预算不足，此条目未完整展开）':text;used+=shown.length;return [{tag:String(e.comment??e.name??'数据库记忆'),kind:'digest' as const,text:shown}];});}
+ async save(body:any){const c=this.assertBinding(body);const visible=new Set(c.visibleEntryIds);for(const id of Object.keys(body?.state?.messages??{}))if(!visible.has(id))throw Object.assign(new Error("插件消息扩展来源不在当前祖先链"),{status:409});const previous=await this.store.readState(c.scope,new Set(c.visibleEntryIds));this.assertBinding(body);body.state.extensionSettings=preserveDatabasePluginSecrets(body.state.extensionSettings,previous.snapshot?.state.extensionSettings);return this.store.saveState(c.scope,c.sourceEntryId,body.revision,body.state,()=>{this.assertBinding(body)});}
+ async prompt(userInput:string):Promise<DatabasePluginPreparedPrompt>{const c=this.currentContext(),binding={scopeKey:this.scopeKey(c),sourceEntryId:c.sourceEntryId};const r=await this.store.readState(c.scope,new Set(c.visibleEntryIds));this.assertBinding(binding);const worldbookEntries=Object.values(r.snapshot?.state.worldbooks??{}).flatMap(b=>b.entries).map(e=>{if(!e||typeof e!=='object'||Array.isArray(e)||typeof e.content!=='string')throw new Error('原数据库世界书条目不是有效宿主对象');return e as unknown as DatabasePluginWorldbookEntry;});return {userInput,worldbookEntries};}
+ // Diagnostic/tool view uses native key activation only, never the disabled
+ // overview, a second AM selector, stripped wrappers or a host character cap.
+ async injection(userText:string){const c=this.currentContext();const prepared=await this.prompt(userText);return selectDatabasePluginWorldbookEntries(prepared.worldbookEntries,c.chat.slice(0,-1).map(m=>String(m.mes??'')),userText).map(e=>({tag:String(e.comment??'数据库世界书'),kind:'digest' as const,text:e.content}));}
+ boundRequestController(req:IncomingMessage,res:ServerResponse,body:any){
+ const controller=new AbortController();const abort=()=>controller.abort();req.once('aborted',abort);res.once('close',abort);
+ const timer=setInterval(()=>{try{this.assertBinding(body)}catch{abort()}},200);timer.unref();
+ return {controller,release:()=>{clearInterval(timer);req.off('aborted',abort);res.off('close',abort)}};
+ }
  async handle(req:IncomingMessage,res:ServerResponse):Promise<boolean>{const url=new URL(req.url??'/',"http://localhost");const internal=req.headers['x-liyuan-database-host']===this.internalToken;
  if(internal&&url.pathname.startsWith('/user/files/')){const c=this.currentContext();url.searchParams.set('scopeKey',this.scopeKey(c));url.searchParams.set('name',decodeURIComponent(url.pathname.slice('/user/files/'.length)));url.pathname='/api/database-plugin/file';}
  if(internal&&['/api/files/upload','/api/files/delete'].includes(url.pathname))url.pathname='/api/database-plugin'+url.pathname.slice('/api'.length);
  if(internal&&['/api/chats/get','/api/chats/group/get'].includes(url.pathname))url.pathname='/api/database-plugin/native-chat';
+ if(url.pathname==='/api/backends/chat-completions/status')url.pathname='/api/database-plugin/completion-status';
+ if(url.pathname==='/api/backends/chat-completions/generate')url.pathname='/api/database-plugin/completion';
  if(!url.pathname.startsWith('/api/database-plugin'))return false;const send=(status:number,value:any,contentType='application/json; charset=utf-8')=>{res.writeHead(status,{'content-type':contentType,'cache-control':'no-store','x-content-type-options':'nosniff'});res.end(Buffer.isBuffer(value)?value:contentType.startsWith('application/json')?JSON.stringify(value):String(value));};
  try{const path=url.pathname.slice('/api/database-plugin'.length);let body:any={};if(req.method==='POST'||req.method==='PUT'){let bytes=0,buf:Buffer[]=[];for await(const part of req){bytes+=part.length;if(bytes>45*1024*1024)throw Object.assign(new Error('插件请求过大'),{status:413});buf.push(part);}body=JSON.parse(Buffer.concat(buf).toString('utf8')||'{}');if(internal&&!body.scopeKey){body.scopeKey=req.headers['x-liyuan-database-scope'];body.sourceEntryId=req.headers['x-liyuan-database-source'];}}
+ if(path==='/binding'){const c=this.host.binding?.()??this.currentContext();send(200,{scopeKey:this.scopeKey(c),sourceEntryId:c.sourceEntryId,sha256:this.sourceStatus().sha256,modelRevision:databasePluginModelRevision(this.managedPresets()),streaming:this.host.isStreaming()});return true;}
  if(path==='/status'){let ready=false;try{this.sources.readCurrentPinnedJS();ready=true;}catch{}send(200,{config:this.config(),sourceReady:ready,...this.sourceStatus()});return true;}
  if(path==='/config'&&(req.method==='POST'||req.method==='PUT')){send(200,{config:this.setConfig(body)});return true;}
  if(path==='/source/check'&&req.method==='POST'){send(200,await checkDatabasePluginUpdate());return true;}
@@ -77,14 +132,31 @@ export class DatabasePluginHttp {
  if(path==='/native-chat'){const c=await this.context();send(200,[{chat_metadata:c.chatMetadata},...c.chat]);return true;}
  if(path==='/context'){send(200,await this.context());return true;}
  if(path==='/state'&&req.method==='POST'){if(!internal&&this.host.isStreaming())throw new Error('生成期间原插件管理台保持只读，稍后再保存');send(200,await this.save(body));return true;}
- if(path==='/generate'&&req.method==='POST'){this.assertBinding(body);if(!Array.isArray(body.prompts)||body.prompts.length>100||body.prompts.reduce((n:number,p:any)=>n+String(p.content??'').length,0)>240000)throw new Error('无效插件模型材料');const controller=new AbortController();req.on('aborted',()=>controller.abort());res.on('close',()=>{if(!res.writableEnded)controller.abort()});const result=await this.host.generate(body.prompts,controller.signal);this.assertBinding(body);send(200,{text:result});return true;}
+ if(path==='/completion-status'&&req.method==='POST'){
+ const context=this.assertBinding(body),state=await this.store.readState(context.scope,new Set(context.visibleEntryIds));this.assertBinding(body);const task=this.boundRequestController(req,res,body);try{const result=await probeDatabasePluginModels(this.cwd,body.payload??body,{auth:this.host.modelAuth,settings:(state.snapshot?.state.extensionSettings??{}) as Record<string,any>,guard:()=>this.assertBinding(body),signal:task.controller.signal});this.assertBinding(body);send(200,result);return true;}finally{task.release()}
+ }
+ if(path==='/completion'&&req.method==='POST'){
+ if(!internal&&this.host.isStreaming())throw new Error('正文生成期间数据库管理台不能手动调用模型，稍后再操作');
+ const context=this.assertBinding(body),state=await this.store.readState(context.scope,new Set(context.visibleEntryIds));const payload=body.payload??body;
+ const task=this.boundRequestController(req,res,body),controller=task.controller;
+ try{this.assertBinding(body);const result=await requestDatabasePluginCompletion(this.cwd,payload,(state.snapshot?.state.extensionSettings??{}) as Record<string,any>,{auth:this.host.modelAuth,complete:this.host.complete,generate:this.host.generate},controller.signal,()=>this.assertBinding(body));
+ this.assertBinding(body);if(payload.stream)send(200,databasePluginChatSse(result),'text/event-stream; charset=utf-8');else send(200,result);return true;}finally{task.release()}
+ }
+ if(path==='/generate'&&req.method==='POST'){
+  if(!internal&&this.host.isStreaming())throw new Error('正文生成期间数据库管理台不能手动调用模型，稍后再操作');
+  this.assertBinding(body);
+  if(!Array.isArray(body.prompts)||body.prompts.length>100||body.prompts.reduce((n:number,p:any)=>n+String(p.content??'').length,0)>240000)throw new Error('无效插件模型材料');
+  const task=this.boundRequestController(req,res,body);
+  try{const result=await this.host.generate(body.prompts,task.controller.signal,{purpose:body.purpose==="recall"?"recall":"fill",modelRef:body.purpose==="recall"?this.config().recallModel:this.config().fillModel,validateBinding:()=>this.assertBinding(body)});this.assertBinding(body);send(200,{text:result});return true;}finally{task.release()}
+ }
+
  if(path==='/external'&&req.method==='POST'){
  const c=this.assertBinding(body);const result=await this.store.readState(c.scope,new Set(c.visibleEntryIds));const namespaces=(result.snapshot?.state.extensionSettings as any)?.__userscripts??{};let config:any=null;
  for(const ns of Object.values(namespaces) as any[])for(const [key,value]of Object.entries(ns))if(key.endsWith('_globalMeta_v1')&&typeof value==='string'){try{const meta=JSON.parse(value);const candidate=meta.vectorMemoryConfigGlobal;if(candidate&&(publicDatabasePluginSettings(candidate.embeddingEndpoint)===body.url||publicDatabasePluginSettings(candidate.rerankEndpoint)===body.url))config=candidate;}catch{}}
  if(!config)throw new Error('外部请求不是已保存的向量/重排连接，拒绝任意代理');const registered=publicDatabasePluginSettings(config.rerankEndpoint)===body.url?config.rerankEndpoint:config.embeddingEndpoint;const target=new URL(registered);if(target.protocol!=='https:'||target.username||target.password||target.hash)throw new Error('外部向量连接必须是无URL凭据的HTTPS地址');
  const answers=isIP(target.hostname)?[{address:target.hostname}]:await lookup(target.hostname,{all:true});if(!answers.length||answers.some(a=>{const ip=a.address.toLowerCase();return /^(?:127\.|10\.|192\.168\.|169\.254\.|0\.|172\.(?:1[6-9]|2[0-9]|3[01])\.)/.test(ip)||ip==='::1'||ip.startsWith('fc')||ip.startsWith('fd')||ip.startsWith('fe80:')||ip.startsWith('::ffff:');}))throw new Error('禁止向量代理访问私有、回环或链路本地地址');
  const key=registered===config.rerankEndpoint?config.rerankApiKey:config.embeddingApiKey;const headers:Record<string,string>={'content-type':'application/json'};if(key)headers.authorization='Bearer '+key;
- const response=await fetch(target,{method:'POST',redirect:'error',headers,body:JSON.stringify(body.payload),signal:AbortSignal.timeout(60000)});const raw=await response.text();if(raw.length>32*1024*1024)throw new Error('外部向量响应过大');this.assertBinding(body);res.writeHead(response.status,{'content-type':'application/json','cache-control':'no-store'});res.end(raw);return true;
+ this.assertBinding(body);const response=await publicDatabasePluginFetch(target.href,{method:'POST',redirect:'error',headers,body:JSON.stringify(body.payload),signal:AbortSignal.timeout(60000)},{allowQuery:true,maxBytes:32*1024*1024,timeoutMs:60000});const raw=await response.text();if(raw.length>32*1024*1024)throw new Error('外部向量响应过大');this.assertBinding(body);res.writeHead(response.status,{'content-type':'application/json','cache-control':'no-store'});res.end(raw);return true;
  }
  if(path==='/embeddings'&&req.method==='POST'){this.assertBinding(body);const cfg=loadMemoryConfig(this.cwd);if(!this.host.embed&&cfg.embedMode!=='cloud')throw new Error('云端嵌入未配置，插件可继续普通表格记忆');const inputs=Array.isArray(body.input)?body.input:[body.input];if(inputs.length>64||inputs.some((x:any)=>typeof x!=='string')||inputs.reduce((n:number,t:string)=>n+t.length,0)>100000)throw new Error('无效embedding批次');const vectors=this.host.embed?await this.host.embed(inputs):await embedTextsCloud(inputs,cfg.cloudEmbed);this.assertBinding(body);send(200,{data:vectors.map((embedding,index)=>({embedding,index})),model:cfg.cloudEmbed.model});return true;}
  if(path==='/files/upload'&&req.method==='POST'){const c=this.assertBinding(body);send(200,await this.putObject(body));return true;}

@@ -60,6 +60,27 @@ function eventsWithCacheCreation(
 const context: Context = { messages: [{ role: "user", content: "hi", timestamp: Date.now() }] };
 
 describe("Anthropic 1h cache write cost", () => {
+	it("returns a clear error for inline system messages instead of relocating them", async () => {
+		let requestSent = false;
+		const client = {
+			messages: {
+				create: () => {
+					requestSent = true;
+					throw new Error("unexpected request");
+				},
+			},
+		} as unknown as Anthropic;
+		const result = await streamAnthropic(
+			getModel("anthropic", "claude-opus-4-8"),
+			{ messages: [{ role: "system", content: [{ type: "text", text: "depth lore" }], timestamp: 0 }] },
+			{ client },
+		).result();
+
+		expect(requestSent).toBe(false);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toMatch(/does not support inline system messages/);
+	});
+
 	it("prices the 1h portion at 2x input and the rest at the 5m rate", async () => {
 		const model = getModel("anthropic", "claude-opus-4-8");
 		const response = createSseResponse(

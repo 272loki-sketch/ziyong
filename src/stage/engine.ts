@@ -12,6 +12,7 @@
  */
 
 import { join } from "node:path";
+import { selectDatabasePluginWorldbookEntries, databasePluginWorldbookParts, insertDatabasePluginDepthEntries, placeDatabasePluginCharacterEntries, type DatabasePluginPreparedPrompt } from "./database-plugin-prompt.ts";
 import { existingEcologyReference } from "./passive-ecology.ts";
 import { buildAgentPresentationMaterials, parseAgentPresentation, parseAgentPresentationPlan, presentationPlainText, presentationSegments, authoredImages } from "./agent-presentation.ts";
 import { projectPresentation } from "../presentation.ts";
@@ -393,7 +394,7 @@ export interface StageEngineDeps {
 	searchMemory?: (sessionId: string, query: string) => Promise<MemoryHitLike[]>;
 	databasePluginMemory?: {
 		enabled(): boolean;
-		before(userText: string, signal?: AbortSignal): Promise<Array<{ tag: string; kind: "digest"; text: string }>>;
+		before(userText: string, signal?: AbortSignal): Promise<DatabasePluginPreparedPrompt>;
 		after(sourceEntryId?: string, signal?: AbortSignal): Promise<void>;
 		recentHistoryMessages(): number;
 	};
@@ -1637,6 +1638,21 @@ export class StageEngine {
 		}
 		let literaryContinuity: LiteraryContinuity | undefined = rerollPrep?.literaryContinuity;
 		const prepLeafId = sm.getLeafId();
+		// Mandatory native database preparation runs before optional side timers.
+		// A failed/cancelled recall must not leave their ten-minute timer running.
+		let databasePreparedPrompt: DatabasePluginPreparedPrompt | undefined;
+		if (databasePluginEnabled) {
+			ev.onActivity?.("原数据库插件：执行原生召回与本轮输入写回");
+			databasePreparedPrompt = await this.#deps.databasePluginMemory!.before(lastUserText, this.#abort?.signal);
+			if (!stableLeaf(prepLeafId)) return { aborted: true };
+			if (typeof databasePreparedPrompt?.userInput !== "string" || !Array.isArray(databasePreparedPrompt.worldbookEntries)) throw new Error("数据库没有交付原生发送前处理结果");
+		}
+		const databaseWorldbookEntries = databasePreparedPrompt
+			? selectDatabasePluginWorldbookEntries(databasePreparedPrompt.worldbookEntries, (history.at(-1)?.role === "user" ? history.slice(0, -1) : history).map(m => m.text), databasePreparedPrompt.userInput) : [];
+		const databaseWorldbook = databasePluginWorldbookParts(databaseWorldbookEntries);
+		const databaseSystemSlots = placeDatabasePluginCharacterEntries(materials.presetBefore, databaseWorldbook);
+		const databaseSourceTexts = databasePreparedPrompt ? [databasePreparedPrompt.userInput, ...databaseWorldbookEntries.map(e => e.content)] : [];
+		const writerUserInput = databasePreparedPrompt?.userInput ?? lastUserText;
 		// 拍前旁路共享总预算；建议工件超时只会降级，不得阻塞正文入口。
 		let prepFinished = false;
 		const prepController = new AbortController();
@@ -1758,11 +1774,6 @@ export class StageEngine {
 		}
 		// 记忆回照注入块（叶守卫：只在当前分支仍相同时采用）
 		let memoryRecallBlocks: Array<{ tag: string; kind: "event" | "digest" | "evidence" | "arc"; text: string }> | undefined;
-		if (databasePluginEnabled) {
-			ev.onActivity?.("原数据库插件：准备当前分支相关记忆");
-			memoryRecallBlocks = await this.#deps.databasePluginMemory!.before(lastUserText, this.#abort?.signal);
-			if (!stableLeaf(prepLeafId)) return { aborted: true };
-		}
 		if ((memoryHits || memoryArcs.length) && stableLeaf(prepLeafId)) {
 			const seenRecall = new Set<string>();
 			const points = ((memoryHits ?? []) as MemoryRecallHitLike[])
@@ -1840,7 +1851,7 @@ export class StageEngine {
 			const prompt = buildLiteraryDirectorPrompt({
 				state,
 				history,
-				summary,
+				summary: [summary, ...databaseSourceTexts].filter(Boolean).join("\n\n") || undefined,
 				literaryProfile,
 				continuity: literaryContinuity,
 				ecology: config.literaryEcologyEnabled === true ? [formatLiteraryEcologyInjection(literaryEcology), passiveEcology].filter(Boolean).join("\n\n") || undefined : undefined,
@@ -1954,7 +1965,8 @@ export class StageEngine {
 			config,
 			constantLore: constantLoreOf(materials),
 			// 预设装配段：原文原序，marker 已按预设作者的位置填入梨园材料
-			presetBefore: materials.presetBefore.map((p) => p.text),
+			presetBefore: databaseSystemSlots.presetBefore,
+			databaseWorldbook: databaseSystemSlots.remaining,
 			declaredMarkers: materials.declaredMarkers,
 			// skill 素材位（M-R2）：常驻包全文 + 拉取包 L1 索引，无包零痕迹
 			skills: materials.skillFiles,
@@ -1997,16 +2009,19 @@ export class StageEngine {
 			: undefined;
 
 		// 末端消息 = 动态注入 + 本拍用户原话。
-		// 顺序要紧：用户当拍的话必须落在**整个上下文的最后一句**。
+		// 宿主状态放在本轮输入之前；插件开启时，本轮输入是上游实际写回
+		// 的完整成品，不要求召回标签之前的用户原文仍占最后一句。
+		// 原世界书的depth=0投送还可以跟在其后，不擅自搬回前面。
+		// 旧宿主顺序规则：用户当拍的话放在宿主状态之后。
 		// 注入块（世界状态/索引等）压在提问之后时，模型会把提问读成历史里的旧话，
 		// 于是既不检索也不正面回应——8/03 实测：同一提问，挪到注入之后立刻触发 lorebook_search。
 		const endsWithUser = history[history.length - 1]?.role === "user";
 		const past = endsWithUser ? history.slice(0, -1) : history;
 		// 规划卡（五注入之一）：每拍第 1 轮随末端注入送达（工作区新建必空），用户话保持最后一句。
 		const injWithCard = !generationMode && tools.length > 0 ? `${injection}\n\n${PLAN_CARD}` : injection;
-		const tailText = endsWithUser ? `${injWithCard}\n\n${history[history.length - 1].text}` : injWithCard;
+		const tailText = endsWithUser ? `${injWithCard}\n\n${writerUserInput}` : injWithCard;
 
-		const buildWriterMessages = (tail: string): unknown[] => [
+		const buildWriterMessages = (tail: string): unknown[] => insertDatabasePluginDepthEntries([
 			// M4 前情提要：被 rp-summary 覆盖的早期剧情在此回读（历史里那段已整体不存在）。
 			// 以 user 角色打头，措辞与 system「消息流约定」里的【前情提要】对上。
 			...(summary
@@ -2036,7 +2051,7 @@ export class StageEngine {
 						},
 			),
 			{ role: "user", content: [{ type: "text", text: tail }], timestamp: Date.now() },
-		];
+		], databaseWorldbook.depthEntries);
 		const messages = buildWriterMessages(tailText);
 		const writerInput = {
 			systemChars: systemPrompt.length,
@@ -2053,14 +2068,15 @@ export class StageEngine {
 				card,
 				config,
 				constantLore: constantLoreOf(materials),
-				presetBefore: materials.presetBefore.map((p) => p.text),
+				presetBefore: databaseSystemSlots.presetBefore,
+				databaseWorldbook: databaseSystemSlots.remaining,
 				declaredMarkers: materials.declaredMarkers,
 				skills: materials.skillFiles,
 				tools: false,
 				generationMode,
 				mcpTools: [],
 			});
-		const pureTextTail = endsWithUser ? `${injection}\n\n${history[history.length - 1].text}` : injection;
+		const pureTextTail = endsWithUser ? `${injection}\n\n${writerUserInput}` : injection;
 		const pureTextMessages = buildWriterMessages(pureTextTail);
 
 		const endWriter = collector.beginPhase("writer");
@@ -2127,7 +2143,7 @@ export class StageEngine {
 			const expertContext: DirectorContext = {
 				sessionId: sm.getSessionId(), leafId: expectedTurnLeafId,
 				userText: lastUserText, userPersona: config.userPersona, card: { name: card.name, description: card.description, personality: card.personality, scenario: card.scenario },
-				state, history, summary: [summary, ...(memoryRecallBlocks ?? []).map(x => x.text)].filter(Boolean).join("\n\n") || undefined, world: formatModularWorldInjection(modularWorld, worldManifest), ecology: { committed: formatLiteraryEcologyInjection(literaryEcology), existingCandidates: passiveEcology },
+				state, history, summary: [summary, ...databaseSourceTexts, ...(memoryRecallBlocks ?? []).map(x => x.text)].filter(Boolean).join("\n\n") || undefined, world: formatModularWorldInjection(modularWorld, worldManifest), ecology: { committed: formatLiteraryEcologyInjection(literaryEcology), existingCandidates: passiveEcology },
 				outline: projectOutline(outlineFromBranch(branch), "director"), lore: activated,
 				presetText: [...materials.presetBefore.map(p => p.text), ...phAll.map(p => p.text)].join("\n\n"),
 				writerPresetText:[...materials.presetBefore.filter(p=>p.source==="block").map(p=>p.text),...phAll.filter(p=>p.source==="block").map(p=>p.text)].join("\n\n"),
@@ -2141,6 +2157,7 @@ export class StageEngine {
 					{ id: "ecology", text: formatLiteraryEcologyInjection(literaryEcology) ?? "" },
 					...sourceEntries.slice(-8).reverse(),
 					...(summary ? [{ id: "summary", text: summary }] : []),
+					...databaseSourceTexts.map((text, index) => ({ id: `memory:database:${index}`, text })),
 					...(memoryRecallBlocks ?? []).map((x, index) => ({ id: `memory:${index}`, text: x.text })),
 					...activated.map((entry, index) => ({ id: `lore:${index}`, text: entry.content })),
 				],

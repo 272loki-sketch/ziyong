@@ -1,6 +1,6 @@
 {
   "name": "liyuan",
-  "version": "1.8.7",
+  "version": "1.8.10",
   "description": "梨园（Liyuan）— 以 AI 为主演的角色扮演剧院",
   "scripts": {
     "test": "node --test --test-concurrency=1 \"test/*.test.ts\"",
@@ -24,6 +24,7 @@
     "pack:release:macos": "powershell -NoProfile -File scripts/pack-release.ps1 -Target macos",
     "test:database-plugin": "node --test test/database-plugin*.test.ts",
     "test:database-plugin-browser": "node web/test/database-plugin-runtime.test.mjs",
+    "test:database-plugin-manager": "node web/test/database-plugin-manager.test.mjs",
     "database-plugin:install": "node scripts/install-database-plugin.mjs"
   },
   "license": "PolyForm-Noncommercial-1.0.0",
@@ -37,7 +38,8 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "better-sqlite3": "^12.11.1",
     "ws": "^8.18.0",
-    "playwright": "^1.49.0"
+    "playwright": "^1.49.0",
+    "yaml": "^2.9.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13"

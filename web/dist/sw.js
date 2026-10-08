@@ -4,7 +4,7 @@
  * 旧 HTML 仍指向已删除的 /assets/index-XXXX.js → 整页白屏。
  */
 const CACHE_PREFIX = "liyuan-shell-";
-const CACHE = `${CACHE_PREFIX}1.8.7`;
+const CACHE = `${CACHE_PREFIX}1.8.10`;
 const PRECACHE = [
 	"/favicon.png",
 	"/logo-32.png",

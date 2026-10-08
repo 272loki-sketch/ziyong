@@ -1,1 +1,42 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>梨园 · 原数据库插件</title></head><body><p id="host-status">正在载入数据库插件…</p><div id="extensionsMenu"></div><div id="extensions_settings"></div><div id="chat"></div><button id="send_but" hidden>send</button><textarea id="send_textarea" hidden></textarea><script type="module" src="/database-plugin-host.js"></script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <title>梨园 · 数据库管理台</title>
+    <style>
+      html, body { margin: 0; min-width: 0; min-height: 100%; }
+      body { font-family: system-ui, sans-serif; background: #f7f4ec; color: #332f29; }
+      #manager-shell { display: none; padding: 24px; max-width: 860px; margin: 0 auto; }
+      #manager-shell h1 { font-size: 22px; }
+      #manager-shell p { line-height: 1.7; }
+      #manager-actions { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+      #manager-actions button, #manager-actions a { font: inherit; padding: 9px 14px; }
+      #host-status { margin: 16px; overflow-wrap: anywhere; }
+      html[data-view="manager"] #manager-shell { display: block; }
+      html[data-view="manager"] #extensionsMenu,
+      html[data-view="manager"] #extensions_settings,
+      html[data-view="manager"] #chat { display: none; }
+      html[data-view="manager"] #host-status { max-width: 860px; margin: 16px auto; padding: 0 24px; }
+      [hidden] { display: none !important; }
+    </style>
+  </head>
+  <body>
+    <main id="manager-shell">
+      <h1>梨园 · 数据库管理台</h1>
+      <p>这里运行原数据库插件的完整前端，人物表、纪要、填表配置、交火／0TK 与数据管理都在原插件界面中。关闭原界面后，可在这里重新打开。</p>
+      <div id="manager-actions">
+        <button id="host-open" type="button" disabled>打开原插件完整界面</button>
+        <button id="host-retry" type="button" hidden>重新加载</button>
+        <a id="host-home" href="/">返回梨园</a>
+      </div>
+    </main>
+    <p id="host-status" role="status" aria-live="polite">正在载入数据库插件…</p>
+    <div id="extensionsMenu"></div>
+    <div id="extensions_settings"></div>
+    <div id="chat"></div>
+    <button id="send_but" hidden>send</button>
+    <textarea id="send_textarea" hidden></textarea>
+    <script type="module" src="/database-plugin-host.js?v=1.8.10"></script>
+  </body>
+</html>

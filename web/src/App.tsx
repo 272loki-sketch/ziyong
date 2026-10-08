@@ -107,6 +107,7 @@ import { PresetPanel } from "./components/PresetPanel.tsx";
 import { RosterPanel } from "./components/RosterPanel.tsx";
 import { SessionsPanel } from "./components/SessionsPanel.tsx";
 import { SettingsPanel } from "./components/SettingsPanel.tsx";
+import { DatabasePluginManager } from "./components/DatabasePluginManager.tsx";
 import { SessionStatsBar, StatusStrip } from "./components/StatusStrip.tsx";
 import { GenerationModeControl } from "./components/GenerationModeControl.tsx";
 import { UploadsPanel } from "./components/UploadsPanel.tsx";
@@ -351,6 +352,8 @@ export default function App() {
 	 */
 	const [welcome, setWelcome] = useState(() => shouldShowHomeOnBoot());
 	const [planningOpen, setPlanningOpen] = useState(false);
+	const [databaseOpen, setDatabaseOpen] = useState(false);
+	const openDatabase = useCallback(() => { setCenterMenu(null); setDatabaseOpen(true); }, []);
 
 	const dismissWelcome = useCallback(() => {
 		setWelcome(false);
@@ -1580,6 +1583,7 @@ export default function App() {
 					generationMode={generationMode}
 					onGenerationModeChange={onGenerationModeChange}
 					onConfigGenerationMode={onConfigGenerationMode}
+					onOpenDatabase={openDatabase}
 				/>;
 			case "card":
 				return (
@@ -1803,6 +1807,7 @@ export default function App() {
 	return (
 		<PanelRefreshContext.Provider value={agentTick}>
 		<div className="app">
+			{databaseOpen && <DatabasePluginManager onClose={() => setDatabaseOpen(false)} busy={busy} contextTick={agentTick} />}
 			{planningOpen && <StoryPlanningWorkbench onClose={() => setPlanningOpen(false)} toast={pushToast} />}
 			<header className="topbar">
 				{/* 中 2：相对整条顶栏绝对居中 = 屏幕水平正中（不受左右留白不对称影响） */}
@@ -1958,6 +1963,11 @@ export default function App() {
 					{busy ? <span className="busy">生成中</span> : <span className={`dot dot-${conn}`} title={conn} />}
 				</div>
 			</header>
+			<nav className="database-navigation" aria-label="数据库入口">
+				<button type="button" className="database-entry" aria-label="数据库" onClick={openDatabase}>
+					<IconCodex size={16} /> 数据库
+				</button>
+			</nav>
 
 			{(centerMenu || dropKeep) && (
 				<div className={`tb-drop-root ${centerMenu ? "" : "tb-drop-collapsed"}`} aria-hidden={!centerMenu}>
@@ -1991,6 +2001,7 @@ export default function App() {
 									generationMode={generationMode}
 									onGenerationModeChange={onGenerationModeChange}
 									onConfigGenerationMode={onConfigGenerationMode}
+									onOpenDatabase={openDatabase}
 								/>
 								</div>
 							)}

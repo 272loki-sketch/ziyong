@@ -1,6 +1,6 @@
 # 当前文档导航
 
-本地 **v1.8.7**。本目录只保留当前使用/维护信息；旧稿纸、剧情ask、心理画像、逐段门禁、废弃预设拆层及过期事故/测试日记已退出活动文档。原文件有受限备份，不冒称历史发生过的失败已不存在。
+本地 **v1.8.10**。本目录只保留当前使用/维护信息；旧稿纸、剧情ask、心理画像、逐段门禁、废弃预设拆层及过期事故/测试日记已退出活动文档。原文件有受限备份，不冒称历史发生过的失败已不存在。
 
 ## 第一读
 
@@ -8,7 +8,7 @@
 2. [架构](ARCHITECTURE-OVERVIEW.md)
 3. [两模式](GENERATION-MODES.md)与[执行合同](PLAN-ROUND-FLOW.md)
 4. [模型连接](MODEL-CONNECTIONS.md)、[原数据库接入](DATABASE-PLUGIN.md)、[旧记忆](PLAN-RP-MEMORY.md)
-5. [验证与限制](VALIDATION-20261007.md)、[测试命令](../TESTING.md)
+5. [原生召回写回纠正](VALIDATION-DATABASE-v1.8.10.md)、[数据库API与连续实战](VALIDATION-DATABASE-v1.8.9.md)、[验证与限制](VALIDATION-20261007.md)、[测试命令](../TESTING.md)
 
 ## 现行主题
 

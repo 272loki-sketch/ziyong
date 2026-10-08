@@ -114,10 +114,28 @@ export const stream = (model, context, options) => {
                 ...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
                 maxRetries: options?.maxRetries ?? 0,
             };
-            const { data: openaiStream, response } = await client.chat.completions
-                .create(params, requestOptions)
-                .withResponse();
-            await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+            let chunkSource;
+            if (compat.streaming !== false) {
+                const { data: openaiStream, response } = await client.chat.completions
+                    .create(params, requestOptions)
+                    .withResponse();
+                await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+                // Race each chunk against AbortSignal so Stop works even when a proxy
+                // ignores HTTP cancellation and never closes the SSE body.
+                chunkSource = abortableAsyncIterable(openaiStream, options?.signal);
+            }
+            else {
+                const nonStreamingParams = {
+                    ...params,
+                    stream: false,
+                };
+                delete nonStreamingParams.stream_options;
+                const { data: completion, response } = await client.chat.completions
+                    .create(nonStreamingParams, requestOptions)
+                    .withResponse();
+                await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+                chunkSource = [completionToChunk(completion)];
+            }
             stream.push({ type: "start", partial: output });
             let textBlock = null;
             let thinkingBlock = null;
@@ -230,9 +248,7 @@ export const stream = (model, context, options) => {
                 applyPendingReasoningDetail(block);
                 return block;
             };
-            // Race each chunk against AbortSignal so Stop works even when a proxy
-            // ignores HTTP cancellation and never closes the SSE body.
-            for await (const chunk of abortableAsyncIterable(openaiStream, options?.signal)) {
+            for await (const chunk of chunkSource) {
                 if (!chunk || typeof chunk !== "object")
                     continue;
                 // OpenAI documents ChatCompletionChunk.id as the unique chat completion identifier,
@@ -327,6 +343,24 @@ export const stream = (model, context, options) => {
                             });
                         }
                     }
+                    // 旧式 OpenAI Chat Completions 使用 delta.function_call，而不是 tool_calls。
+                    // 仍有部分兼容网关只实现这一版协议；统一归一成一个原生 toolCall 块。
+                    const legacyFunctionCall = choice?.delta?.function_call;
+                    if (legacyFunctionCall) {
+                        const block = ensureToolCallBlock({
+                            index: 0,
+                            id: "legacy-function-call",
+                            function: { name: legacyFunctionCall.name ?? "", arguments: legacyFunctionCall.arguments ?? "" },
+                        });
+                        if (!block.name && legacyFunctionCall.name)
+                            block.name = legacyFunctionCall.name;
+                        const delta = legacyFunctionCall.arguments ?? "";
+                        if (delta) {
+                            block.partialArgs = (block.partialArgs ?? "") + delta;
+                            block.arguments = parseStreamingJson(block.partialArgs);
+                        }
+                        stream.push({ type: "toolcall_delta", contentIndex: getContentIndex(block), delta, partial: output });
+                    }
                     const reasoningDetails = choice.delta.reasoning_details;
                     if (Array.isArray(reasoningDetails)) {
                         for (const detail of reasoningDetails) {
@@ -389,9 +423,7 @@ export const streamSimple = (model, context, options) => {
     getClientApiKey(model.provider, options?.apiKey, options?.headers);
     const base = buildBaseOptions(model, context, options, options?.apiKey);
     const clampedReasoning = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
-    // 只有端点声明支持 reasoning_effort 时才发送；否则某些中转在携带 function tools
-    // 时会拒绝 reasoning_effort 字段（8/19 实测 gpt-5.6-sol / gpt-5.6-luna）。
-    const reasoningEffort = clampedReasoning === "off" || clampedReasoning === undefined || !getCompat(model).supportsReasoningEffort ? undefined : clampedReasoning;
+    const reasoningEffort = clampedReasoning === "off" ? undefined : clampedReasoning;
     const toolChoice = options?.toolChoice;
     return stream(model, context, {
         ...base,
@@ -445,7 +477,8 @@ function buildParams(model, context, options, compat = getCompat(model), cacheRe
         params.store = false;
     }
     if (options?.maxTokens) {
-        // 官方偏 max_completion_tokens；中转多数只认 max_tokens。非官方只发 max_tokens。
+        // 官方 OpenAI 新模型偏 max_completion_tokens；国内/自建中转多数只认 max_tokens。
+        // 非官方端点：只发 max_tokens（双发时部分网关会丢/忽略）。
         const base = model.baseUrl || "";
         const official = base.includes("api.openai.com") ||
             base.includes("openai.azure.com") ||
@@ -705,7 +738,15 @@ export function convertMessages(model, context, compat) {
                 content: "I have processed the tool results.",
             });
         }
-        if (msg.role === "user") {
+        if (msg.role === "system") {
+            const useDeveloperRole = model.reasoning && compat.supportsDeveloperRole;
+            const role = useDeveloperRole ? "developer" : "system";
+            params.push({
+                role,
+                content: msg.content.map((block) => sanitizeSurrogates(block.text)).join(""),
+            });
+        }
+        else if (msg.role === "user") {
             if (typeof msg.content === "string") {
                 params.push({
                     role: "user",
@@ -909,6 +950,50 @@ function convertTools(tools, compat) {
         },
     }));
 }
+/**
+ * Convert a non-streaming ChatCompletion into a single synthetic chunk so that
+ * compat.streaming === false runs through the same event loop as streaming.
+ */
+function completionToChunk(completion) {
+    const choice = completion.choices?.[0];
+    const message = choice?.message;
+    const delta = {};
+    if (message) {
+        if (typeof message.content === "string" && message.content.length > 0) {
+            delta.content = message.content;
+        }
+        // Non-streaming responses carry reasoning on the message the same way
+        // streaming responses carry it on the delta.
+        for (const field of ["reasoning_content", "reasoning", "reasoning_text"]) {
+            const value = message[field];
+            if (typeof value === "string" && value.length > 0) {
+                delta[field] = value;
+            }
+        }
+        if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+            delta.tool_calls = message.tool_calls.map((toolCall, index) => ({ index, ...toolCall }));
+        }
+        if (Array.isArray(message.reasoning_details)) {
+            delta.reasoning_details = message.reasoning_details;
+        }
+    }
+    return {
+        id: completion.id,
+        object: "chat.completion.chunk",
+        created: completion.created,
+        model: completion.model,
+        ...(completion.usage ? { usage: completion.usage } : {}),
+        choices: choice
+            ? [
+                {
+                    index: choice.index ?? 0,
+                    delta: delta,
+                    finish_reason: choice.finish_reason ?? "stop",
+                },
+            ]
+            : [],
+    };
+}
 function parseChunkUsage(rawUsage, model) {
     const promptTokens = rawUsage.prompt_tokens || 0;
     const cacheReadTokens = rawUsage.prompt_tokens_details?.cached_tokens ?? rawUsage.prompt_cache_hit_tokens ?? 0;
@@ -996,6 +1081,9 @@ function detectCompat(model) {
         isAntLing;
     const useMaxTokens = baseUrl.includes("chutes.ai") || isMoonshot || isCloudflareAiGateway || isTogether || isNvidia || isAntLing;
     const isGrok = provider === "xai" || baseUrl.includes("api.x.ai");
+    // deepseek 模型经中转（opencode zen 等）时 baseUrl 不含 deepseek.com：按模型 id 兜底识别，
+    // 否则 thinkingFormat 判不成 "deepseek"，发不出 thinking:{type:"disabled"}，
+    // 端点默认推理常开 → 思考档 off/low 全部失效（2026-08-02 实测：精修调用 4096 tokens 全烧在隐形推理里）
     const isDeepSeek = provider === "deepseek" || baseUrl.includes("deepseek.com") || /deepseek/i.test(model.id);
     const isOpenRouterDeveloperRoleModel = isOpenRouter && (model.id.startsWith("anthropic/") || model.id.startsWith("openai/"));
     const cacheControlFormat = provider === "openrouter" && model.id.startsWith("anthropic/") ? "anthropic" : undefined;
@@ -1032,6 +1120,7 @@ function detectCompat(model) {
             isCloudflareAiGateway ||
             isNvidia ||
             isAntLing),
+        streaming: true,
     };
 }
 /**
@@ -1062,6 +1151,7 @@ function getCompat(model) {
         cacheControlFormat: model.compat.cacheControlFormat ?? detected.cacheControlFormat,
         sendSessionAffinityHeaders: model.compat.sendSessionAffinityHeaders ?? detected.sendSessionAffinityHeaders,
         supportsLongCacheRetention: model.compat.supportsLongCacheRetention ?? detected.supportsLongCacheRetention,
+        streaming: model.compat.streaming ?? detected.streaming,
     };
 }
 //# sourceMappingURL=openai-completions.js.map

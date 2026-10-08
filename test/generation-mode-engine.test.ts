@@ -15,7 +15,53 @@ const normalDirector = JSON.stringify({ scenePressure: "既有事务", character
 const emptyReport = JSON.stringify({ summary: "依据现有材料完成", facts: [], inferences: [], candidates: [], issues: [] });
 const consult = (phase: keyof typeof DIRECTOR_ROLES) => ({ calls: [{ name: "consult_experts", args: { tasks: DIRECTOR_ROLES[phase].map(role => ({ role, task: "本拍报告" })) } }] });
 const directorScript = (body: string) => [consult("evidence"), consult("ideas"), { calls: [{ name: "begin_narrative" }] }, { text: body }, consult("review"), { calls: [{ name: "finalize" }] }];
-function fixture(mode: "direct" | "director", responses: any[], options: { ecology?: boolean; sideStreaming?: boolean; supportsTools?: boolean; databasePluginMemory?: {enabled():boolean;before(text:string):Promise<Array<{tag:string;kind:"digest";text:string}>>;after(id?:string):Promise<void>;recentHistoryMessages():number} } = {}) {
+type DatabasePluginWorldbookEntry = { uid?: number; comment?: string; content: string; enabled?: boolean; type?: string; keys?: string[]; position?: string; depth?: number; order?: number; prevent_recursion?: boolean };
+type DatabasePluginBeforeResult = { userInput: string; worldbookEntries: DatabasePluginWorldbookEntry[] };
+type DatabasePluginMemoryFixture = { enabled(): boolean; before(text: string): Promise<DatabasePluginBeforeResult>; after(id?: string): Promise<void>; recentHistoryMessages(): number; events?: string[] };
+const recalledOrderEntryContent = "<AM0001同序附记>保留上游顺序</AM0001同序附记>";
+const recalledEntryContent = "<记忆回溯>\n<recall>AM0001|Xd</recall>\n</记忆回溯>";
+const recalledLoreGroup = `${recalledOrderEntryContent}\n\n${recalledEntryContent}`;
+const recalledUserInput = (input: string) => `<本轮用户输入>${input}</本轮用户输入>\n<recall>AM0001|Xd</recall>`;
+function pluginBeforeResult(input: string): DatabasePluginBeforeResult {
+	return { userInput: recalledUserInput(input), worldbookEntries: [
+		{ uid: 100, comment: "AM0001同序附记", content: recalledOrderEntryContent, enabled: true, type: "system", keys: ["AM0001"], position: "at_depth_as_system", depth: 2, order: 10, prevent_recursion: true },
+		{ uid: 101, comment: "AM0001纪要正文", content: recalledEntryContent, enabled: true, type: "system", keys: ["AM0001"], position: "at_depth_as_system", depth: 2, order: 17, prevent_recursion: true },
+		{ uid: 102, comment: "禁用纪要索引", content: "<已发生的事件概览>\nAM0002|禁用索引不得投送</已发生的事件概览>", enabled: false, type: "system", keys: ["AM0002"], position: "at_depth_as_system", depth: 2, order: 18, prevent_recursion: true },
+	] };
+}
+function promptMessageText(message: any): string {
+	if (typeof message?.content === "string") return message.content;
+	if (Array.isArray(message?.content)) return message.content.map((part: any) => typeof part?.text === "string" ? part.text : "").join("");
+	return "";
+}
+function assertDatabasePluginOrder(events: string[]) {
+	const before = events.indexOf("before"), writer = events.indexOf("writer"), after = events.lastIndexOf("after");
+	assert.ok(before >= 0 && writer > before && after > writer, `expected before -> writer -> after, got ${events.join(" -> ")}`);
+}
+function assertDatabaseRecallRequest(requests: any[], input: string) {
+	const expectedUserInput = recalledUserInput(input);
+	const writerRequests = requests.filter(request => request.model === "writer");
+	const expected = writerRequests.find(request => {
+		const messages = request.context?.messages;
+		if (!Array.isArray(messages)) return false;
+		const lastUser = [...messages].reverse().find((message: any) => message.role === "user");
+		return promptMessageText(lastUser).endsWith(expectedUserInput);
+	});
+	assert.ok(expected, `a writer request must end its final user message with the plugin's exact writeback userInput; tails=${JSON.stringify(writerRequests.map(request => Array.isArray(request.context?.messages) ? [...request.context.messages].reverse().find((message: any) => message.role === "user") : null).map(message => promptMessageText(message).slice(-160)))}`);
+	const messages = expected.context.messages as any[];
+	const systemLore = messages.filter(message => message.role === "system" && promptMessageText(message).includes(recalledEntryContent));
+	assert.equal(systemLore.length, 1, "the enabled original lore entries must remain one independent system message with their wrappers intact");
+	assert.equal(promptMessageText(systemLore[0]), recalledLoreGroup, "same-position worldbook entries must preserve original order and wrapper bytes");
+	const loreIndex = messages.indexOf(systemLore[0]);
+	const originalMessages = messages.filter(message => message !== systemLore[0]);
+	assert.equal(loreIndex, Math.max(0, originalMessages.length - 2), `at_depth_as_system depth=2 must insert relative to the message tail; roles=${JSON.stringify(messages.map((message: any, index: number) => ({ index, role: message.role, text: promptMessageText(message).slice(-90) })))}`);
+	const serializedMessages = JSON.stringify(messages);
+	assert.match(serializedMessages, /AM0001\|Xd/);
+	assert.doesNotMatch(serializedMessages, /AM0002|禁用纪要索引|合成插件记忆|宿主概括/);
+	assert.equal(messages.some((message: any) => /^(?:【剧情记忆】|合成插件记忆|宿主概括)/.test(promptMessageText(message).trim())), false, "the host must not prepend its own narrative-memory summary message");
+	return expected;
+}
+function fixture(mode: "direct" | "director", responses: any[], options: { ecology?: boolean; sideStreaming?: boolean; supportsTools?: boolean; databasePluginMemory?: DatabasePluginMemoryFixture } = {}) {
 	const cwd = mkdtempSync(join(tmpdir(), "liyuan-dual-engine-"));
 	writeFileSync(join(cwd, "card.json"), JSON.stringify({ data: { name: "云澜", description: "谨慎的同门", first_mes: "你来了。" } }));
 	mkdirSync(join(cwd, ".liyuan"));
@@ -30,7 +76,8 @@ function fixture(mode: "direct" | "director", responses: any[], options: { ecolo
 		...(options.supportsTools === undefined ? {} : { supportsTools: options.supportsTools }),
 	} };
 	const streamFn: StageStreamFn = (m, context) => {
-		requests.push({ model: m.id, compat: { ...((m.compat as { streaming?: boolean } | undefined) ?? {}) }, context });
+		requests.push({ model: m.id, compat: { ...((m.compat as { streaming?: boolean } | undefined) ?? {}) }, context: structuredClone(context) });
+		if (m.id === "writer") options.databasePluginMemory?.events?.push("writer");
 		let response: any;
 		if (m.id === "writer") response = presentationFixtureReply(context) ?? responses.shift();
 		else if (m.id === "literaryDirector") response = { text: normalDirector };
@@ -243,13 +290,52 @@ test("取消支持工具调用后，导演仍执行固定3/2/2而不切直出", 
 test("原数据库接线：拍前投送、已落树规范正文拍后整理、旧自动压缩不再双写", async () => {
 	const body='青梧把铜钥匙收好，记下了未兑现的归还约定。'+"两人确认了眼前的安排。".repeat(25);
 	const calls: string[]=[];let f:ReturnType<typeof fixture>;
-	f=fixture("direct",[{text:body}],{databasePluginMemory:{enabled:()=>true,before:async text=>{calls.push("before");assert.equal(text,"继续。");return[{tag:"original-plugin",kind:"digest",text:"合成插件记忆：旧约定仍未兑现"}]},after:async id=>{calls.push("after");const entry=f.sm.getBranch().find(e=>e.id===id) as any;assert.equal(entry.message.details.rpNarrative,body);},recentHistoryMessages:()=>12}});
-	try{await f.engine.performTurn("继续。");assert.deepEqual(calls,["before","after"]);assert.ok(JSON.stringify(f.requests.find(r=>r.model==="writer").context).includes("合成插件记忆"));assert.ok(f.sm.getBranch().some((e:any)=>e.customType==="rp-database-memory"&&e.data.status==="complete"));assert.ok(!f.requests.some(r=>r.model==="compaction"||r.model==="memoryEvents"));assert.deepEqual(await f.engine.compactNow(),{kind:"skipped",reason:"upstream-plugin-managed"});}finally{f.cleanup()}
+	f=fixture("direct",[{text:body}],{databasePluginMemory:{enabled:()=>true,before:async text=>{calls.push("before");assert.equal(text,"继续。");return pluginBeforeResult(text)},after:async id=>{calls.push("after");const entry=f.sm.getBranch().find(e=>e.id===id) as any;assert.equal(entry.message.details.rpNarrative,body);},recentHistoryMessages:()=>12}});
+	try{await f.engine.performTurn("继续。");assert.deepEqual(calls,["before","after"]);assertDatabaseRecallRequest(f.requests,"继续。");assert.ok(f.sm.getBranch().some((e:any)=>e.customType==="rp-database-memory"&&e.data.status==="complete"));assert.ok(!f.requests.some(r=>r.model==="compaction"||r.model==="memoryEvents"));assert.deepEqual(await f.engine.compactNow(),{kind:"skipped",reason:"upstream-plugin-managed"});}finally{f.cleanup()}
+});
+
+test("插件拍前失败时不调用writer或after，且提交的user原文不污染", async () => {
+	let beforeCalls=0,afterCalls=0;
+	const f=fixture("direct",[{text:"不应生成的正文。"}],{databasePluginMemory:{enabled:()=>true,before:async()=>{beforeCalls++;throw new Error("synthetic before failure")},after:async()=>{afterCalls++},recentHistoryMessages:()=>12}});
+	try{
+		await f.engine.performTurn("原始输入。").catch(()=>undefined);
+		assert.equal(beforeCalls,1);assert.equal(afterCalls,0);
+		assert.equal(f.requests.filter(request=>request.model==="writer").length,0);
+		const users=f.sm.getBranch().filter((entry:any)=>entry.type==="message"&&entry.message.role==="user");
+		assert.equal(promptMessageText(users.at(-1)?.message),"原始输入。");
+	}finally{f.cleanup()}
 });
 
 test("原数据库失败不重写已保存故事：留下pending并在下一拍前恢复一次", async () => {
 	const first='青梧收下铜钥匙，承诺明日归还。'+"两人确认了眼前的安排。".repeat(25),second='青梧核对了昨天的约定，没有把它当作已经兑现。'+"她继续说明归还的安排。".repeat(25);
 	let fail=true;const ids:string[]=[];
-	const f=fixture("direct",[{text:first},{text:second}],{databasePluginMemory:{enabled:()=>true,before:async()=>[],after:async id=>{ids.push(id!);if(fail){fail=false;throw new Error("synthetic memory failure")}},recentHistoryMessages:()=>12}});
-	try{await f.engine.performTurn("收下钥匙。");const saved=replies(f.sm)[0];assert.equal(saved.message.details.rpNarrative,first);assert.ok(f.sm.getBranch().some((e:any)=>e.customType==="rp-database-memory"&&e.data.status==="pending"));await f.engine.performTurn("核对约定。");assert.equal(replies(f.sm).length,2);assert.deepEqual(ids.slice(0,2),[saved.id,saved.id]);assert.equal(ids.length,3);}finally{f.cleanup()}
+	const f=fixture("direct",[{text:first},{text:second}],{databasePluginMemory:{enabled:()=>true,before:async text=>({userInput:recalledUserInput(text),worldbookEntries:[]}),after:async id=>{ids.push(id!);if(fail){fail=false;throw new Error("synthetic memory failure")}},recentHistoryMessages:()=>12}});
+	try{await f.engine.performTurn("收下钥匙。");const saved=replies(f.sm)[0];assert.equal(saved.message.details.rpNarrative,first);assert.ok(f.sm.getBranch().some((e:any)=>e.customType==="rp-database-memory"&&e.data.status==="pending"));await f.engine.performTurn("核对约定。");assert.equal(replies(f.sm).length,2);assert.deepEqual(ids.slice(0,2),[saved.id,saved.id]);assert.equal(ids.length,3);assert.equal(f.sm.getBranch().find((entry:any)=>entry.id===saved.id)?.message.details.rpNarrative,first);assert.deepEqual(f.sm.getBranch().filter((entry:any)=>entry.type==="message"&&entry.message.role==="user").map((entry:any)=>promptMessageText(entry.message)),["收下钥匙。","核对约定。"]);}finally{f.cleanup()}
+});
+
+test("原插件交火召回以原文和条目元数据进入direct正式请求", async () => {
+	const input="原始输入。",body="直出作者完成的合成正文。"+"两人继续核对眼前安排。".repeat(25),events:string[]=[];
+	let f:ReturnType<typeof fixture>;
+	f=fixture("direct",[{text:body}],{databasePluginMemory:{enabled:()=>true,before:async text=>{events.push("before");assert.equal(text,input);return pluginBeforeResult(text)},after:async id=>{events.push("after");assert.equal((f.sm.getBranch().find((entry:any)=>entry.id===id) as any)?.message.details.rpNarrative,body)},recentHistoryMessages:()=>12,events}});
+	try{
+		await f.engine.performTurn(input);
+		assertDatabasePluginOrder(events);
+		const request=assertDatabaseRecallRequest(f.requests,input);assert.equal(request.model,"writer");
+		const users=f.sm.getBranch().filter((entry:any)=>entry.type==="message"&&entry.message.role==="user");assert.equal(promptMessageText(users.at(-1)?.message),input);
+	}finally{f.cleanup()}
+});
+
+test("原插件交火召回进入director正式请求与专家来源，原始user事实保持不变", async () => {
+	const input="原始输入。",body="导演主作者完成的合成定稿。"+"两人继续核对眼前安排。".repeat(25),events:string[]=[];
+	let f:ReturnType<typeof fixture>;
+	f=fixture("director",directorScript(body),{databasePluginMemory:{enabled:()=>true,before:async text=>{events.push("before");assert.equal(text,input);return pluginBeforeResult(text)},after:async id=>{events.push("after");assert.equal((f.sm.getBranch().find((entry:any)=>entry.id===id) as any)?.message.details.rpNarrative,body)},recentHistoryMessages:()=>12,events}});
+	try{
+		await f.engine.performTurn(input);
+		assertDatabasePluginOrder(events);
+		assertDatabaseRecallRequest(f.requests,input);
+		const experts=f.requests.filter(request=>request.model!=="writer"&&request.model!=="scribe");
+		assert.ok(experts.length>0);assert.ok(experts.some(request=>JSON.stringify(request.context).includes("<recall>AM0001|Xd</recall>")),"director expert request sources must include recalled AM material");
+		for(const request of experts)assert.doesNotMatch(JSON.stringify(request.context),/AM0002|禁用纪要索引/);
+		const users=f.sm.getBranch().filter((entry:any)=>entry.type==="message"&&entry.message.role==="user");assert.equal(promptMessageText(users.at(-1)?.message),input);
+	}finally{f.cleanup()}
 });

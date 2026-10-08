@@ -1,6 +1,6 @@
 # 当前部署与运维模板
 
-本文件不保存实际公网地址、账号、SSH/OAuth/API凭据。当前应用v1.8.7，结果见 `../docs/VALIDATION-20261007.md`；应用与独立CLI Proxy版本分别核验。
+本文件不保存实际公网地址、账号、SSH/OAuth/API凭据。当前应用v1.8.9，结果见 `../docs/VALIDATION-20261007.md`；应用与独立CLI Proxy版本分别核验。
 
 ## 部署前
 
@@ -30,3 +30,11 @@ CLI Proxy补丁镜像须固定，不用latest覆盖后宣称心跳补丁仍在�
 ## 发布与回滚
 
 回滚只恢复自己的目标源码/dist/配置，保用户新数据，不删除记忆/会话卷。旧原始/对照实例不要擅自启动。只有用户明确授权才commit/push/Release；运行备份与记录不得包含公开凭据。
+
+## v1.8.10原生召回维护注意
+
+本机v1.8.10已部署；原插件仍固定原naiv1.2.4字节。宿主不再关闭剧情记忆任务、不自行读取禁用索引替代原writeback。填表/召回沿用已有3.8 Flash，默认作者和其它岗位不换。
+
+此修复同时涉及AI包的inline system消息，部署必须同步对应源码与离线编译dist；只更新前端或引擎会让深度世界书在最终HTTP转换时丢失。保留当前dirty改动，不依据旧HEAD全量回退；回退只用本次受限source-before与dist备份。原生Google/Anthropic/Bedrock不能表达inline system时明确失败，当前Gemini连接为OpenAI兼容接口。
+
+验收与私有数据保护结果见 `docs/VALIDATION-DATABASE-v1.8.10.md`，不把旧三拍或合成两千纪要冒称新真实千楼文学评测。

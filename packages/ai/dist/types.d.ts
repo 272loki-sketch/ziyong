@@ -273,6 +273,11 @@ export interface UserMessage {
     content: string | (TextContent | ImageContent)[];
     timestamp: number;
 }
+export interface SystemMessage {
+    role: "system";
+    content: TextContent[];
+    timestamp: number;
+}
 export interface AssistantMessage {
     role: "assistant";
     content: (TextContent | ThinkingContent | ToolCall)[];
@@ -296,7 +301,7 @@ export interface ToolResultMessage<TDetails = any> {
     isError: boolean;
     timestamp: number;
 }
-export type Message = UserMessage | AssistantMessage | ToolResultMessage;
+export type Message = SystemMessage | UserMessage | AssistantMessage | ToolResultMessage;
 export type ImagesInputContent = TextContent | ImageContent;
 export type ImagesOutputContent = TextContent | ImageContent;
 export interface ImagesContext {
@@ -392,6 +397,8 @@ export type AssistantMessageEvent = {
  * Use this to override URL-based auto-detection for custom providers.
  */
 export interface OpenAICompletionsCompat {
+    /** Whether the endpoint accepts native function/tool calling. Default: true. */
+    supportsTools?: boolean;
     /** Whether the provider supports the `store` field. Default: auto-detected from URL. */
     supportsStore?: boolean;
     /** Whether the provider supports the `developer` role (vs `system`). Default: auto-detected from URL. */
@@ -428,6 +435,8 @@ export interface OpenAICompletionsCompat {
     sendSessionAffinityHeaders?: boolean;
     /** Whether the provider supports long prompt cache retention (`prompt_cache_retention: "24h"` or Anthropic-style `cache_control.ttl: "1h"`, depending on format). Default: true. */
     supportsLongCacheRetention?: boolean;
+    /** Whether to use streaming. Set to false to call the non-streaming endpoint and synthesize stream events from the full response. Default: true. */
+    streaming?: boolean;
 }
 /** Compatibility settings for OpenAI Responses APIs. */
 export interface OpenAIResponsesCompat {
@@ -437,6 +446,8 @@ export interface OpenAIResponsesCompat {
     sendSessionIdHeader?: boolean;
     /** Whether the provider supports `prompt_cache_retention: "24h"`. Default: true. */
     supportsLongCacheRetention?: boolean;
+    /** Whether to use streaming. Set to false to call the non-streaming endpoint and synthesize stream events from the full response. Default: true. */
+    streaming?: boolean;
 }
 /** Compatibility settings for Anthropic Messages-compatible APIs. */
 export interface AnthropicMessagesCompat {
@@ -484,6 +495,13 @@ export interface AnthropicMessagesCompat {
     forceAdaptiveThinking?: boolean;
     /** Whether to replay empty thinking signatures as `signature: ""` instead of converting thinking to text. Default: false. */
     allowEmptySignature?: boolean;
+    /** Whether to use streaming. Set to false to call the non-streaming endpoint and synthesize stream events from the full response. Default: true. */
+    streaming?: boolean;
+}
+/** Compatibility settings for Google Generative AI / Vertex APIs. */
+export interface GoogleCompat {
+    /** Whether to use streaming. Set to false to use non-streaming generateContent. Default: true. */
+    streaming?: boolean;
 }
 /**
  * OpenRouter provider routing preferences.
@@ -587,7 +605,7 @@ export interface Model<TApi extends Api> {
     maxTokens: number;
     headers?: Record<string, string>;
     /** Compatibility overrides for OpenAI-compatible APIs. If not set, auto-detected from baseUrl. */
-    compat?: TApi extends "openai-completions" ? OpenAICompletionsCompat : TApi extends "openai-responses" ? OpenAIResponsesCompat : TApi extends "anthropic-messages" ? AnthropicMessagesCompat : never;
+    compat?: TApi extends "openai-completions" ? OpenAICompletionsCompat : TApi extends "openai-responses" ? OpenAIResponsesCompat : TApi extends "anthropic-messages" ? AnthropicMessagesCompat : TApi extends "google-generative-ai" | "google-vertex" ? GoogleCompat : never;
 }
 export interface ImagesModel<TApi extends ImagesApi> extends Omit<Model<Api>, "api" | "provider" | "reasoning" | "contextWindow" | "maxTokens" | "compat"> {
     api: TApi;

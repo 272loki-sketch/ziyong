@@ -269,6 +269,8 @@ export function codexNamesFromBranch(branch: BranchEntryLike[]): string[] {
 // ---------------- system prompt（字节稳定） ----------------
 
 export interface StageSystemOptions {
+	/** Exact native plugin worldbook before/after-character placement. */
+	databaseWorldbook?: { before: string; after: string };
 	card: CharacterCard;
 	config: RpConfig;
 	constantLore: LorebookEntry[];
@@ -300,6 +302,7 @@ export function buildStageSystemPrompt({
 	card,
 	config,
 	constantLore,
+	databaseWorldbook,
 	presetBefore,
 	declaredMarkers,
 	skills,
@@ -329,6 +332,7 @@ export function buildStageSystemPrompt({
 
 	// 1) 预设装配段：原文原序，零 harness 引导语。卡/世界书/人设已在预设作者指定的槽位里。
 	if (presetBefore && presetBefore.length > 0) sections.push(presetBefore.join("\n\n"));
+	if (databaseWorldbook?.before) sections.push(databaseWorldbook.before);
 
 	// 2) 兜底：预设没声明的 marker 槽位，梨园按自己的版式补——补的是位置，不是措辞之外的话。
 	const charParts: string[] = [];
@@ -339,6 +343,7 @@ export function buildStageSystemPrompt({
 		charParts.push(`## 对白示例（仅供文风与语气参考，不是已发生的剧情）\n${m(card.mesExample)}`);
 	}
 	if (charParts.length > 0) sections.push([generationMode ? `# 角色卡资料：${card.name}` : `# 你扮演的角色：${card.name}`, ...charParts].join("\n\n"));
+	if (databaseWorldbook?.after) sections.push(databaseWorldbook.after);
 
 	if (!declared.has("personaDescription")) {
 		sections.push(

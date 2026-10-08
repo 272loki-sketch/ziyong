@@ -15,6 +15,7 @@ import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSyn
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { DatabasePluginHttp } from "./database-plugin-http.ts";
 import { DatabasePluginRuntime } from "./database-plugin-runtime.ts";
+import { createDatabasePluginGenerator } from "./database-plugin-generation.ts";
 import { presentationFactText } from "../src/stage/agent-presentation.ts";
 import { createHash, randomBytes } from "node:crypto";
 import { networkInterfaces } from "node:os";
@@ -712,7 +713,7 @@ const helloFrame = (): ServerFrame => {
 					const legacyCalendar = presentation.calendar ? undefined : parseLegacyCalendarSource(rawCurtain);
 					if (legacyCalendar) presentation.calendar = legacyCalendar;
 					// Adaptive delivery already contains the card-authored calendar; native data was reference only.
-					if (typeof details.rpPresentationBody === "string") delete presentation.calendar;
+					if (messages[i].presentationDelivery?.status === "complete") delete presentation.calendar;
 					const optionMatch = rawCurtain.match(/<options>\s*([\s\S]*?)\s*<\/options>/i);
 					// 当前卡若已有 options 美化正则，HTML 会在正文中展示；不要再叠加
 					// 原生 presentation 卡，避免同一组选项出现一份美化、一份裸卡。
@@ -2441,7 +2442,26 @@ async function handleAccessApi(req: IncomingMessage, res: ServerResponse, url: s
 	}
 }
 
+const runDatabasePluginModel=createDatabasePluginGenerator({
+ findModel:ref=>currentlyConfiguredModels().find(m=>m.provider===ref.provider&&m.id===ref.id),
+ defaultModel:()=>{const config=loadStageMaterials(cwd).config;return resolveStepModel("memoryEvents",config.stepModels,session.model,(provider,id)=>currentlyConfiguredModels().find(m=>m.provider===provider&&m.id===id)).model;},
+ auth:model=>session.modelRegistry.getApiKeyAndHeaders(model as never),
+});
+
 const databasePlugin = new DatabasePluginHttp(cwd, {
+	// Management polls identities only; do not load worldbooks or map all historical text on each poll.
+	binding: () => {
+		const branch = session.sessionManager.getBranch() as BranchEntryLike[];
+		let sourceEntryId = `session:${session.sessionId}`;
+		for (let i = branch.length - 1; i >= 0; i--) {
+			const entry = branch[i];
+			if (entry.type !== "message" || !entry.id || !entry.message || !["user", "assistant"].includes(entry.message.role ?? "")) continue;
+			const details = entry.message.details as Record<string, unknown> | undefined;
+			const text = entry.message.role === "assistant" && !details?.rpGreeting ? committedNarrativeText(entry) : extractEntryText(entry.message.content);
+			if (text.trim()) { sourceEntryId = entry.id; break; }
+		}
+		return { scope: { sessionId: session.sessionId, card: cardPath || undefined }, sourceEntryId };
+	},
 	isStreaming: () => readStoryStreaming(),
 	context: () => {
 		const branch = session.sessionManager.getBranch() as BranchEntryLike[];
@@ -2462,29 +2482,23 @@ const databasePlugin = new DatabasePluginHttp(cwd, {
 			chat, readonlyBooks: { [`Liyuan-Materials-Readonly-${createHash("sha256").update(cardPath||"nocard").digest("hex").slice(0,12)}`]: { entries: materials.entries.map(entry=>({uid:entry.uid,comment:entry.comment,name:entry.comment,content:entry.content,keys:entry.keys,key:entry.keys,type:entry.constant?"constant":"keyword",constant:entry.constant,enabled:entry.enabled,order:entry.order,selective:entry.selective})) } }, character: { name: materials.card.name, description: materials.card.description, personality: materials.card.personality,
 				scenario: materials.card.scenario, first_mes: materials.card.firstMes, extensions: {} }, userName: materials.config.userName };
 	},
-	generate: async (prompts, signal) => {
-		const config = loadStageMaterials(cwd).config;
-		const model = resolveStepModel("memoryEvents", config.stepModels, session.model,
-			(provider, id) => currentlyConfiguredModels().find(m => m.provider === provider && m.id === id)).model;
-		if (!model) throw new Error("数据库整理模型尚未配置");
-		const auth = await session.modelRegistry.getApiKeyAndHeaders(model as never);
-		if (!auth.ok) throw new Error("数据库整理模型鉴权不可用");
-		const systemPrompt = prompts.filter(p => p.role === "system").map(p => p.content).join("\n\n");
-		const messages = prompts.filter(p => p.role !== "system").map(p => p.role === "assistant"
-			? { role: "assistant", content: [{ type: "text", text: p.content }], api: model.api, provider: model.provider, model: model.id,
-				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 0 }
-			: { role: "user", content: [{ type: "text", text: p.content }], timestamp: 0 });
-		const memoryHeaders = { ...(auth.headers ?? {}) }; if (!memoryHeaders["user-agent"] && !memoryHeaders["User-Agent"]) memoryHeaders["user-agent"]="Mozilla/5.0";
-		const source = streamSimple(model as never, { systemPrompt, messages: messages as never }, { apiKey: auth.apiKey, headers: memoryHeaders,
-			maxTokens: Math.min(model.maxTokens ?? 16384, 16384), reasoning:"off", signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(180000)]) : AbortSignal.timeout(180000), maxRetries: 0 });
-		for await (const _event of source) { /* Original plugin consumes the final response; intermediate reasoning is not persisted. */ }
-		const result = await source.result();
-		if (result.stopReason === "error" || result.stopReason === "aborted") throw new Error("数据库整理模型未完成，本次记忆没有成功收据");
-		return result.content.filter(part => part.type === "text").map(part => part.type === "text" ? part.text : "").join("");
+	modelAuth: async (provider) => {
+		const desired=databasePlugin.config().fillModel??databasePlugin.config().recallModel;
+		const model=currentlyConfiguredModels().find(m=>m.provider===provider&&(!desired||desired.provider!==provider||m.id===desired.id))??currentlyConfiguredModels().find(m=>m.provider===provider);
+		if(!model)throw new Error("梨园连接没有已启用的模型");
+		const auth=await session.modelRegistry.getApiKeyAndHeaders(model as never);
+		if(!auth.ok)throw new Error("梨园这个连接的鉴权不可用");
+		return {apiKey:auth.apiKey,headers:auth.headers};
+	},
+	complete: (payload,options,signal) => runDatabasePluginModel(payload.messages,signal,{...options,payload}),
+	generate: async (prompts,signal,options) => {
+		const reply=await runDatabasePluginModel(prompts,signal,options);
+		return reply.choices[0].message.content??"";
 	},
 });
 const databasePluginRuntime = new DatabasePluginRuntime(databasePlugin, () => `http://127.0.0.1:${(httpServer.address() as { port: number } | null)?.port ?? 7620}`);
 databasePlugin.onSourceChanged = () => databasePluginRuntime.close();
+databasePlugin.onConfigChanged = () => databasePluginRuntime.close();
 
 const httpServer = createServer((req, res) => {
 	void (async () => {
@@ -2493,7 +2507,7 @@ const httpServer = createServer((req, res) => {
 			await handleAccessApi(req, res, urlPath);
 			return;
 		}
-		const databaseHostRequest = (urlPath.startsWith("/api/database-plugin") || urlPath.startsWith("/database-plugin-host") || urlPath.startsWith("/api/files/") || urlPath.startsWith("/user/files/") || urlPath === "/api/chats/get" || urlPath === "/api/chats/group/get") && req.headers["x-liyuan-database-host"] === databasePlugin.internalToken;
+		const databaseHostRequest = (urlPath.startsWith("/api/database-plugin") || urlPath.startsWith("/database-plugin-host") || urlPath.startsWith("/api/files/") || urlPath.startsWith("/user/files/") || urlPath === "/api/chats/get" || urlPath === "/api/chats/group/get" || urlPath === "/api/backends/chat-completions/status" || urlPath === "/api/backends/chat-completions/generate") && req.headers["x-liyuan-database-host"] === databasePlugin.internalToken;
 		if (accessGuarded(urlPath) && !requestAuthed(req) && !databaseHostRequest) {
 			res.writeHead(401, { "content-type": "application/json" });
 			res.end(JSON.stringify({ error: "需要登录" }));
@@ -2598,7 +2612,7 @@ const httpServer = createServer((req, res) => {
 				const name = file.replace(/\\/g, "/");
 				if (name.includes("/assets/")) {
 					headers["cache-control"] = "public, max-age=31536000, immutable";
-				} else if (name.endsWith("/sw.js")) {
+				} else if (name.endsWith("/sw.js") || name.endsWith("/database-plugin-host.js")) {
 					headers["cache-control"] = "no-cache";
 				} else {
 					headers["cache-control"] = "public, max-age=86400";
@@ -2657,12 +2671,12 @@ const stage = new StageEngine({
 	// memory_search 工具：剧情库 + 外部资料库合并取前 6（与扩展侧同一套语义）
 	databasePluginMemory: {
 		enabled: () => databasePlugin.config().enabled,
-		before: async (userText, signal) => { await databasePluginRuntime.before(userText, signal); return databasePlugin.injection(userText); },
+		before: async (userText, signal) => { const prepared = await databasePluginRuntime.before(userText, signal); return databasePlugin.prompt(prepared.userInput); },
 		after: async (sourceEntryId, signal) => { await databasePluginRuntime.after(sourceEntryId, signal); },
 		recentHistoryMessages: () => databasePlugin.config().recentHistoryMessages,
 	},
 	searchMemory: async (sessionId, query) => {
-		if (databasePlugin.config().enabled) { await databasePluginRuntime.before(query); return (await databasePlugin.injection(query)).map(block=>({text:block.text,meta:{title:block.tag,kind:"digest" as const}})); }
+		if (databasePlugin.config().enabled) { const prepared = await databasePluginRuntime.before(query); return (await databasePlugin.injection(prepared.userInput)).map(block=>({text:block.text,meta:{title:block.tag,kind:"digest" as const}})); }
 		const scope = { sessionId, card: cardPath || undefined };
 		const visibleEntryIds = new Set(
 			session.sessionManager.getBranch().map((entry) => entry.id).filter((id): id is string => typeof id === "string"),

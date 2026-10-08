@@ -1,6 +1,6 @@
 # AGENTS.md — 梨园项目维护约束
 
-进入项目先读本文件，再读 `docs/DOCUMENTATION-INDEX.md`、`ARCHITECTURE-OVERVIEW.md`、`GENERATION-MODES.md` 与 `PLAN-ROUND-FLOW.md`。本地v1.8.7，发布状态/实际门禁单列，不据工作区版本冒称公开Release。
+进入项目先读本文件，再读 `docs/DOCUMENTATION-INDEX.md`、`ARCHITECTURE-OVERVIEW.md`、`GENERATION-MODES.md` 与 `PLAN-ROUND-FLOW.md`。本地v1.8.10，发布状态/实际门禁单列，不据工作区版本冒称公开Release。
 
 ## 必守边界
 
@@ -19,7 +19,7 @@
 - `src/stage/engine.ts` / `agent-turn.ts` / `agent-director.ts`：模式、作者、阶段、保存与共用结算。
 - `agent-presentation.ts` / `materials.ts` / `assemble.ts`：原文资料、事实/格式边界。
 - `literary-world-*.ts` / `literary-ecology.ts`：世界与生态，另见相关现行PLAN。
-- `server/database-plugin-*.ts` / `web/public/database-plugin-host.*`：原上游数据库的私有缓存、宿主适配、作用域与浏览器运行时；源码不fork，升级先验哈希与原插件回归。
+- `server/database-plugin-*.ts` / `web/public/database-plugin-host.*`：原上游数据库的私有缓存、宿主适配、作用域与浏览器运行时；源码不fork，升级先验哈希与原插件回归。原生剧情任务包含召回，不强制关闭plotEnabledGlobal；输入写回模板与世界书位置由上游决定，不自行读禁用索引、改写/前置记忆或截断条目。安装文件一致不证明宿主行为百分之百原生等价；宿主API/事件、配置迁移及世界书投送是兼容实现，文档不得混淆。
 - `src/memory/` / `stage/compact.ts`：旧SQLite库保留回退；插件启用后不再自动剧情双写。
 - `src/outline/` / `src/novel-play/`：导演室、大纲、研究、小说消化和开演。
 - `src/tools/` / `.liyuan/extensions/roleplay.ts`：能力投影和旧SDK/热刷新接线。

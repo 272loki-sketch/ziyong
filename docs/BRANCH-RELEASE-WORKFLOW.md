@@ -1,28 +1,23 @@
-# 分支发布流程
+# 当前分支与发布流程
 
-当前小说开演版本使用分支隔离，`main` 保持原有稳定基线。
+核对日期：2026-10-08。项目当前本地及已部署版本v1.8.10；部署、Git提交/推送和GitHub Release是不同状态，不互相推定。
 
-## 分支
+## 当前仓库
 
-- `main`: 稳定基线，不直接承载未完成的小说开演功能。
-- `feat/novel-play-foundation`: 功能开发、修复和专项验证分支。
-- `release/novel-play-v1.7.0`: 从功能分支复制的候选发布分支，用于最后人工验收和部署准备。
+- 当前工作分支：`local`，跟踪 `origin/local`。
+- 远端：`272loki-sketch/ziyong`。
+- 本次用户要求更新文档并推送现有项目。正常提交后，仅对当前跟踪分支做非强制推送；不顺带覆盖main、删除远端分支/历史、改默认分支或创建Release。
+- 旧v1.7.0功能/发布分支流程不再作为本次操作指令。
 
-## 更新步骤
+## 推送前门禁
 
-```bash
-git fetch origin
-git switch release/novel-play-v1.7.0
-git pull --ff-only origin release/novel-play-v1.7.0
-npm ci
-node --test --test-reporter=./scripts/test-summary.mjs test/novel-play*.test.ts
-node --test --test-reporter=./scripts/test-summary.mjs test/*.test.ts
-npm --prefix web ci
-npm --prefix web run build
-```
+1. 阅读AGENTS和当前文档；保留继承的工作区改动，不reset。
+2. 完成 `npm run verify`，必要时单列候选build、原插件浏览器及真实模型范围；不把合成千楼当实际千楼问答准确率。
+3. 精确暂存项目代码、对应构建产物、测试和文档；检查完整暂存树，不使用未经核验的全目录上传。
+4. 私人配置、会话、Key/OAuth/SSH、用户卡/预设/世界书、截图、记忆数据库和 `.liyuan-database-plugin` 上游缓存/运行状态不进提交。临时凭据只允许内存/禁回显输入，不进URL、脚本、日志或Git配置。
+5. 核验远端当前分支头；远端有新提交时停止覆盖，不force推送。沿现有跟踪分支推送后，再查询远端提交哈希与版本文件。
+6. 返回具体提交、分支、版本、测试和未完成状态。推送失败不能写“已同步”；没有显式Release请求不创建Release。
 
-如果功能分支继续修复，先在 `feat/novel-play-foundation` 完成测试，再重新创建或快进发布分支。不要直接把发布分支强制回写到 `main`。
+## 本次实现边界
 
-## 当前状态
-
-最新代码先推送到 `feat/novel-play-foundation`，再推送到 `release/novel-play-v1.7.0`。当前没有合并 `main`，也没有创建正式 GitHub Release。真实模型和浏览器人工验收完成后，再决定是否合并。
+数据库安装文件原样下载并校验，不是完整clone重编；宿主API/事件、配置迁移和世界书激活/深度投送由梨园兼容实现。源码字节一致不等于所有执行行为原生等价，见 `DATABASE-PLUGIN.md`。

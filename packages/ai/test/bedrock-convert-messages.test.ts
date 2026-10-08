@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 const bedrockMock = vi.hoisted(() => ({
 	constructorCalls: [] as Array<Record<string, unknown>>,
+	sendCalls: 0,
 }));
 
 vi.mock("@aws-sdk/client-bedrock-runtime", () => {
@@ -13,6 +14,7 @@ vi.mock("@aws-sdk/client-bedrock-runtime", () => {
 		}
 
 		send(): Promise<never> {
+			bedrockMock.sendCalls++;
 			return Promise.reject(new Error("mock send"));
 		}
 	}
@@ -67,6 +69,19 @@ async function capturePayload(context: Context): Promise<unknown> {
 }
 
 describe("bedrock convertMessages skips unknown content types", () => {
+	it("returns a clear error for inline system messages instead of relocating them", async () => {
+		bedrockMock.sendCalls = 0;
+		const result = await streamBedrock(
+			baseModel,
+			{ messages: [{ role: "system", content: [{ type: "text", text: "depth lore" }], timestamp: 0 }] },
+			{ cacheRetention: "none" },
+		).result();
+
+		expect(bedrockMock.sendCalls).toBe(0);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toMatch(/does not support inline system messages/);
+	});
+
 	it("skips unknown user content blocks instead of throwing", async () => {
 		const messages: Message[] = [
 			{

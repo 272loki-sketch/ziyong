@@ -78,6 +78,9 @@ export function parseAgentPresentation(text: string, frozenNarrative: string, au
 		let cursor=0,usedReferences=false;
 		for(const item of row.layout){
 			if(!item||typeof item!=="object")continue;
+			// A complete image-only fragment remains presentation, even when the model labels it format.
+			// Reclassify its placement, not its bytes; frozen narrative and original-image checks still apply.
+			if(item.kind==="format"&&typeof item.text==="string"&&[...item.text.matchAll(IMAGE_BLOCK)].length&&presentationFactText(item.text)==="")item.kind="image";
 			if(item.kind==="narrative"&&Array.isArray(item.refs)){
 				usedReferences=true;let text="";
 				for(const id of item.refs){if(segments[cursor]?.id!==id)return {ok:false,error:"正文引用必须完整、按原次序且恰好一次，不得遗漏、重排或重复原段"};text+=segments[cursor++].text;}
@@ -111,6 +114,8 @@ export function parseAgentPresentation(text: string, frozenNarrative: string, au
 	const output = Array.isArray(row.layout) ? row.layout.map(part => part.text).join("") : `${row.body}\n\n${row.formats}`;
 	const requirements: AgentPresentationDelivery["requirements"] = [];
 	for (const requirement of row.requirements) {
+		// Known image evidence aliases are validated against the actual delivered image, never trusted by label.
+		if(requirement&&["image","inline-images"].includes(requirement.kind)&&typeof requirement.quote==="string"&&[...requirement.quote.matchAll(IMAGE_BLOCK)].length&&presentationFactText(requirement.quote)===""&&body.includes(requirement.quote))requirement.kind="card-format";
 		if (!requirement || typeof requirement.name !== "string" || !["actions", "card-format"].includes(requirement.kind) || typeof requirement.quote !== "string" || requirement.quote.trim().length < 3 || !output.includes(requirement.quote)) return { ok: false, error: "格式核对项必须引用本次实际交付的逐字片段，不能只声称已输出" };
 		requirements.push({ name: requirement.name, kind: requirement.kind, ...(typeof requirement.id==="string"?{id:requirement.id}:{}), quote: requirement.quote });
 	}

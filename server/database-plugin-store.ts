@@ -1,4 +1,4 @@
-import { chmodSync, constants, lstatSync, mkdirSync } from "node:fs";
+import { chmodSync, constants, lstatSync, mkdirSync, renameSync } from "node:fs";
 import { chmod, lstat, mkdir, open, readdir, rename, rmdir, unlink, type FileHandle } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { dirname, join, relative, resolve, sep } from "node:path";
@@ -348,7 +348,7 @@ async function fsyncDirectory(path: string): Promise<void> {
 	}
 }
 
-async function writeAtomic(targetPath: string, data: Uint8Array): Promise<void> {
+async function writeAtomic(targetPath: string, data: Uint8Array, guard?:()=>void): Promise<void> {
 	const parent = dirname(targetPath);
 	const existing = await lstat(targetPath).catch((error: unknown) => {
 		if (isNodeError(error, "ENOENT")) return null;
@@ -366,7 +366,7 @@ async function writeAtomic(targetPath: string, data: Uint8Array): Promise<void> 
 		await handle.close();
 		handle = undefined;
 		await chmod(tempPath, PRIVATE_FILE_MODE);
-		await rename(tempPath, targetPath);
+		if(guard){guard();renameSync(tempPath,targetPath);}else await rename(tempPath,targetPath);
 		await chmod(targetPath, PRIVATE_FILE_MODE);
 		await fsyncDirectory(parent);
 	} catch (error) {
@@ -504,6 +504,7 @@ export class DatabasePluginStore {
 		sourceEntryId: string | undefined,
 		expectedRevision: number,
 		state: DatabasePluginHostState,
+		guard?:()=>void,
 	): Promise<DatabasePluginStateWriteResult> {
 		const normalizedScope = normalizeScope(scope);
 		const source = validateSourceEntryId(sourceEntryId);
@@ -515,6 +516,7 @@ export class DatabasePluginStore {
 		const release = await this.acquireScopeLock(directories.scopeDirectory);
 		try {
 			const head = await this.readStateHead(directories.scopeDirectory);
+			guard?.();
 			if (head.globalRevision !== expectedRevision) throw new DatabasePluginStoreConflictError(expectedRevision, head.globalRevision);
 			if (head.globalRevision >= Number.MAX_SAFE_INTEGER) {
 				throw new DatabasePluginStoreError("revision_exhausted", "Database-plugin state revision space is exhausted.");
@@ -537,7 +539,7 @@ export class DatabasePluginStore {
 				snapshots: [...head.snapshots, { revision, file, sourceEntryId: source ?? null }],
 			};
 			const headBytes = serializeLimitedJson(nextHead, "state head");
-			await writeAtomic(join(directories.scopeDirectory, STATE_HEAD_FILE), headBytes);
+			await writeAtomic(join(directories.scopeDirectory, STATE_HEAD_FILE), headBytes,guard);
 			const snapshot: DatabasePluginStateSnapshot = {
 				revision,
 				...(source === undefined ? {} : { sourceEntryId: source }),

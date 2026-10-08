@@ -237,3 +237,12 @@ test("scope state snapshot and head files are private and concurrent reads retur
 	const head = JSON.parse(readFileSync(join(scopeDirectory, "state-head.json"), "utf8")) as { globalRevision: number };
 	assert.equal(head.globalRevision, 1);
 }));
+
+// A guarded publication must validate immediately before the authoritative head becomes visible.
+test('database plugin state publication guard refuses a revoked binding after asynchronous staging',async()=>{
+ const cwd=mkdtempSync(join(tmpdir(),'liyuan-plugin-revoked-'));try{
+  const store=new DatabasePluginStore(cwd);let checks=0;
+  await assert.rejects(store.saveState({sessionId:'synthetic'},'a-1',0,{messages:{},chatMetadata:{},extensionSettings:{},worldbooks:{}},()=>{checks++;if(checks>1)throw new Error('binding revoked before commit')}),/binding revoked/);
+  const state=await store.readState({sessionId:'synthetic'},new Set(['a-1']));assert.equal(state.globalRevision,0);assert.equal(state.snapshot,null);
+ }finally{rmSync(cwd,{recursive:true,force:true})}
+});

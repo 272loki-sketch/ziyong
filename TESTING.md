@@ -1,6 +1,6 @@
 # 当前验证与测试边界
 
-本地v1.8.7，结果与未覆盖项见 [本次验收](docs/VALIDATION-20261007.md)。不要把旧版本测试数字、部署或失败恢复当成本次结果。
+本地v1.8.10，数据库原生召回最新结果见 [原生链路验收](docs/VALIDATION-DATABASE-v1.8.10.md)，先前API/实战结果见 [API／连续实战验收](docs/VALIDATION-DATABASE-v1.8.9.md)，其它结果与未覆盖项见 [既有验收](docs/VALIDATION-20261007.md)。不要把旧版本测试数字、部署或失败恢复当成本次结果。
 
 ## 离线门禁
 
@@ -10,8 +10,11 @@ npm run test:connect-config  # 默认/覆盖/未知字段保护（离线）
 node test/model-tool-support.test.ts  # runtime/引擎/本机合成HTTP（不调外部模型）
 npm run test:lorebook-panel  # 内嵌书、来源/修订/行键、PNG、批量与缓存
 npm run test:database-plugin
+node test/database-plugin-prompt.test.ts
+node test/database-plugin-system-messages.test.ts # 本机HTTP，走已编译SDK dist，非外部API
 # 原脚本浏览器验收必须显式提供已校验的缓存和合成宿主，不下载/写生产：
 LIYUAN_DATABASE_PLUGIN_TEST_SOURCE=/tmp/index.js LIYUAN_DATABASE_PLUGIN_TEST_VENDOR=/tmp/vendor npm run test:database-plugin-browser
+LIYUAN_DATABASE_MANAGER_DIST=/tmp/web-dist LIYUAN_DATABASE_PLUGIN_TEST_SOURCE=/tmp/index.js LIYUAN_DATABASE_PLUGIN_TEST_VENDOR=/tmp/vendor npm run test:database-plugin-manager
 node test/memory-narrative-window.test.ts
 node test/memory.test.ts
 node test/rp-memory.test.ts
@@ -25,7 +28,9 @@ Node≥22.19.0，使用已安装依赖，不临时下载tsx。测试HOME/TMPDIR/
 
 ## 浏览器和构建
 
-候选dist构建至临时目录，支持 `LIYUAN_LORE_DIST` / `LIYUAN_READER_DIST` / `LIYUAN_CONNECT_DIST`；`test:lorebook-browser`、`test:record-reader`使用合成数据，无剧情模型调用。截图/日志留临时目录。桌面与手机检查来源入口、全文、过期请求、只读Portal、溢出和页面错误。
+候选dist构建至临时目录，支持 `LIYUAN_LORE_DIST` / `LIYUAN_READER_DIST` / `LIYUAN_CONNECT_DIST`；`test:lorebook-browser`、`test:record-reader`使用合成数据，无剧情模型调用。截图/日志留临时目录。数据库独立管理台验收使用原插件与真正REST/WS宿主，人物表编辑/保存、模式与数据管理导航、桌面/手机、过期卡绑定和加载失败均只用合成数据；禁止付费生成请求。
+
+桌面与手机检查来源入口、全文、过期请求、只读Portal、溢出和页面错误。
 
 `npm run test:connect-browser`使用隔离合成配置核验逐模型工具开关、保存/刷新/重新开启、失败不假成功、多渠道/未知字段/默认模型保护及手机布局；截图可指定 `LIYUAN_CONNECT_ARTIFACTS`，不会试写生产API配置或调用收费模型。
 

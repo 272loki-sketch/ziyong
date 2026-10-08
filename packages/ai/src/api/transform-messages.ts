@@ -72,6 +72,11 @@ export function transformMessages<TApi extends Api>(
 
 	// First pass: transform messages (unsupported image downgrade, thinking blocks, tool call ID normalization)
 	const transformed = imageAwareMessages.map((msg) => {
+		// System messages contain plain text only and must retain their exact position.
+		if (msg.role === "system") {
+			return msg;
+		}
+
 		// User messages pass through unchanged
 		if (msg.role === "user") {
 			return msg;
@@ -203,6 +208,8 @@ export function transformMessages<TApi extends Api>(
 			result.push(msg);
 		} else if (msg.role === "toolResult") {
 			existingToolResultIds.add(msg.toolCallId);
+			result.push(msg);
+		} else if (msg.role === "system") {
 			result.push(msg);
 		} else if (msg.role === "user") {
 			// User message interrupts tool flow - insert synthetic results for orphaned calls

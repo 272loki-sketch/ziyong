@@ -703,11 +703,13 @@ export function SettingsPanel({
 	generationMode,
 	onGenerationModeChange,
 	onConfigGenerationMode,
+	onOpenDatabase,
 }: {
 	toast: (level: "info" | "warning" | "error", text: string) => void;
 	generationMode: GenerationMode;
 	onGenerationModeChange: (mode: GenerationMode) => void;
 	onConfigGenerationMode: (mode: unknown) => void;
+	onOpenDatabase: () => void;
 }) {
 	const { data, error, loading, reload } = usePanelData(() => apiGet<{ config: RpConfigView }>("/api/config"), { cacheKey: "/api/config" });
 	const modelData = usePanelData(() => apiGet<ModelsResponse>("/api/models/catalog"), { cacheKey: "/api/models/catalog", watchModels: true });
@@ -819,7 +821,7 @@ export function SettingsPanel({
 				<div className="field-hint">白昼 / 黑夜立刻切换，偏好记在本机浏览器，与会话配置无关。</div>
 			</section>
 			<AccessSection toast={toast} />
-			<DatabasePluginPanel toast={toast} />
+			<DatabasePluginPanel toast={toast} onOpenManager={onOpenDatabase} />
 			<MemorySection toast={toast} />
 			<NovelAiSection toast={toast} />
 			{data && (

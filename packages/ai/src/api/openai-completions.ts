@@ -930,7 +930,14 @@ export function convertMessages(
 			});
 		}
 
-		if (msg.role === "user") {
+		if (msg.role === "system") {
+			const useDeveloperRole = model.reasoning && compat.supportsDeveloperRole;
+			const role = useDeveloperRole ? "developer" : "system";
+			params.push({
+				role,
+				content: msg.content.map((block) => sanitizeSurrogates(block.text)).join(""),
+			});
+		} else if (msg.role === "user") {
 			if (typeof msg.content === "string") {
 				params.push({
 					role: "user",

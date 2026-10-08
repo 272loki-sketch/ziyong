@@ -1128,6 +1128,10 @@ function convertMessages(
 				role: "assistant",
 				content: blocks,
 			});
+		} else if (msg.role === "system") {
+			throw new Error(
+				"Anthropic Messages API does not support inline system messages; provide system instructions via the system parameter or use an API with inline system-role support.",
+			);
 		} else if (msg.role === "toolResult") {
 			// Collect all consecutive toolResult messages, needed for z.ai Anthropic endpoint
 			const toolResults: ContentBlockParam[] = [];

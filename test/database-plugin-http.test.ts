@@ -14,3 +14,62 @@ test('database plugin HTTP: manual extra knowledge uses plugin artifacts, keeps 
 test('database plugin HTTP: nested/serialized upstream keys stay server-side and masked save preserves them',async()=>{const f=fixture();try{const c=await f.api.context();const secret='SYNTHETIC_SERVER_ONLY_CREDENTIAL';await f.api.save({...c,state:{...emptyState,extensionSettings:{__userscripts:{fixture:{global:JSON.stringify({vectorMemoryConfigGlobal:{embeddingApiKey:secret,rerankApiKey:secret}})}}}}});const view=await f.api.context();assert.ok(!JSON.stringify(view).includes(secret));const current=await f.api.store.readState(f.context().scope,f.context().visibleEntryIds);assert.ok(JSON.stringify(current.snapshot?.state).includes(secret));await f.api.save({...view,state:{...emptyState,extensionSettings:view.extensionSettings}});const after=await f.api.store.readState(f.context().scope,f.context().visibleEntryIds);assert.ok(JSON.stringify(after.snapshot?.state).includes(secret));}finally{f.cleanup()}});
 test('database plugin HTTP: same object name in siblings is immutable-pointer isolated; delete only hides current branch',async()=>{const f=fixture();try{const a=await f.api.context();await f.api.putObject({...a,name:'same.json',data:Buffer.from('{"branch":"A"}').toString('base64')});const origin=f.context();f.switch({...origin,sourceEntryId:'b-1',visibleEntryIds:['b-1'],chat:[{mes:'Synthetic branch B',__liyuanEntryId:'b-1',message_id:'b-1',is_user:false}]});assert.equal(await f.api.readObject('same.json'),null);const b=await f.api.context();await f.api.putObject({...b,name:'same.json',data:Buffer.from('{"branch":"B"}').toString('base64')});assert.equal((await f.api.readObject('same.json'))?.data.toString(),'{"branch":"B"}');assert.equal(await f.api.deleteObject({...b,name:'same.json'}),true);assert.equal(await f.api.readObject('same.json'),null);f.switch(origin);assert.equal((await f.api.readObject('same.json'))?.data.toString(),'{"branch":"A"}');}finally{f.cleanup()}});
 test('provider switch stops old SDK narrative auto-writes without altering old memory config',async()=>{const {mkdirSync,writeFileSync}=await import('node:fs');const {onNarrativeTurnEnd,updateMemoryConfig,memoryUpsertEventDigest,memoryArchiveCompacted}=await import('../src/memory/service.ts');const f=fixture();try{updateMemoryConfig(f.cwd,{enabled:true,embedMode:'local'});mkdirSync(join(f.cwd,'.liyuan-database-plugin'),{recursive:true});writeFileSync(join(f.cwd,'.liyuan-database-plugin','config.json'),'{"enabled":true}');const scope={sessionId:'synthetic'};assert.equal((await onNarrativeTurnEnd(f.cwd,scope,'Synthetic old SDK narration that must not enter the old library')).stored,false);assert.equal((await memoryArchiveCompacted(f.cwd,scope,'Synthetic archive that must not enter the old library')).archived,false);assert.equal((await memoryUpsertEventDigest(f.cwd,scope,{kind:'rp-event-digest',id:'synthetic',title:'Synthetic',status:'active',importance:'major',tags:[],recallAnchors:[],summary:'Synthetic event',sourceRefs:[{entryId:'a-1'}],evidenceLevel:'source-backed'})).stored,false);}finally{f.cleanup()}});
+
+test('database manager binding stays lightweight and manual generation is blocked while story is busy', async () => {
+ const f=fixture();
+ const server=createServer((req,res)=>{void f.api.handle(req,res).then(handled=>{if(!handled){res.writeHead(404);res.end()}})});
+ await new Promise<void>(r=>server.listen(0,'127.0.0.1',r));
+ try {
+  const base='http://127.0.0.1:'+(server.address() as any).port;
+  const binding=await(await fetch(base+'/api/database-plugin/binding')).json();
+  assert.deepEqual(Object.keys(binding).sort(),['modelRevision','scopeKey','sha256','sourceEntryId','streaming']);
+  assert.equal(binding.sourceEntryId,'a-1');assert.equal(binding.streaming,false);
+  assert.ok(!JSON.stringify(binding).includes('Synthetic committed story'));
+  const c=await f.api.context();f.stream(true);
+  const body=JSON.stringify({scopeKey:c.scopeKey,sourceEntryId:c.sourceEntryId,prompts:[{role:'user',content:'Synthetic manager request'}]});
+  const blocked=await fetch(base+'/api/database-plugin/generate',{method:'POST',body});
+  assert.equal(blocked.status,400);assert.match((await blocked.json()).error,/生成期间/);assert.equal(f.calls(),0);
+  const internal=await fetch(base+'/api/database-plugin/generate',{method:'POST',headers:{'x-liyuan-database-host':f.api.internalToken},body});
+  assert.equal(internal.status,200);assert.equal(f.calls(),1,'the isolated memory runtime remains allowed during settlement');
+  f.switch({...f.context(),sourceEntryId:'sibling'});
+  const next=await(await fetch(base+'/api/database-plugin/binding')).json();
+  assert.equal(next.sourceEntryId,'sibling');assert.equal(next.streaming,true);
+ }finally{await new Promise<void>(r=>server.close(()=>r()));f.cleanup()}
+});
+
+test('original chat-completions status/generate endpoints bridge to actual configured models and stay source-bound',async()=>{
+ const {writeFileSync}=await import('node:fs');const f=fixture();let probes=0;
+ const upstream=createServer((req,res)=>{probes++;assert.equal(req.url,'/v1/models');assert.equal(req.headers.authorization,'Bearer SYNTHETIC_ACTUAL_SERVER_KEY');res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({data:[{id:'gemini-3.8-flash'}]}));});
+ await new Promise<void>(r=>upstream.listen(0,'127.0.0.1',r));
+ writeFileSync(join(f.cwd,'liyuan.agent.json'),JSON.stringify({version:1,providers:{enabled:{api:'openai-completions',baseUrl:'http://127.0.0.1:'+(upstream.address() as any).port+'/v1',apiKey:'SYNTHETIC_ACTUAL_SERVER_KEY',models:[{id:'gemini-3.8-flash'}]}}}));
+ f.api.setConfig({fillModel:{provider:'enabled',id:'gemini-3.8-flash'},recallModel:{provider:'enabled',id:'gemini-3.8-flash'}});
+ const server=createServer((req,res)=>{void f.api.handle(req,res).then(handled=>{if(!handled){res.writeHead(404);res.end()}})});await new Promise<void>(r=>server.listen(0,'127.0.0.1',r));
+ try{
+  const base='http://127.0.0.1:'+(server.address() as any).port,c=await f.api.context();const binding={scopeKey:c.scopeKey,sourceEntryId:c.sourceEntryId};
+  assert.equal(c.managedModels.presets.length,2);assert.ok(!JSON.stringify(c).includes('SYNTHETIC_ACTUAL_SERVER_KEY'));
+  const payload={chat_completion_source:'custom',custom_url:'http://host.invalid'+c.managedModels.presets[0].url,custom_include_headers:'Authorization: Bearer host-managed'};
+  const models=await fetch(base+'/api/backends/chat-completions/status',{method:'POST',body:JSON.stringify({...binding,...payload})});assert.equal(models.status,200);assert.deepEqual((await models.json()).data,[{id:'gemini-3.8-flash',object:'model'}]);assert.equal(probes,1);
+  const chat={...binding,...payload,model:'gemini-3.8-flash',messages:[{role:'user',content:'Synthetic API test'}]};
+  const generated=await fetch(base+'/api/backends/chat-completions/generate',{method:'POST',body:JSON.stringify(chat)});assert.equal(generated.status,200);assert.equal((await generated.json()).choices[0].message.content,'SYNTHETIC_RESPONSE');
+  const stream=await fetch(base+'/api/backends/chat-completions/generate',{method:'POST',body:JSON.stringify({...chat,stream:true})});assert.equal(stream.status,200);assert.match(stream.headers.get('content-type')??'',/event-stream/);assert.match(await stream.text(),/data: \[DONE\]/);
+  f.stream(true);const blocked=await fetch(base+'/api/backends/chat-completions/generate',{method:'POST',body:JSON.stringify(chat)});assert.equal(blocked.status,400);
+  f.switch({...f.context(),sourceEntryId:'next-source'});const late=await fetch(base+'/api/backends/chat-completions/status',{method:'POST',body:JSON.stringify({...binding,...payload})});assert.equal(late.status,409);assert.equal(probes,1);
+ }finally{await new Promise<void>(r=>server.close(()=>r()));await new Promise<void>(r=>upstream.close(()=>r()));f.cleanup()}
+});
+
+test('serialized API request headers are masked and masked edits preserve server-side original credentials',async()=>{
+ const f=fixture();try{const c=await f.api.context();const secret='SYNTHETIC_HEADER_KEY';await f.api.save({...c,state:{...emptyState,extensionSettings:{profile:JSON.stringify({apiConfig:{url:'https://example.test/v1',model:'fixture',requestHeaders:'Authorization: Bearer '+secret+'\nUser-Agent: old-fixture'}})}}});const view=await f.api.context();assert.ok(!JSON.stringify(view).includes(secret));const edited=JSON.parse(view.extensionSettings.profile as string);edited.apiConfig.requestHeaders=edited.apiConfig.requestHeaders.replace('old-fixture','new-fixture');await f.api.save({...view,state:{...emptyState,extensionSettings:{profile:JSON.stringify(edited)}}});const state=await f.api.store.readState(f.context().scope,f.context().visibleEntryIds);assert.ok(JSON.stringify(state.snapshot?.state).includes(secret));assert.ok(JSON.stringify(state.snapshot?.state).includes('new-fixture'));}finally{f.cleanup()}
+});
+
+test('API preset reorder/delete/endpoint changes never transplant credentials to another connection',async()=>{
+ const {publicDatabasePluginSettings,preserveDatabasePluginSecrets}=await import('../server/database-plugin-http.ts');
+ const old={apiPresets:[{name:'A',apiConfig:{url:'https://a.test/v1',model:'one',apiKey:'KEY_FOR_A'}},{name:'B',apiConfig:{url:'https://b.test/v1',model:'two',apiKey:'KEY_FOR_B'}}]};
+ const view=publicDatabasePluginSettings(old);view.apiPresets.reverse();const swapped=preserveDatabasePluginSecrets(view,old);
+ assert.equal(swapped.apiPresets[0].apiConfig.apiKey,'KEY_FOR_B');assert.equal(swapped.apiPresets[1].apiConfig.apiKey,'KEY_FOR_A');
+ const single=preserveDatabasePluginSecrets({apiPresets:[view.apiPresets[0]]},old);assert.equal(single.apiPresets[0].apiConfig.apiKey,'KEY_FOR_B');
+ view.apiPresets[0].apiConfig.url='https://attacker.test/v1';const changed=preserveDatabasePluginSecrets(view,old);assert.equal(changed.apiPresets[0].apiConfig.apiKey,'');assert.ok(!JSON.stringify(changed.apiPresets[0]).includes('KEY_FOR'));
+ const headers={url:'https://a.test/v1',requestHeaders:'  Authorization: Bearer HEADER_KEY\n\tX-API-Key: SECOND_KEY\nUser-Agent: fixture'};
+ const safe=publicDatabasePluginSettings(headers);assert.ok(!JSON.stringify(safe).includes('HEADER_KEY'));assert.ok(!JSON.stringify(safe).includes('SECOND_KEY'));assert.deepEqual(preserveDatabasePluginSecrets(safe,headers),headers);
+});
+
+test('state save rechecks scope/source after asynchronous reads, before committing',async()=>{const f=fixture();try{const c=await f.api.context();const read=f.api.store.readState.bind(f.api.store);f.api.store.readState=async(...args:any[])=>{const result=await(read as any)(...args);f.switch({...f.context(),sourceEntryId:'new-source'});return result};await assert.rejects(f.api.save({...c,state:emptyState}),/会话|分支/);f.api.store.readState=read;assert.equal((await f.api.context()).revision,0);}finally{f.cleanup()}});

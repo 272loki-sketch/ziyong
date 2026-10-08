@@ -47,6 +47,10 @@ export function transformMessages(messages, model, normalizeToolCallId) {
     const imageAwareMessages = downgradeUnsupportedImages(messages, model);
     // First pass: transform messages (unsupported image downgrade, thinking blocks, tool call ID normalization)
     const transformed = imageAwareMessages.map((msg) => {
+        // System messages contain plain text only and must retain their exact position.
+        if (msg.role === "system") {
+            return msg;
+        }
         // User messages pass through unchanged
         if (msg.role === "user") {
             return msg;
@@ -166,6 +170,9 @@ export function transformMessages(messages, model, normalizeToolCallId) {
         }
         else if (msg.role === "toolResult") {
             existingToolResultIds.add(msg.toolCallId);
+            result.push(msg);
+        }
+        else if (msg.role === "system") {
             result.push(msg);
         }
         else if (msg.role === "user") {

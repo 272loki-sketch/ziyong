@@ -742,6 +742,10 @@ function convertMessages(
 		const m = transformedMessages[i];
 
 		switch (m.role) {
+			case "system":
+				throw new Error(
+					"Amazon Bedrock Converse does not support inline system messages; provide system instructions via the system parameter or use an API with inline system-role support.",
+				);
 			case "user": {
 				const content: ContentBlock[] = [];
 				if (typeof m.content === "string") {

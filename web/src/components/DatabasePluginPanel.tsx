@@ -2,8 +2,8 @@ import { useEffect, useState } from "react";
 import { api } from "../api.ts";
 import { Toggle } from "./kit.tsx";
 type Status={config:{enabled:boolean;recentHistoryMessages:number;injectionMaxChars:number};sourceReady:boolean;ref:string;sha256:string};
-export function DatabasePluginPanel({toast}:{toast:(level:"info"|"warning"|"error",text:string)=>void}){
- const [status,setStatus]=useState<Status|null>(null),[error,setError]=useState(""),[busy,setBusy]=useState(false),[show,setShow]=useState(false),[ref,setRef]=useState(""),[sha,setSha]=useState("");
+export function DatabasePluginPanel({toast,onOpenManager}:{onOpenManager:()=>void;toast:(level:"info"|"warning"|"error",text:string)=>void}){
+ const [status,setStatus]=useState<Status|null>(null),[error,setError]=useState(""),[busy,setBusy]=useState(false),[ref,setRef]=useState(""),[sha,setSha]=useState("");
  const refresh=async()=>{try{const value=await api<Status>("/api/database-plugin/status");setStatus(value);setRef(value.ref);setSha(value.sha256);setError("");}catch(e){setError(e instanceof Error?e.message:"数据库状态读取失败");}};
  useEffect(()=>{void refresh();},[]);
  const run=async(fn:()=>Promise<unknown>,message:string)=>{setBusy(true);try{await fn();await refresh();toast("info",message);}catch(e){const text=e instanceof Error?e.message:"操作失败";setError(text);toast("error",text);}finally{setBusy(false);}};
@@ -17,8 +17,7 @@ export function DatabasePluginPanel({toast}:{toast:(level:"info"|"warning"|"erro
    <button className="drawer-btn" disabled={busy} onClick={()=>{setBusy(true);void api<{ref:string;expectedSha256:string;version:string}>("/api/database-plugin/source/check",{method:"POST",body:"{}"}).then(candidate=>{setRef(candidate.ref);setSha(candidate.expectedSha256);toast("info",`已核验上游 ${candidate.version} 候选，点击安装才切换；可回退`);}).catch(e=>toast("error",e instanceof Error?e.message:"检查更新失败")).finally(()=>setBusy(false));}}>检查上游更新（不自动切换）</button>
    <button className="drawer-btn" disabled={busy} onClick={()=>void run(()=>api("/api/database-plugin/source/install",{method:"POST",body:JSON.stringify({ref,expectedSha256:sha})}),"上游源码已校验并缓存，未改写核心")}>安装／核验当前固定版本</button>
    <button className="drawer-btn" disabled={busy} onClick={()=>void run(()=>api("/api/database-plugin/source/rollback",{method:"POST",body:"{}"}),"已回退前一已核验插件版本，私有记忆数据保留")}>回退上一插件版本</button>
-   <button className="drawer-btn" disabled={busy||!status.sourceReady} onClick={()=>setShow(!show)}>{show?"收起原插件界面":"打开原插件管理台"}</button>
-   {show&&<iframe title="原数据库插件管理台" src="/database-plugin-host.html" style={{width:"100%",height:"70vh",minHeight:450,border:"1px solid var(--border)",borderRadius:8}}/>}
+   <button className="drawer-btn" disabled={busy||!status.sourceReady} onClick={onOpenManager}>打开独立数据库管理台</button>
    <div className="field-hint">原管理台保留人物表、纪要、交火、0TK及模板设置。完整记忆依赖服务端浏览器运行时；异常会明确报错，不假装记忆已保存。</div>
   </>}
  </section>;

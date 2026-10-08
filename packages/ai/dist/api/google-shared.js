@@ -82,7 +82,10 @@ export function convertMessages(model, context) {
     };
     const transformedMessages = transformMessages(context.messages, model, normalizeToolCallId);
     for (const msg of transformedMessages) {
-        if (msg.role === "user") {
+        if (msg.role === "system") {
+            throw new Error("Google Generative AI does not support inline system messages; provide system instructions via context.systemPrompt or use an API with inline system-role support.");
+        }
+        else if (msg.role === "user") {
             if (typeof msg.content === "string") {
                 contents.push({
                     role: "user",

@@ -12,11 +12,13 @@ const buildVersion = packageJson.version.trim();
 /** public 目录不会经过 Rollup transform；在静态文件复制完成后给本应用 SW 注入同一构建版本。 */
 function versionedServiceWorker(): Plugin {
 	let outputPath = "";
+	let databaseHostPath = "";
 	return {
 		name: "liyuan-service-worker-build-version",
 		apply: "build",
 		configResolved(config) {
 			outputPath = resolve(config.root, config.build.outDir, "sw.js");
+			databaseHostPath = resolve(config.root, config.build.outDir, "database-plugin-host.html");
 		},
 		writeBundle() {
 			const marker = "__LIYUAN_BUILD_VERSION__";
@@ -25,6 +27,13 @@ function versionedServiceWorker(): Plugin {
 				this.error("web/public/sw.js 必须且只能包含一个构建版本标记");
 			}
 			writeFileSync(outputPath, source.replace(marker, buildVersion), "utf8");
+			// The un-hashed host adapter must not reuse a previous release's browser cache.
+			const hostMarker = "__LIYUAN_DATABASE_HOST_VERSION__";
+			const host = readFileSync(databaseHostPath, "utf8");
+			if (host.split(hostMarker).length - 1 !== 1) {
+				this.error("数据库宿主 HTML 必须且只能包含一个构建版本标记");
+			}
+			writeFileSync(databaseHostPath, host.replace(hostMarker, buildVersion), "utf8");
 		},
 	};
 }

@@ -267,3 +267,12 @@ test("交付requirements须引用本次真实输出，不能虚报actions或miss
 	missing.missing = ["forum_widget"];
 	expectRejected(parseLayout(missing), "仍报告missing不算完整交付");
 });
+
+test('actual complete image fragments and image-evidence aliases normalize without rewriting author bytes',()=>{
+ const image='<image>synthetic adult clockmaker, dusk</image>';
+ const row={layout:[{kind:'narrative',text:'她翻开登记册。'},{kind:'format',text:image},{kind:'narrative',text:'\n\n他指向灯塔。'},{kind:'format',text:'<options>继续核对</options>'}],requirements:[{name:'穿插图片',kind:'inline-images',quote:image},{name:'选项',kind:'actions',quote:'<options>继续核对</options>'}],missing:[]};
+ const result=parseAgentPresentation(JSON.stringify(row),FROZEN);assert.equal(result.ok,true);
+ if(result.ok){assert.ok(result.delivery.body.includes(image));assert.equal(result.delivery.requirements[0].kind,'card-format');}
+ row.requirements[0].quote='<image>not actually delivered</image>';
+ assert.equal(parseAgentPresentation(JSON.stringify(row),FROZEN).ok,false,'an image label must never manufacture actual delivery evidence');
+});

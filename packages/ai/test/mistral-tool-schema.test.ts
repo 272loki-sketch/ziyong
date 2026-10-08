@@ -14,6 +14,36 @@ interface MistralToolPayload {
 }
 
 describe("Mistral tool schema serialization", () => {
+	it("keeps inline system messages at their original conversation position", async () => {
+		const model: Model<"mistral-conversations"> = {
+			...getModel("mistral", "devstral-medium-latest"),
+			baseUrl: "https://synthetic.invalid",
+		};
+		const lore = "世界书原文｜第一段\n  第二段。";
+		let capturedMessages: Array<{ role: string; content?: unknown }> | undefined;
+		const result = await complete(
+			model,
+			{
+				messages: [
+					{ role: "user", content: "历史输入", timestamp: 1 },
+					{ role: "system", content: [{ type: "text", text: lore }], timestamp: 0 },
+					{ role: "user", content: "末轮输入", timestamp: 2 },
+				],
+			},
+			{
+				apiKey: "synthetic-not-a-real-key",
+				onPayload: (payload) => {
+					capturedMessages = (payload as { messages: Array<{ role: string; content?: unknown }> }).messages;
+					throw new Error("stop after synthetic payload capture");
+				},
+			},
+		);
+
+		expect(capturedMessages?.map((message) => message.role)).toEqual(["user", "system", "user"]);
+		expect(capturedMessages?.[1]?.content).toBe(lore);
+		expect(result.stopReason).toBe("error");
+	});
+
 	it("strips TypeBox symbol keys before the SDK validates tool schemas", async () => {
 		const model: Model<"mistral-conversations"> = {
 			...getModel("mistral", "devstral-medium-latest"),
